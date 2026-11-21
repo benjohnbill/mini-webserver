@@ -107,12 +107,13 @@ Makefile
 src/
   main.c          arguments, signals, listen socket, model selection
   config.h        struct config and all default values (§6)
-  http_parse.c/h  buffer -> struct request, or a status code      test
-  router.c/h      request -> Route (static file or Handler)        test
-  mime.c/h        file extension -> Content-Type                   test
-  response.c/h    status line and headers into a buffer            test
-  serve.c/h       request -> Response plan; keep-alive decision    test
-  handlers.c/h    POST /echo, GET /api/time
+  core/           the Shared core. `make lint` fails on a socket include
+    http_parse.c/h  buffer -> struct request, or a status code    test
+    router.c/h      request -> Route (static file or Handler)      test
+    mime.c/h        file extension -> Content-Type                 test
+    response.c/h    status line and headers into a buffer          test
+    serve.c/h       request -> Response plan; keep-alive decision  test
+    handlers.c/h    POST /echo, GET /api/time
   send_plan.c/h   write a Response plan from an offset (I/O layer)
   conn.c/h        blocking: read to the empty line, body, keep-alive loop
   model.h         the four model entry points
@@ -293,9 +294,9 @@ Row 4: for `POST /echo`, the `body` of the plan points into the buffer of the co
 
 One `Makefile` with the targets `make`, `make test`, `make asan`, `make www`, `make format`, and `make lint`.
 
-- Flags: `CC = gcc`, `-std=c11 -D_POSIX_C_SOURCE=200809L -O2 -g -Wall -Wextra -Werror -pthread -Isrc`. Sanitizer flags go on the compile line and the link line.
+- Flags: `CC = gcc`, `-std=c11 -D_POSIX_C_SOURCE=200809L -O2 -g -Wall -Wextra -Werror -pthread -Isrc -Isrc/core`. Sanitizer flags go on the compile line and the link line.
 - Allowed outside POSIX: `<sys/epoll.h>`. Use `fcntl` for `O_NONBLOCK`, not `accept4`. Use `strcasecmp` from `<strings.h>`. Use `inet_ntop`, not `inet_ntoa`.
-- `make lint` runs `clang-tidy --warnings-as-errors='*'` on `src/*.c` and `tests/*.c` with `-- -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc`, then `clang-format --dry-run -Werror`. `make format` runs `clang-format -i` on `src/` and `tests/`.
+- `make lint` first fails if a file in `src/core/` includes a socket header (`sys/socket.h`, `sys/epoll.h`, `sys/select.h`, `poll.h`, `netinet/*`, `arpa/inet.h`) or an I/O layer header (`conn.h`, `send_plan.h`, `model.h`). Then it runs `clang-tidy --warnings-as-errors='*'` on `src/*.c`, `src/core/*.c`, and `tests/*.c` with `-- -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc -Isrc/core`, then `clang-format --dry-run -Werror`. `make format` runs `clang-format -i` on `src/`, `src/core/`, and `tests/`.
 
 ## 10. How the code is generated
 

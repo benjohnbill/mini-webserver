@@ -1,21 +1,25 @@
 CC = gcc
 CFLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -g -Wall -Wextra -Werror \
-	-pthread -Isrc
+	-pthread -Isrc -Isrc/core
 SANITIZE = -fsanitize=address,undefined -g
-TIDY_FLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc
+TIDY_FLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc -Isrc/core
 
-CORE_SRCS = src/http_parse.c src/router.c src/mime.c src/response.c \
-	src/serve.c src/handlers.c
+CORE_SRCS = src/core/http_parse.c src/core/router.c src/core/mime.c \
+	src/core/response.c src/core/serve.c src/core/handlers.c
 SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/main.c \
 	src/model_iter.c src/model_fork.c src/model_pool.c src/model_epoll.c
-HEADERS = $(wildcard src/*.h)
+HEADERS = $(wildcard src/*.h src/core/*.h)
 TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS))
-FORMAT_FILES = $(wildcard src/*.c src/*.h tests/*.c tests/*.h)
+FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
+	tests/*.c tests/*.h)
 
 # A 1x1 PNG.
 PNG_BASE64 = iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==
 LARGE_BIN_SIZE = 10485760
+# The Shared core does not use sockets or the I/O layer
+# (docs/adr/shared-core-does-not-know-sockets.md).
+CORE_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|sys/select|poll|netinet/[a-z_]+|arpa/inet|conn|send_plan|model)\.h[>"]'
 
 .PHONY: all test asan www format lint clean
 
@@ -48,7 +52,10 @@ format:
 	clang-format -i $(FORMAT_FILES)
 
 lint:
-	clang-tidy --quiet --warnings-as-errors='*' src/*.c tests/*.c -- \
+	@! grep -nE $(CORE_BANNED_INCLUDE) src/core/*.c src/core/*.h || \
+		{ echo 'lint: the Shared core must not use sockets'; false; }
+	clang-tidy --quiet --warnings-as-errors='*' src/*.c src/core/*.c \
+		tests/*.c -- \
 		$(TIDY_FLAGS)
 	clang-format --dry-run -Werror $(FORMAT_FILES)
 
