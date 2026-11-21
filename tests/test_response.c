@@ -15,7 +15,7 @@ static void a_200_has_its_status_line_and_content_length(void)
     CHECK(header_has(&plan, "\r\nConnection: keep-alive\r\n"));
     CHECK(!plan.close_after);
     CHECK_EQ_INT(plan.file_fd, -1);
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
 }
 
 static void a_404_has_its_status_line_and_content_length(void)
@@ -27,7 +27,7 @@ static void a_404_has_its_status_line_and_content_length(void)
     CHECK(header_has(&plan, "\r\nConnection: close\r\n"));
     CHECK(header_has(&plan, "\r\n\r\n404 Not Found\n"));
     CHECK(plan.close_after);
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
 }
 
 static void a_405_has_an_allow_header(void)
@@ -36,7 +36,7 @@ static void a_405_has_an_allow_header(void)
     response_plan_init_not_allowed(&plan, "POST");
     CHECK(strncmp(plan.header, "HTTP/1.1 405 Method Not Allowed\r\n", 33) == 0);
     CHECK(header_has(&plan, "\r\nAllow: POST\r\n"));
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
 }
 
 static void a_content_type_too_long_for_the_header_becomes_a_500(void)
@@ -49,7 +49,7 @@ static void a_content_type_too_long_for_the_header_becomes_a_500(void)
     CHECK(strncmp(plan.header, "HTTP/1.1 500 Internal Server Error\r\n", 36) ==
           0);
     CHECK(plan.close_after);
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
 }
 
 int main(void)

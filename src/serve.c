@@ -13,14 +13,15 @@
 static int static_file_open(const struct request *request,
                             const struct config *config,
                             struct response_plan *plan);
-static int path_check_file(char *path, size_t size, struct stat *info);
+static int path_resolve(char *path, size_t size, struct stat *info);
 static int errno_to_status(int error);
+static int path_resolve_index(char *path, size_t size, struct stat *info);
 
 void serve_request(const struct request *request, const struct config *config,
                    struct response_plan *plan)
 {
     struct route route;
-    int status = router_find(request, &route);
+    int status = router_resolve(request, &route);
     if (status == 405) {
         response_plan_init_not_allowed(plan, route.allowed_method);
         return;
@@ -53,7 +54,7 @@ static int static_file_open(const struct request *request,
     if (length < 0 || (size_t)length >= sizeof(path)) {
         return 500;
     }
-    int status = path_check_file(path, sizeof(path), &info);
+    int status = path_resolve(path, sizeof(path), &info);
     if (status != 0) {
         return status;
     }
@@ -73,21 +74,15 @@ static int static_file_open(const struct request *request,
 }
 
 /* A folder becomes its index.html. Only a regular file passes. */
-static int path_check_file(char *path, size_t size, struct stat *info)
+static int path_resolve(char *path, size_t size, struct stat *info)
 {
     if (stat(path, info) < 0) {
         return errno_to_status(errno);
     }
     if (S_ISDIR(info->st_mode)) {
-        size_t len = strlen(path);
-        const char *index_name =
-            path[len - 1] == '/' ? "index.html" : "/index.html";
-        if (len + strlen(index_name) >= size) {
-            return 500;
-        }
-        strcat(path, index_name);
-        if (stat(path, info) < 0) {
-            return errno_to_status(errno);
+        int status = path_resolve_index(path, size, info);
+        if (status != 0) {
+            return status;
         }
     }
     if (!S_ISREG(info->st_mode)) {
@@ -105,4 +100,20 @@ static int errno_to_status(int error)
         return 403;
     }
     return 500;
+}
+
+/* A folder becomes its index.html. */
+static int path_resolve_index(char *path, size_t size, struct stat *info)
+{
+    size_t len = strlen(path);
+    const char *index_name =
+        path[len - 1] == '/' ? "index.html" : "/index.html";
+    if (len + strlen(index_name) >= size) {
+        return 500;
+    }
+    strcat(path, index_name);
+    if (stat(path, info) < 0) {
+        return errno_to_status(errno);
+    }
+    return 0;
 }

@@ -14,8 +14,8 @@ struct header_fields {
 };
 
 static size_t find_header_end(const char *buffer, size_t len);
-static long partial_frame_check(const char *buffer, size_t scan_len,
-                                size_t len);
+static long partial_frame_measure(const char *buffer, size_t scan_len,
+                                  size_t len);
 static int head_parse(char *buffer, size_t header_len, struct request *request);
 static int start_line_parse(char *buffer, size_t len, struct request *request,
                             char **next_line);
@@ -38,7 +38,7 @@ static int content_length_parse(const char *value, long *content_length);
 
 int http_parse_request(char *buffer, size_t len, struct request *request)
 {
-    long frame = http_frame_check(buffer, len);
+    long frame = http_frame_measure(buffer, len);
     if (frame == HTTP_INCOMPLETE) {
         return HTTP_INCOMPLETE;
     }
@@ -60,14 +60,14 @@ int http_parse_request(char *buffer, size_t len, struct request *request)
     return 0;
 }
 
-long http_frame_check(const char *buffer, size_t len)
+long http_frame_measure(const char *buffer, size_t len)
 {
     char copy[HEADER_MAX + 1];
     struct request request;
     size_t scan_len = len < HEADER_MAX ? len : HEADER_MAX;
     size_t header_len = find_header_end(buffer, scan_len);
     if (header_len == 0) {
-        return partial_frame_check(buffer, scan_len, len);
+        return partial_frame_measure(buffer, scan_len, len);
     }
 
     memcpy(copy, buffer, header_len);
@@ -100,7 +100,8 @@ static size_t find_header_end(const char *buffer, size_t len)
 
 /* The header has no end yet. A finished request line can still decide a
    status (414 when the request line ends), so check it now. */
-static long partial_frame_check(const char *buffer, size_t scan_len, size_t len)
+static long partial_frame_measure(const char *buffer, size_t scan_len,
+                                  size_t len)
 {
     const char *line_end = memchr(buffer, '\n', scan_len);
     if (line_end != NULL) {

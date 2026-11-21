@@ -5,7 +5,7 @@
 
 #include "config.h"
 
-static size_t plan_body_len(const struct response_plan *plan);
+static size_t plan_get_body_len(const struct response_plan *plan);
 static ssize_t plan_send_part(const struct response_plan *plan, int conn_fd,
                               size_t offset);
 static ssize_t plan_send_file_chunk(const struct response_plan *plan,
@@ -14,7 +14,7 @@ static ssize_t plan_send_file_chunk(const struct response_plan *plan,
 int send_plan_some(const struct response_plan *plan, int conn_fd,
                    size_t *offset)
 {
-    size_t total = plan->header_len + plan_body_len(plan);
+    size_t total = plan->header_len + plan_get_body_len(plan);
     while (*offset < total) {
         ssize_t written = plan_send_part(plan, conn_fd, *offset);
         if (written < 0) {
@@ -29,7 +29,7 @@ int send_plan_some(const struct response_plan *plan, int conn_fd,
     return SEND_DONE;
 }
 
-static size_t plan_body_len(const struct response_plan *plan)
+static size_t plan_get_body_len(const struct response_plan *plan)
 {
     return plan->file_fd >= 0 ? (size_t)plan->file_size : plan->body_len;
 }

@@ -32,7 +32,10 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | `create` and `destroy` | Allocate and make. Free. Use them as a pair |
    | `init` | Set memory that already exists. It does not allocate |
    | `find` | Look for a thing. Return `NULL` or `false` if it is not there |
-   | `parse` | Read bytes into a struct. Return a status code on failure |
+   | `parse` | Read bytes into a struct. Return a status code, or false, on failure |
+   | `resolve` | Turn a name into the thing that it names. Return 0 or a status code |
+   | `measure` | Return a length |
+   | `get` | Return a value. Change nothing |
    | `send` | Write bytes to a socket |
    | `is_` and `has_` | Ask a question and return `bool` |
 

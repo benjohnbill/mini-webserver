@@ -149,7 +149,7 @@ int http_parse_request(char *buffer, size_t len, struct request *request);
    as soon as the header is complete, or a status code as a negative number
    (-400). A length can be equal to a status code, so the sign is necessary.
    Does not change the buffer. */
-long http_frame_check(const char *buffer, size_t len);
+long http_frame_measure(const char *buffer, size_t len);
 
 /* router.h — pure, no files */
 enum route_kind { ROUTE_STATIC, ROUTE_HANDLER };
@@ -160,14 +160,15 @@ struct route {
 };
 /* 0, 403, or 405. No 404: the router does not look at files. serve gets 404
    when stat fails. */
-int router_find(const struct request *request, struct route *route);
+int router_resolve(const struct request *request, struct route *route);
 
 /* mime.h */
 const char *mime_find_type(const char *path);
 
 /* response.h */
+#define RESPONSE_HEADER_MAX 1024
 struct response_plan {
-    char header[1024];
+    char header[RESPONSE_HEADER_MAX];
     size_t header_len;
     const char *body;       /* memory body, or NULL */
     size_t body_len;
@@ -187,7 +188,7 @@ void response_plan_init_error(struct response_plan *plan, int status, bool close
 /* 405 with "Allow: <allowed_method>". It closes the connection. */
 void response_plan_init_not_allowed(struct response_plan *plan,
                                     const char *allowed_method);
-void response_plan_destroy(struct response_plan *plan); /* closes file_fd */
+void response_plan_close(struct response_plan *plan); /* closes file_fd */
 
 /* serve.h — opens files (stat, open). */
 void serve_request(const struct request *request, const struct config *config,
@@ -209,10 +210,10 @@ int model_pool_run(int listen_fd, const struct config *config);
 int model_epoll_run(int listen_fd, const struct config *config);
 ```
 
-- `iter`, `fork`, and `pool` call `conn_serve`. `epoll` has its own loop, but it uses `http_frame_check`, `http_parse_request`, `serve_request`, `serve_keeps_open`, and `send_plan_some`. The keep-alive logic is in one place.
+- `iter`, `fork`, and `pool` call `conn_serve`. `epoll` has its own loop, but it uses `http_frame_measure`, `http_parse_request`, `serve_request`, `serve_keeps_open`, and `send_plan_some`. The keep-alive logic is in one place.
 - `send_plan_some` reads a file body with `pread`, not `sendfile` (not POSIX).
 - `http_parse` keeps the flow of lab 09: `find_header_end`, `parse_request_line`, `end_first_line`, `split_at_space`, `is_supported_version`. These helpers keep their lab names as `static` functions in `http_parse.c`. This is an exception to CONVENTION Names rule 2. Changes from lab 09: `parse_request_line` returns a status code, not `bool`. `end_first_line` checks for NULL. The loop variable `p` becomes `cursor`.
-- Lab 09 `open_listen_fd`, `bind_and_listen_by_fd`, and the `SIGPIPE` ignore move to `main.c`. `status_reason` moves to `response.c`. `create_socket_addr` becomes `socket_addr_init`.
+- Lab 09 `open_listen_fd`, `bind_and_listen_by_fd`, and the `SIGPIPE` ignore move to `main.c`. There, `open_listen_fd` becomes `listen_socket_open` and `bind_and_listen_by_fd` becomes `listen_socket_bind`. Lab 09 `status_reason` moves to `response.c` as `status_get_reason`. `create_socket_addr` becomes `socket_addr_init`.
 - The function pointer in `struct route` is for Handlers only. Model selection is one `if` chain in `main.c`.
 - `www/`: `index.html` loads `style.css`, `app.js`, and `image.png`. `app.js` fetches `/api/time` and shows it. `make www` writes `image.png` (a 1×1 PNG) from a base64 literal, and `large.bin` (10 MB, for S4) with `head -c`.
 

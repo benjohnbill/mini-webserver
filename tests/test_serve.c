@@ -58,7 +58,7 @@ static void echo_sends_back_the_body_and_its_content_type(void)
     CHECK_EQ_INT(plan.body_len, 5);
     CHECK(memcmp(plan.body, "hello", 5) == 0);
     CHECK(!plan.close_after);
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
 }
 
 static void a_dot_dot_target_gets_a_403_plan_that_closes(void)
@@ -71,7 +71,7 @@ static void a_dot_dot_target_gets_a_403_plan_that_closes(void)
     serve_request(&request, &config, &plan);
     CHECK(strstr(plan.header, "HTTP/1.1 403 Forbidden\r\n") == plan.header);
     CHECK(plan.close_after);
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
 }
 
 int main(void)

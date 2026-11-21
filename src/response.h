@@ -5,8 +5,10 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define RESPONSE_HEADER_MAX 1024
+
 struct response_plan {
-    char header[1024];
+    char header[RESPONSE_HEADER_MAX];
     size_t header_len;
     const char *body; /* memory body, or NULL */
     size_t body_len;
@@ -29,6 +31,6 @@ void response_plan_init_error(struct response_plan *plan, int status,
 /* 405 with "Allow: <allowed_method>". It closes the connection. */
 void response_plan_init_not_allowed(struct response_plan *plan,
                                     const char *allowed_method);
-void response_plan_destroy(struct response_plan *plan); /* closes file_fd */
+void response_plan_close(struct response_plan *plan); /* closes file_fd */
 
 #endif

@@ -15,14 +15,14 @@
 volatile sig_atomic_t stop_requested = 0;
 
 static bool config_init_from_args(struct config *config, int argc, char **argv);
-static bool number_read(const char *text, long min, long max, int *number);
-static bool option_read(struct config *config, const char *name,
-                        const char *value);
+static bool number_parse(const char *text, long min, long max, int *number);
+static bool option_parse(struct config *config, const char *name,
+                         const char *value);
 static bool model_is_known(const char *model);
 static void signals_install(void);
 static void stop_signal_handle(int signal_number);
-static int open_listen_fd(int port);
-static void bind_and_listen_by_fd(int listen_fd, int port);
+static int listen_socket_open(int port);
+static void listen_socket_bind(int listen_fd, int port);
 static void socket_addr_init(struct sockaddr_in *addr, int port);
 static int model_run(int listen_fd, const struct config *config);
 
@@ -38,10 +38,10 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     signals_install();
 
-    int listen_fd = open_listen_fd(config.port);
-    int status = model_run(listen_fd, &config);
+    int listen_fd = listen_socket_open(config.port);
+    int result = model_run(listen_fd, &config);
     close(listen_fd);
-    if (status != 0) {
+    if (result != 0) {
         fprintf(stderr, "server: model %s: SLOT not written (SPEC §8)\n",
                 config.model);
         return 1;
@@ -57,7 +57,7 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
         .timeout = DEFAULT_TIMEOUT,
         .log = false,
     };
-    if (argc < 3 || !number_read(argv[1], 1, PORT_MAX, &config->port)) {
+    if (argc < 3 || !number_parse(argv[1], 1, PORT_MAX, &config->port)) {
         return false;
     }
     config->root = argv[2];
@@ -65,7 +65,7 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--log") == 0) {
             config->log = true;
-        } else if (i + 1 < argc && option_read(config, argv[i], argv[i + 1])) {
+        } else if (i + 1 < argc && option_parse(config, argv[i], argv[i + 1])) {
             i++;
         } else {
             return false;
@@ -74,7 +74,7 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
     return true;
 }
 
-static bool number_read(const char *text, long min, long max, int *number)
+static bool number_parse(const char *text, long min, long max, int *number)
 {
     char *end = NULL;
     errno = 0;
@@ -87,18 +87,18 @@ static bool number_read(const char *text, long min, long max, int *number)
     return true;
 }
 
-static bool option_read(struct config *config, const char *name,
-                        const char *value)
+static bool option_parse(struct config *config, const char *name,
+                         const char *value)
 {
     if (strcmp(name, "--model") == 0) {
         config->model = value;
         return model_is_known(value);
     }
     if (strcmp(name, "--workers") == 0) {
-        return number_read(value, 1, WORKERS_MAX, &config->workers);
+        return number_parse(value, 1, WORKERS_MAX, &config->workers);
     }
     if (strcmp(name, "--timeout") == 0) {
-        return number_read(value, 1, TIMEOUT_MAX, &config->timeout);
+        return number_parse(value, 1, TIMEOUT_MAX, &config->timeout);
     }
     return false;
 }
@@ -132,7 +132,7 @@ static void stop_signal_handle(int signal_number)
     stop_requested = 1;
 }
 
-static int open_listen_fd(int port)
+static int listen_socket_open(int port)
 {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -140,12 +140,12 @@ static int open_listen_fd(int port)
         exit(EXIT_FAILURE);
     }
 
-    bind_and_listen_by_fd(listen_fd, port);
+    listen_socket_bind(listen_fd, port);
     printf("listening on port %d\n", port);
     return listen_fd;
 }
 
-static void bind_and_listen_by_fd(int listen_fd, int port)
+static void listen_socket_bind(int listen_fd, int port)
 {
     int reuse = 1;
     if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <

@@ -30,7 +30,7 @@ static void a_request_with_no_empty_line_is_incomplete(void)
     struct request request;
     CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request),
                  HTTP_INCOMPLETE);
-    CHECK_EQ_INT(http_frame_check(buffer, strlen(buffer)), HTTP_INCOMPLETE);
+    CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), HTTP_INCOMPLETE);
 }
 
 static void a_request_with_bare_newline_line_ends_is_complete(void)
@@ -92,7 +92,7 @@ static void a_long_target_gets_414_when_the_request_line_ends(void)
     size_t len = request_with_target(buffer, sizeof(buffer), 2049);
     char *line_end = strchr(buffer, '\n');
     len = (size_t)(line_end - buffer) + 1;
-    CHECK_EQ_INT(http_frame_check(buffer, len), -414);
+    CHECK_EQ_INT(http_frame_measure(buffer, len), -414);
 }
 
 static void a_header_of_8192_bytes_is_complete(void)
@@ -100,7 +100,7 @@ static void a_header_of_8192_bytes_is_complete(void)
     char buffer[LONG_BUFFER_SIZE];
     struct request request;
     size_t len = request_with_header_len(buffer, sizeof(buffer), 8192);
-    CHECK_EQ_INT(http_frame_check(buffer, len), 8192);
+    CHECK_EQ_INT(http_frame_measure(buffer, len), 8192);
     CHECK_EQ_INT(http_parse_request(buffer, len, &request), 0);
 }
 
@@ -109,7 +109,7 @@ static void a_header_over_8192_bytes_gets_431(void)
     char buffer[LONG_BUFFER_SIZE];
     struct request request;
     size_t len = request_with_header_len(buffer, sizeof(buffer), 8193);
-    CHECK_EQ_INT(http_frame_check(buffer, len), -431);
+    CHECK_EQ_INT(http_frame_measure(buffer, len), -431);
     CHECK_EQ_INT(http_parse_request(buffer, len, &request), 431);
 }
 
@@ -118,8 +118,8 @@ static void a_request_line_with_no_end_in_8192_bytes_gets_431(void)
     char buffer[LONG_BUFFER_SIZE];
     memset(buffer, 'a', 8192);
     memcpy(buffer, "GET /", 5);
-    CHECK_EQ_INT(http_frame_check(buffer, 8192), -431);
-    CHECK_EQ_INT(http_frame_check(buffer, 8191), HTTP_INCOMPLETE);
+    CHECK_EQ_INT(http_frame_measure(buffer, 8192), -431);
+    CHECK_EQ_INT(http_frame_measure(buffer, 8191), HTTP_INCOMPLETE);
 }
 
 static void a_post_with_no_content_length_gets_411(void)
@@ -157,7 +157,7 @@ static void a_body_of_1048576_bytes_passes_the_frame_check(void)
 {
     char buffer[] =
         "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 1048576\r\n\r\n";
-    CHECK_EQ_INT(http_frame_check(buffer, strlen(buffer)), 1048633);
+    CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), 1048633);
 }
 
 static void a_body_over_1048576_bytes_gets_413_before_the_body(void)
@@ -165,7 +165,7 @@ static void a_body_over_1048576_bytes_gets_413_before_the_body(void)
     char buffer[] =
         "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 1048577\r\n\r\n";
     struct request request;
-    CHECK_EQ_INT(http_frame_check(buffer, strlen(buffer)), -413);
+    CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), -413);
     CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 413);
 }
 
@@ -174,7 +174,7 @@ static void the_frame_check_gives_the_total_length_before_the_body(void)
     char buffer[] = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
                     "\r\nhel";
     struct request request;
-    CHECK_EQ_INT(http_frame_check(buffer, strlen(buffer)), 56);
+    CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), 56);
     CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request),
                  HTTP_INCOMPLETE);
 }
@@ -196,7 +196,7 @@ static void the_frame_check_does_not_change_the_buffer(void)
     char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     char before[sizeof(buffer)];
     memcpy(before, buffer, sizeof(buffer));
-    CHECK_EQ_INT(http_frame_check(buffer, strlen(buffer)), 46);
+    CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), 46);
     CHECK(memcmp(before, buffer, sizeof(buffer)) == 0);
 }
 

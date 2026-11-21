@@ -14,6 +14,6 @@ struct route {
 };
 
 /* Returns 0, 403, or 405. On 405, route->allowed_method is set. */
-int router_find(const struct request *request, struct route *route);
+int router_resolve(const struct request *request, struct route *route);
 
 #endif

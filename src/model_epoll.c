@@ -34,7 +34,7 @@ struct epoll_loop {
     time_t last_sweep;
 };
 
-static time_t clock_seconds(void);
+static time_t clock_get_seconds(void);
 static int loop_run(struct epoll_loop *loop);
 static int loop_dispatch(struct epoll_loop *loop,
                          const struct epoll_event *event);
@@ -44,10 +44,12 @@ static int connection_watch(struct epoll_loop *loop,
                             struct connection *connection, uint32_t events);
 static void connection_close(struct epoll_loop *loop,
                              struct connection *connection);
+static void connection_unlink(struct epoll_loop *loop,
+                              struct connection *connection);
 static int loop_handle_input(struct epoll_loop *loop,
                              const struct epoll_event *event);
 static void loop_sweep_timeouts(struct epoll_loop *loop);
-static void loop_destroy(struct epoll_loop *loop);
+static void loop_close(struct epoll_loop *loop);
 
 int model_epoll_run(int listen_fd, const struct config *config)
 {
@@ -55,7 +57,7 @@ int model_epoll_run(int listen_fd, const struct config *config)
         .listen_fd = listen_fd,
         .config = config,
         .connections = NULL,
-        .last_sweep = clock_seconds(),
+        .last_sweep = clock_get_seconds(),
     };
     loop.epoll_fd = epoll_create1(0);
     if (loop.epoll_fd < 0) {
@@ -69,12 +71,12 @@ int model_epoll_run(int listen_fd, const struct config *config)
         return -1;
     }
 
-    int status = loop_run(&loop);
-    loop_destroy(&loop);
-    return status;
+    int result = loop_run(&loop);
+    loop_close(&loop);
+    return result;
 }
 
-static time_t clock_seconds(void)
+static time_t clock_get_seconds(void)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -117,13 +119,13 @@ static void connection_send(struct epoll_loop *loop,
 {
     int result = send_plan_some(&connection->plan, connection->conn_fd,
                                 &connection->offset);
-    connection->last_active = clock_seconds();
+    connection->last_active = clock_get_seconds();
     if (result == SEND_AGAIN) {
         return;
     }
 
     bool keeps_open = result == SEND_DONE && !connection->plan.close_after;
-    response_plan_destroy(&connection->plan);
+    response_plan_close(&connection->plan);
     connection->is_writing = false;
     if (!keeps_open || connection_watch(loop, connection, EPOLLIN) != 0) {
         connection_close(loop, connection);
@@ -146,9 +148,17 @@ static void connection_close(struct epoll_loop *loop,
                              struct connection *connection)
 {
     if (connection->is_writing) {
-        response_plan_destroy(&connection->plan);
+        response_plan_close(&connection->plan);
     }
     close(connection->conn_fd);
+    connection_unlink(loop, connection);
+    free(connection->buffer);
+    free(connection);
+}
+
+static void connection_unlink(struct epoll_loop *loop,
+                              struct connection *connection)
+{
     if (connection->prev != NULL) {
         connection->prev->next = connection->next;
     } else {
@@ -157,8 +167,6 @@ static void connection_close(struct epoll_loop *loop,
     if (connection->next != NULL) {
         connection->next->prev = connection->prev;
     }
-    free(connection->buffer);
-    free(connection);
 }
 
 static int loop_handle_input(struct epoll_loop *loop,
@@ -172,7 +180,7 @@ static int loop_handle_input(struct epoll_loop *loop,
 
 static void loop_sweep_timeouts(struct epoll_loop *loop)
 {
-    time_t now = clock_seconds();
+    time_t now = clock_get_seconds();
     if (now - loop->last_sweep < 1) {
         return;
     }
@@ -188,7 +196,7 @@ static void loop_sweep_timeouts(struct epoll_loop *loop)
     }
 }
 
-static void loop_destroy(struct epoll_loop *loop)
+static void loop_close(struct epoll_loop *loop)
 {
     while (loop->connections != NULL) {
         connection_close(loop, loop->connections);

@@ -18,7 +18,7 @@ struct plan_head {
 
 static bool plan_write_head(struct response_plan *plan,
                             const struct plan_head *head);
-static const char *status_reason(int status);
+static const char *status_get_reason(int status);
 static void plan_write_error(struct response_plan *plan, int status,
                              bool close_after, const char *allowed_method);
 
@@ -62,7 +62,7 @@ void response_plan_init_not_allowed(struct response_plan *plan,
     plan_write_error(plan, 405, true, allowed_method);
 }
 
-void response_plan_destroy(struct response_plan *plan)
+void response_plan_close(struct response_plan *plan)
 {
     if (plan->file_fd >= 0) {
         close(plan->file_fd);
@@ -84,7 +84,7 @@ static bool plan_write_head(struct response_plan *plan,
                           "Content-Length: %lld\r\n"
                           "Connection: %s\r\n"
                           "%s\r\n%s",
-                          head->status, status_reason(head->status),
+                          head->status, status_get_reason(head->status),
                           head->content_type, (long long)head->content_length,
                           head->close_after ? "close" : "keep-alive",
                           allow_line, head->text != NULL ? head->text : "");
@@ -104,7 +104,7 @@ static bool plan_write_head(struct response_plan *plan,
     return true;
 }
 
-static const char *status_reason(int status)
+static const char *status_get_reason(int status)
 {
     switch (status) {
     case 200:
@@ -136,7 +136,7 @@ static void plan_write_error(struct response_plan *plan, int status,
                              bool close_after, const char *allowed_method)
 {
     char text[ERROR_TEXT_SIZE];
-    snprintf(text, sizeof(text), "%d %s\n", status, status_reason(status));
+    snprintf(text, sizeof(text), "%d %s\n", status, status_get_reason(status));
     struct plan_head head = {
         .status = status,
         .content_type = "text/plain",

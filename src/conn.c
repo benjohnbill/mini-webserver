@@ -67,7 +67,7 @@ static int connection_read_request(int conn_fd, struct conn_buffer *buffer,
         if (!connection_read_some(conn_fd, buffer)) {
             return CONN_CLOSED;
         }
-        frame = http_frame_check(buffer->data, buffer->used);
+        frame = http_frame_measure(buffer->data, buffer->used);
         if (frame < HTTP_INCOMPLETE) {
             return (int)-frame;
         }
@@ -128,6 +128,6 @@ static bool connection_answer(int conn_fd, const struct config *config,
     size_t offset = 0;
     bool keeps_open = send_plan_some(&plan, conn_fd, &offset) == SEND_DONE &&
                       !plan.close_after;
-    response_plan_destroy(&plan);
+    response_plan_close(&plan);
     return keeps_open;
 }

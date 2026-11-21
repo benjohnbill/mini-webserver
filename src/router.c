@@ -18,22 +18,21 @@ static const struct handler_route handler_routes[] = {
 };
 
 static bool target_has_dot_dot_segment(const char *target);
+static const struct handler_route *handler_route_find(const char *target);
 
-int router_find(const struct request *request, struct route *route)
+int router_resolve(const struct request *request, struct route *route)
 {
     if (target_has_dot_dot_segment(request->target)) {
         return 403;
     }
 
-    for (size_t i = 0; i < sizeof(handler_routes) / sizeof(handler_routes[0]);
-         i++) {
-        if (strcmp(request->target, handler_routes[i].target) == 0) {
-            route->kind = ROUTE_HANDLER;
-            route->allowed_method = handler_routes[i].method;
-            route->handler = handler_routes[i].handler;
-            return strcmp(request->method, route->allowed_method) == 0 ? 0
-                                                                       : 405;
-        }
+    const struct handler_route *handler_route =
+        handler_route_find(request->target);
+    if (handler_route != NULL) {
+        route->kind = ROUTE_HANDLER;
+        route->allowed_method = handler_route->method;
+        route->handler = handler_route->handler;
+        return strcmp(request->method, route->allowed_method) == 0 ? 0 : 405;
     }
 
     route->kind = ROUTE_STATIC;
@@ -52,4 +51,15 @@ static bool target_has_dot_dot_segment(const char *target)
         }
     }
     return false;
+}
+
+static const struct handler_route *handler_route_find(const char *target)
+{
+    for (size_t i = 0; i < sizeof(handler_routes) / sizeof(handler_routes[0]);
+         i++) {
+        if (strcmp(target, handler_routes[i].target) == 0) {
+            return &handler_routes[i];
+        }
+    }
+    return NULL;
 }

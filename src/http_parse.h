@@ -27,6 +27,6 @@ int http_parse_request(char *buffer, size_t len, struct request *request);
    body) as soon as the header is complete, or a status code as a negative
    number (-400). The sign is necessary because a length can be equal to a
    status code. Does not change the buffer. */
-long http_frame_check(const char *buffer, size_t len);
+long http_frame_measure(const char *buffer, size_t len);
 
 #endif
