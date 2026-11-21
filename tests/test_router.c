@@ -77,5 +77,6 @@ int main(void)
     a_dot_dot_at_the_end_gets_403();
     dots_inside_a_name_are_not_a_dot_dot_segment();
     printf("test_router: ok\n");
+
     return 0;
 }

@@ -26,6 +26,7 @@ int send_plan_some(const struct response_plan *plan, int conn_fd,
         }
         *offset += (size_t)written;
     }
+
     return SEND_DONE;
 }
 
@@ -45,6 +46,7 @@ static ssize_t plan_send_part(const struct response_plan *plan, int conn_fd,
         return write(conn_fd, plan->body + body_offset,
                      plan->body_len - body_offset);
     }
+
     return plan_send_file_chunk(plan, conn_fd, body_offset);
 }
 
@@ -63,5 +65,6 @@ static ssize_t plan_send_file_chunk(const struct response_plan *plan,
     if (length < 0) {
         return -1;
     }
+
     return write(conn_fd, chunk, (size_t)length);
 }

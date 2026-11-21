@@ -88,6 +88,7 @@ static bool buffer_reserve(struct conn_buffer *buffer, size_t capacity)
     }
     buffer->data = data;
     buffer->capacity = capacity;
+
     return true;
 }
 
@@ -129,5 +130,6 @@ static bool connection_answer(int conn_fd, const struct config *config,
     bool keeps_open = send_plan_some(&plan, conn_fd, &offset) == SEND_DONE &&
                       !plan.close_after;
     response_plan_close(&plan);
+
     return keeps_open;
 }

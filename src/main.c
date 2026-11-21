@@ -42,6 +42,7 @@ int main(int argc, char **argv)
     int listen_fd = listen_socket_open(config.port);
     int result = model_run(listen_fd, &config);
     close(listen_fd);
+
     return model_result_report(config.model, result);
 }
 
@@ -67,6 +68,7 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
             return false;
         }
     }
+
     return true;
 }
 
@@ -80,6 +82,7 @@ static bool number_parse(const char *text, long min, long max, int *number)
         return false;
     }
     *number = (int)value;
+
     return true;
 }
 
@@ -96,6 +99,7 @@ static bool option_parse(struct config *config, const char *name,
     if (strcmp(name, "--timeout") == 0) {
         return number_parse(value, 1, TIMEOUT_MAX, &config->timeout);
     }
+
     return false;
 }
 
@@ -182,6 +186,7 @@ static int model_run(int listen_fd, const struct config *config)
     if (strcmp(config->model, "epoll") == 0) {
         return model_epoll_run(listen_fd, config);
     }
+
     return model_pool_run(listen_fd, config);
 }
 
@@ -197,5 +202,6 @@ static int model_result_report(const char *model, int result)
         fprintf(stderr, "server: model %s: failed\n", model);
         return 1;
     }
+
     return 0;
 }

@@ -70,6 +70,7 @@ static int static_file_open(const struct request *request,
     }
     plan->file_fd = fd;
     plan->file_size = info.st_size;
+
     return 0;
 }
 
@@ -88,6 +89,7 @@ static int path_resolve(char *path, size_t size, struct stat *info)
     if (!S_ISREG(info->st_mode)) {
         return 403;
     }
+
     return 0;
 }
 
@@ -99,6 +101,7 @@ static int errno_to_status(int error)
     if (error == EACCES) {
         return 403;
     }
+
     return 500;
 }
 
@@ -115,5 +118,6 @@ static int path_resolve_index(char *path, size_t size, struct stat *info)
     if (stat(path, info) < 0) {
         return errno_to_status(errno);
     }
+
     return 0;
 }

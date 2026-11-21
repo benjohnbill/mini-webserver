@@ -257,6 +257,7 @@ int main(void)
     a_bad_header_line_gets_400_before_an_unknown_version();
     an_unknown_method_waits_for_the_header_end();
     printf("test_http_parse: ok\n");
+
     return 0;
 }
 
@@ -269,6 +270,7 @@ static size_t request_with_target(char *buffer, size_t size, size_t target_len)
     target[target_len] = '\0';
     int len =
         snprintf(buffer, size, "GET %s HTTP/1.1\r\nHost: a\r\n\r\n", target);
+
     return (size_t)len;
 }
 
@@ -283,5 +285,6 @@ static size_t request_with_header_len(char *buffer, size_t size,
     memset(pad, 'p', pad_len);
     pad[pad_len] = '\0';
     int len = snprintf(buffer, size, "%s%s%s", head, pad, tail);
+
     return (size_t)len;
 }

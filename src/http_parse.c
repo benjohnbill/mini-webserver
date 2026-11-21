@@ -59,6 +59,7 @@ int http_parse_request(char *buffer, size_t len, struct request *request)
     }
     request->body = buffer + header_len;
     request->body_len = (size_t)frame - header_len;
+
     return 0;
 }
 
@@ -79,6 +80,7 @@ long http_frame_measure(const char *buffer, size_t len)
         return -status;
     }
     long body_len = request.content_length > 0 ? request.content_length : 0;
+
     return (long)header_len + body_len;
 }
 
@@ -97,6 +99,7 @@ static size_t find_header_end(const char *buffer, size_t len)
         }
         cursor = memchr(cursor + 1, '\n', rest);
     }
+
     return 0;
 }
 
@@ -122,6 +125,7 @@ static long partial_frame_measure(const char *buffer, size_t scan_len,
             return -414;
         }
     }
+
     return len >= HEADER_MAX ? -431 : HTTP_INCOMPLETE;
 }
 
@@ -132,6 +136,7 @@ static int head_parse(char *buffer, size_t header_len, struct request *request)
     if (status != 0) {
         return status;
     }
+
     return header_lines_parse(line, request);
 }
 
@@ -146,6 +151,7 @@ static int start_line_parse(char *buffer, size_t len, struct request *request,
     if (*next_line == NULL) {
         return 400;
     }
+
     return parse_request_line(buffer, request);
 }
 
@@ -160,6 +166,7 @@ static char *end_first_line(char *buffer)
     if (line_end > buffer && line_end[-1] == '\r') {
         line_end[-1] = '\0';
     }
+
     return line_end + 1;
 }
 
@@ -173,6 +180,7 @@ static int parse_request_line(char *buffer, struct request *request)
         request->target[0] != '/' || strchr(request->version, ' ') != NULL) {
         return 400;
     }
+
     return 0;
 }
 
@@ -186,6 +194,7 @@ static char *split_at_space(char *text)
         return NULL;
     }
     *space = '\0';
+
     return space + 1;
 }
 
@@ -217,6 +226,7 @@ static int header_lines_parse(char *line, struct request *request)
     request->wants_close =
         is_http_1_0 ? !fields.has_keep_alive : fields.has_close;
     /* SLOT(owner): Host check, HTTP/1.1 only */
+
     return body_framing_check(request, &fields);
 }
 
@@ -238,6 +248,7 @@ static int header_line_parse(char *line, struct request *request,
         return 400;
     }
     header_fields_record(line, text_trim_spaces(colon + 1), request, fields);
+
     return 0;
 }
 
@@ -250,6 +261,7 @@ static char *text_trim_spaces(char *text)
     while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t')) {
         text[--len] = '\0';
     }
+
     return text;
 }
 
@@ -284,6 +296,7 @@ static int request_line_check(const struct request *request)
     if (is_target_too_long(request->target)) {
         return 414;
     }
+
     return 0;
 }
 
@@ -313,6 +326,7 @@ static int body_framing_check(struct request *request,
     if (request->content_length < 0 && strcmp(request->method, "POST") == 0) {
         return 411;
     }
+
     return 0;
 }
 
@@ -335,5 +349,6 @@ static int content_length_parse(const char *value, long *content_length)
         return 413;
     }
     *content_length = number;
+
     return 0;
 }

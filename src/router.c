@@ -38,6 +38,7 @@ int router_resolve(const struct request *request, struct route *route)
     route->kind = ROUTE_STATIC;
     route->allowed_method = "GET";
     route->handler = NULL;
+
     return strcmp(request->method, "GET") == 0 ? 0 : 405;
 }
 
@@ -50,6 +51,7 @@ static bool target_has_dot_dot_segment(const char *target)
             return true;
         }
     }
+
     return false;
 }
 
@@ -61,5 +63,6 @@ static const struct handler_route *handler_route_find(const char *target)
             return &handler_routes[i];
         }
     }
+
     return NULL;
 }

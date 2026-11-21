@@ -33,5 +33,6 @@ int main(void)
     an_unknown_extension_is_octet_stream();
     a_dot_in_a_folder_name_is_not_an_extension();
     printf("test_mime: ok\n");
+
     return 0;
 }

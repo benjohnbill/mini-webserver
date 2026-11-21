@@ -59,6 +59,7 @@ int main(void)
     a_405_has_an_allow_header();
     a_content_type_too_long_for_the_header_becomes_a_500();
     printf("test_response: ok\n");
+
     return 0;
 }
 
@@ -67,5 +68,6 @@ static bool header_has(const struct response_plan *plan, const char *text)
     char header[sizeof(plan->header) + 1];
     memcpy(header, plan->header, plan->header_len);
     header[plan->header_len] = '\0';
+
     return strstr(header, text) != NULL;
 }

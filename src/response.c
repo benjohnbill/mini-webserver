@@ -32,6 +32,7 @@ bool response_plan_init(struct response_plan *plan, int status,
         .content_length = content_length,
         .close_after = close_after,
     };
+
     return plan_write_head(plan, &head);
 }
 
@@ -101,6 +102,7 @@ static bool plan_write_head(struct response_plan *plan,
         return false;
     }
     plan->header_len = (size_t)length;
+
     return true;
 }
 

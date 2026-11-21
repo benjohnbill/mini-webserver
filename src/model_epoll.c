@@ -102,6 +102,7 @@ static int loop_run(struct epoll_loop *loop)
         }
         loop_sweep_timeouts(loop);
     }
+
     return 0;
 }
 
@@ -113,6 +114,7 @@ static int loop_dispatch(struct epoll_loop *loop,
         connection_send(loop, connection);
         return 0;
     }
+
     return loop_handle_input(loop, event);
 }
 

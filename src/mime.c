@@ -33,5 +33,6 @@ const char *mime_find_type(const char *path)
             return mime_entries[i].type;
         }
     }
+
     return MIME_DEFAULT_TYPE;
 }
