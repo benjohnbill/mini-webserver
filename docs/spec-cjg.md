@@ -135,6 +135,7 @@ struct request {
     char *target;
     char *version;
     char *host;             /* NULL if absent */
+    char *content_type;     /* NULL if absent. POST /echo sends it back */
     long content_length;    /* -1 if absent */
     bool wants_close;       /* from the version and Connection */
     char *body;
@@ -144,7 +145,10 @@ struct request {
 /* Returns 0 when the request is complete, HTTP_INCOMPLETE when more bytes
    are needed, or a status code (400, 405, 411, 413, 414, 431, 505). */
 int http_parse_request(char *buffer, size_t len, struct request *request);
-/* Returns HTTP_INCOMPLETE, the total length of the request, or a status code. */
+/* Returns HTTP_INCOMPLETE, the total length of the request (header and body)
+   as soon as the header is complete, or a status code as a negative number
+   (-400). A length can be equal to a status code, so the sign is necessary.
+   Does not change the buffer. */
 long http_frame_check(const char *buffer, size_t len);
 
 /* router.h — pure, no files */
@@ -154,7 +158,9 @@ struct route {
     const char *allowed_method;
     int (*handler)(const struct request *request, struct response_plan *plan);
 };
-int router_find(const struct request *request, struct route *route); /* 0, 403, 404, 405 */
+/* 0, 403, or 405. No 404: the router does not look at files. serve gets 404
+   when stat fails. */
+int router_find(const struct request *request, struct route *route);
 
 /* mime.h */
 const char *mime_find_type(const char *path);
@@ -169,7 +175,18 @@ struct response_plan {
     off_t file_size;
     bool close_after;
 };
+/* False: the header did not fit, and the plan is a 500 now. */
+bool response_plan_init(struct response_plan *plan, int status,
+                        const char *content_type, off_t content_length,
+                        bool close_after);
+/* A short generated body goes into header[], so the plan owns it. */
+void response_plan_init_text(struct response_plan *plan, int status,
+                             const char *content_type, const char *text,
+                             bool close_after);
 void response_plan_init_error(struct response_plan *plan, int status, bool close_after);
+/* 405 with "Allow: <allowed_method>". It closes the connection. */
+void response_plan_init_not_allowed(struct response_plan *plan,
+                                    const char *allowed_method);
 void response_plan_destroy(struct response_plan *plan); /* closes file_fd */
 
 /* serve.h — opens files (stat, open). */
@@ -182,6 +199,8 @@ int send_plan_some(const struct response_plan *plan, int conn_fd, size_t *offset
 
 /* conn.h — does not close conn_fd */
 void conn_serve(int conn_fd, const struct config *config);
+/* One line for --log. request is NULL if the request did not parse. */
+void conn_log(const struct request *request, const struct response_plan *plan);
 
 /* model.h — each returns 0 at a clean shutdown */
 int model_iter_run(int listen_fd, const struct config *config);

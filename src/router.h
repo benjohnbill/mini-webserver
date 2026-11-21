@@ -13,7 +13,7 @@ struct route {
     int (*handler)(const struct request *request, struct response_plan *plan);
 };
 
-/* Returns 0, 403, 404, or 405. On 405, route->allowed_method is set. */
+/* Returns 0, 403, or 405. On 405, route->allowed_method is set. */
 int router_find(const struct request *request, struct route *route);
 
 #endif
