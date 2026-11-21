@@ -104,10 +104,11 @@ request_with_header_len() {
     echo "$file"
 }
 
-# A target of exactly $1 bytes: "/" and then letters.
+# A target of exactly $1 bytes: "/" and then letters, with a "/" every 200
+# bytes. A path part over NAME_MAX (255) gets ENAMETOOLONG, which is 500.
 target_of_len() {
     printf '/'
-    head -c $(($1 - 1)) /dev/zero | tr '\0' a
+    head -c $(($1 - 1)) /dev/zero | tr '\0' a | sed -E 's/(.{199})./\1\//g'
 }
 
 check_static_files() {

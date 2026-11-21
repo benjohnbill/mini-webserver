@@ -85,7 +85,8 @@ Shutdown:
 ## 4a. Known limits
 
 - A slow sender (one byte every few seconds) is not closed, because the timeout limits one `read`. Scene S2b shows it.
-- No send timeout: a client that stops reading holds a Worker in `write`.
+- No send timeout in `iter`, `fork`, and `pool`: a client that stops reading holds a Worker in `write`.
+- `epoll` closes a connection when its send makes no progress for `--timeout`.
 - No pipelining: bytes after the body of a request are dropped, as in lab 09.
 - `epoll` is Linux only. The statement asks for portability. We accept this.
 - `fork` has no limit on children.

@@ -93,7 +93,7 @@ static int path_resolve(char *path, size_t size, struct stat *info)
 
 static int errno_to_status(int error)
 {
-    if (error == ENOENT || error == ENOTDIR || error == ENAMETOOLONG) {
+    if (error == ENOENT || error == ENOTDIR) {
         return 404;
     }
     if (error == EACCES) {
