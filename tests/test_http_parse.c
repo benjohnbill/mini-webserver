@@ -215,6 +215,19 @@ static void a_header_line_with_no_colon_gets_400(void)
     CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 400);
 }
 
+static void a_bad_header_line_gets_400_before_an_unknown_version(void)
+{
+    char buffer[] = "GET / HTTP/2.0\r\nHost: a\r\nbroken\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 400);
+}
+
+static void an_unknown_method_waits_for_the_header_end(void)
+{
+    char buffer[] = "DELETE / HTTP/1.1\r\nHost: a\r\n";
+    CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), HTTP_INCOMPLETE);
+}
+
 int main(void)
 {
     a_full_get_is_complete();
@@ -241,6 +254,8 @@ int main(void)
     the_frame_check_does_not_change_the_buffer();
     connection_close_sets_wants_close();
     a_header_line_with_no_colon_gets_400();
+    a_bad_header_line_gets_400_before_an_unknown_version();
+    an_unknown_method_waits_for_the_header_end();
     printf("test_http_parse: ok\n");
     return 0;
 }

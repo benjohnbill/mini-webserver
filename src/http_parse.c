@@ -22,8 +22,7 @@ static int start_line_parse(char *buffer, size_t len, struct request *request,
 static char *end_first_line(char *buffer);
 static int parse_request_line(char *buffer, struct request *request);
 static char *split_at_space(char *text);
-static bool is_supported_version(const char *version);
-static bool is_supported_method(const char *method);
+static bool is_target_too_long(const char *target);
 static int header_lines_parse(char *line, struct request *request);
 static bool line_is_empty(const char *line);
 static int header_line_parse(char *line, struct request *request,
@@ -32,6 +31,9 @@ static char *text_trim_spaces(char *text);
 static void header_fields_record(const char *name, char *value,
                                  struct request *request,
                                  struct header_fields *fields);
+static int request_line_check(const struct request *request);
+static bool is_supported_version(const char *version);
+static bool is_supported_method(const char *method);
 static int body_framing_check(struct request *request,
                               const struct header_fields *fields);
 static int content_length_parse(const char *value, long *content_length);
@@ -98,8 +100,9 @@ static size_t find_header_end(const char *buffer, size_t len)
     return 0;
 }
 
-/* The header has no end yet. A finished request line can still decide a
-   status (414 when the request line ends), so check it now. */
+/* The header has no end yet. A finished request line can still decide 400
+   (bad syntax) or 414 (SPEC §6: 414 when the request line ends). 505 and 405
+   wait for the header end, because a bad header line gets 400 first. */
 static long partial_frame_measure(const char *buffer, size_t scan_len,
                                   size_t len)
 {
@@ -114,6 +117,9 @@ static long partial_frame_measure(const char *buffer, size_t scan_len,
         int status = start_line_parse(copy, line_len, &request, &next_line);
         if (status != 0) {
             return -status;
+        }
+        if (is_target_too_long(request.target)) {
+            return -414;
         }
     }
     return len >= HEADER_MAX ? -431 : HTTP_INCOMPLETE;
@@ -167,15 +173,6 @@ static int parse_request_line(char *buffer, struct request *request)
         request->target[0] != '/' || strchr(request->version, ' ') != NULL) {
         return 400;
     }
-    if (!is_supported_version(request->version)) {
-        return 505;
-    }
-    if (!is_supported_method(request->method)) {
-        return 405;
-    }
-    if (strlen(request->target) > TARGET_MAX) {
-        return 414;
-    }
     return 0;
 }
 
@@ -192,14 +189,9 @@ static char *split_at_space(char *text)
     return space + 1;
 }
 
-static bool is_supported_version(const char *version)
+static bool is_target_too_long(const char *target)
 {
-    return strcmp(version, "HTTP/1.0") == 0 || strcmp(version, "HTTP/1.1") == 0;
-}
-
-static bool is_supported_method(const char *method)
-{
-    return strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0;
+    return strlen(target) > TARGET_MAX;
 }
 
 static int header_lines_parse(char *line, struct request *request)
@@ -215,6 +207,10 @@ static int header_lines_parse(char *line, struct request *request)
             return status;
         }
         line = next_line;
+    }
+    int status = request_line_check(request);
+    if (status != 0) {
+        return status;
     }
 
     bool is_http_1_0 = strcmp(request->version, "HTTP/1.0") == 0;
@@ -274,6 +270,31 @@ static void header_fields_record(const char *name, char *value,
         fields->has_close |= strcasecmp(value, "close") == 0;
         fields->has_keep_alive |= strcasecmp(value, "keep-alive") == 0;
     }
+}
+
+/* SPEC §3: after the syntax checks, 505, then 405, then 414. */
+static int request_line_check(const struct request *request)
+{
+    if (!is_supported_version(request->version)) {
+        return 505;
+    }
+    if (!is_supported_method(request->method)) {
+        return 405;
+    }
+    if (is_target_too_long(request->target)) {
+        return 414;
+    }
+    return 0;
+}
+
+static bool is_supported_version(const char *version)
+{
+    return strcmp(version, "HTTP/1.0") == 0 || strcmp(version, "HTTP/1.1") == 0;
+}
+
+static bool is_supported_method(const char *method)
+{
+    return strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0;
 }
 
 static int body_framing_check(struct request *request,

@@ -44,7 +44,7 @@ Proxy extension point: tomorrow the Proxy adds a third Route kind. The I/O layer
 
 ## 3. HTTP behavior
 
-- Checks run in this order: 400 (syntax), 505 (version not `HTTP/1.0` or `HTTP/1.1`), 405 (method not `GET` or `POST`), then the Route.
+- Checks run in this order: 400 (syntax of the request line, then of the header lines), 505 (version not `HTTP/1.0` or `HTTP/1.1`), 405 (method not `GET` or `POST`), 414 (target over 2048 bytes), then the Route. Before the header section ends, only the request line can give a status: 400, or 414 (§6). 505 and 405 wait for the end of the header section.
 - A line ends with `\r\n` or a bare `\n`. RFC 9112 section 2.2 lets a server accept a bare `\n` ("MAY"). Lab 09 does this.
 - The header section ends at the first empty line (`\r\n\r\n` or `\n\n`).
 - A request with a body must have exactly one decimal `Content-Length`. Otherwise it gets 400. A `POST` with no `Content-Length` gets 411. A value above 1048576 gets 413 before the server reads the body. A request with `Transfer-Encoding` gets 400.
