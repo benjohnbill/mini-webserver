@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include "model.h"
 #include "send_plan.h"
@@ -33,7 +34,8 @@ static void connection_drain(int conn_fd);
 void conn_serve(int conn_fd, const struct config *config)
 {
     struct conn_buffer buffer = {0};
-    /* SLOT(owner): SO_RCVTIMEO */
+    struct timeval timeout = {.tv_sec = config->timeout, .tv_usec = 0};
+    setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     while (!stop_requested) {
         size_t request_len = 0;
