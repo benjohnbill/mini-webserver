@@ -31,7 +31,7 @@ Fallback: if S2 on `pool` has no result by a time that the owner sets (open), th
 | In today | Out today |
 |---|---|
 | TCP socket server (`socket`, `bind`, `listen` with backlog `SOMAXCONN`, `accept`, `SO_REUSEADDR`) | Forward Proxy and Reverse Proxy (2026-11-22) |
-| Request line, headers (`Host`, `Content-Length`, `Connection`), POST body by `Content-Length` | CGI (Handlers are C functions in the server) |
+| Request line, headers (`Host`, `Content-Length`, `Connection`, `Content-Type`, `Transfer-Encoding`), POST body by `Content-Length`. `Transfer-Encoding` is read only to answer 400 | CGI (Handlers are C functions in the server) |
 | Status line, `Content-Type`, `Content-Length`, `Connection`, body | Chunked transfer, Range, TLS, HTTP/2, authentication |
 | Static files from a root folder, MIME types, 400, 403, 404, 405, 411, 413, 414, 431, 500, 505 | Team rules (team meeting) |
 | `Host` missing in an `HTTP/1.1` request gets 400. The owner types this check (§10 slot) | |
@@ -196,7 +196,15 @@ void serve_request(const struct request *request, const struct config *config,
                    struct response_plan *plan);
 bool serve_keeps_open(const struct request *request, int status);
 
+/* handlers.h — each returns 0, or a status code when it made no plan. */
+int handlers_echo(const struct request *request, struct response_plan *plan);
+int handlers_tell_time(const struct request *request,
+                       struct response_plan *plan);
+
 /* send_plan.h — I/O layer. Returns SEND_DONE, SEND_AGAIN, or SEND_ERROR. */
+#define SEND_DONE 0
+#define SEND_AGAIN 1
+#define SEND_ERROR (-1)
 int send_plan_some(const struct response_plan *plan, int conn_fd, size_t *offset);
 
 /* conn.h — does not close conn_fd */
@@ -205,6 +213,8 @@ void conn_serve(int conn_fd, const struct config *config);
 void conn_log(const struct request *request, const struct response_plan *plan);
 
 /* model.h — each returns 0 at a clean shutdown, -1 while it is a slot, 1 on an error */
+/* Set by the SIGINT and SIGTERM handler in main.c. Each loop stops on it. */
+extern volatile sig_atomic_t stop_requested;
 int model_iter_run(int listen_fd, const struct config *config);
 int model_fork_run(int listen_fd, const struct config *config);
 int model_pool_run(int listen_fd, const struct config *config);
@@ -276,6 +286,8 @@ The generator writes all code except the rows of this table. It leaves a slot fo
 | 4 | `model_epoll_run`: the read side of the event loop | What must the server remember so that it never blocks on one connection? |
 | 5 | `model_iter_run`: the accept loop | Where does one connection stop everyone? |
 | 6 | The `Host` check in `http_parse.c` (`HTTP/1.1` only) | The task from 2026-11-21 |
+
+Row 4: for `POST /echo`, the `body` of the plan points into the buffer of the connection. The read side must not reuse, move, or free that buffer until the send of the plan is done.
 
 ## 9. Build
 

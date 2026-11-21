@@ -11,6 +11,7 @@ HOST=127.0.0.1
 PORT=18080
 BASE="http://$HOST:$PORT"
 WORK=$(mktemp -d)
+EMPTY_DIR=
 SERVER_PID=
 
 cleanup() {
@@ -19,6 +20,9 @@ cleanup() {
         wait "$SERVER_PID" 2>/dev/null
     fi
     rm -rf "$WORK"
+    if [ -n "$EMPTY_DIR" ]; then
+        rm -rf "$EMPTY_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -124,6 +128,9 @@ check_static_files() {
         "$(curl -s -o /dev/null --max-time 20 -w '%{size_download}' \
             "$BASE/large.bin")"
     expect "a missing file is 404" 404 "$(http_status "$BASE/missing.html")"
+    EMPTY_DIR=$(mktemp -d www/func-empty.XXXXXX)
+    expect "a folder with no index.html is 404" 404 \
+        "$(http_status "$BASE/${EMPTY_DIR#www/}/")"
     expect "a .. segment is 403" 403 \
         "$(http_status --path-as-is "$BASE/../etc/passwd")"
 }
@@ -160,6 +167,8 @@ check_errors() {
     expect "two Content-Length headers are 400" 400 "$(raw_status "$file")"
     file=$(request_file 'POST /echo HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n')
     expect "Transfer-Encoding is 400" 400 "$(raw_status "$file")"
+    file=$(request_file 'GET / HTTP/1.1\r\nConnection: close\r\n\r\n')
+    expect "HTTP/1.1 with no Host is 400" 400 "$(raw_status "$file")"
     file=$(request_file 'GET / HTTP/2.0\r\nHost: a\r\n\r\n')
     expect "HTTP/2.0 is 505" 505 "$(raw_status "$file")"
     file=$(request_file 'DELETE / HTTP/1.1\r\nHost: a\r\n\r\n')
