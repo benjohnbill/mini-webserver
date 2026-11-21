@@ -204,7 +204,7 @@ void conn_serve(int conn_fd, const struct config *config);
 /* One line for --log. request is NULL if the request did not parse. */
 void conn_log(const struct request *request, const struct response_plan *plan);
 
-/* model.h — each returns 0 at a clean shutdown */
+/* model.h — each returns 0 at a clean shutdown, -1 while it is a slot, 1 on an error */
 int model_iter_run(int listen_fd, const struct config *config);
 int model_fork_run(int listen_fd, const struct config *config);
 int model_pool_run(int listen_fd, const struct config *config);

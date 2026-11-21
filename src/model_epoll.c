@@ -62,13 +62,13 @@ int model_epoll_run(int listen_fd, const struct config *config)
     loop.epoll_fd = epoll_create1(0);
     if (loop.epoll_fd < 0) {
         perror("epoll_create1");
-        return -1;
+        return 1;
     }
     struct epoll_event listen_event = {.events = EPOLLIN, .data.ptr = NULL};
     if (epoll_ctl(loop.epoll_fd, EPOLL_CTL_ADD, listen_fd, &listen_event) < 0) {
         perror("epoll_ctl");
         close(loop.epoll_fd);
-        return -1;
+        return 1;
     }
 
     int result = loop_run(&loop);
@@ -91,11 +91,13 @@ static int loop_run(struct epoll_loop *loop)
             epoll_wait(loop->epoll_fd, events, EPOLL_EVENTS_MAX, EPOLL_WAIT_MS);
         if (count < 0 && errno != EINTR) {
             perror("epoll_wait");
-            return -1;
+            return 1;
         }
         for (int i = 0; i < count; i++) {
-            if (loop_dispatch(loop, &events[i]) != 0) {
-                return -1;
+            /* -1 while the read side is a slot, 1 on an error */
+            int result = loop_dispatch(loop, &events[i]);
+            if (result != 0) {
+                return result;
             }
         }
         loop_sweep_timeouts(loop);

@@ -25,6 +25,7 @@ static int listen_socket_open(int port);
 static void listen_socket_bind(int listen_fd, int port);
 static void socket_addr_init(struct sockaddr_in *addr, int port);
 static int model_run(int listen_fd, const struct config *config);
+static int model_result_report(const char *model, int result);
 
 int main(int argc, char **argv)
 {
@@ -41,12 +42,7 @@ int main(int argc, char **argv)
     int listen_fd = listen_socket_open(config.port);
     int result = model_run(listen_fd, &config);
     close(listen_fd);
-    if (result != 0) {
-        fprintf(stderr, "server: model %s: SLOT not written (SPEC §8)\n",
-                config.model);
-        return 1;
-    }
-    return 0;
+    return model_result_report(config.model, result);
 }
 
 static bool config_init_from_args(struct config *config, int argc, char **argv)
@@ -187,4 +183,19 @@ static int model_run(int listen_fd, const struct config *config)
         return model_epoll_run(listen_fd, config);
     }
     return model_pool_run(listen_fd, config);
+}
+
+/* Returns the exit code. A slot returns -1, an error returns 1. */
+static int model_result_report(const char *model, int result)
+{
+    if (result == -1) {
+        fprintf(stderr, "server: model %s: SLOT not written (SPEC §8)\n",
+                model);
+        return 1;
+    }
+    if (result != 0) {
+        fprintf(stderr, "server: model %s: failed\n", model);
+        return 1;
+    }
+    return 0;
 }
