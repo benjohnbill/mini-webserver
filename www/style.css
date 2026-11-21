@@ -1,0 +1,9 @@
+body {
+  font-family: sans-serif;
+  margin: 2rem;
+}
+
+img {
+  image-rendering: pixelated;
+  border: 1px solid #888;
+}

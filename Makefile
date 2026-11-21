@@ -13,7 +13,11 @@ TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS))
 FORMAT_FILES = $(wildcard src/*.c src/*.h tests/*.c tests/*.h)
 
-.PHONY: all test asan format lint clean
+# A 1x1 PNG.
+PNG_BASE64 = iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==
+LARGE_BIN_SIZE = 10485760
+
+.PHONY: all test asan www format lint clean
 
 all: server
 
@@ -31,6 +35,14 @@ build/test_%: tests/test_%.c tests/check.h $(CORE_SRCS) $(HEADERS)
 
 test: $(TEST_BINS)
 	@for test_bin in $(TEST_BINS); do ./$$test_bin || exit 1; done
+
+www: www/image.png www/large.bin
+
+www/image.png:
+	printf '%s' '$(PNG_BASE64)' | base64 -d > $@
+
+www/large.bin:
+	head -c $(LARGE_BIN_SIZE) /dev/zero > $@
 
 format:
 	clang-format -i $(FORMAT_FILES)
