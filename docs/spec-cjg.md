@@ -92,7 +92,7 @@ Shutdown:
 - `fork` has no limit on children.
 - Each connection holds up to 8192 bytes of header and up to 1048576 bytes of body in memory.
 - No percent-decoding, no symlink check, no absolute-form target. The query string is not removed.
-- An error close with unread bytes can send RST, so a client can miss a 413 or 431.
+- After an error response, `conn` stops writing (`shutdown`) and drops unread bytes: at most 16 reads of 4096 bytes, each after a wait of at most 1 s. Then it closes. A client that sends more than that can still get RST and miss a 413 or 431. `epoll` does not drain: its close after an error can send RST.
 - `.htm`, upper-case extensions, and `charset` are not handled.
 - No `Transfer-Encoding` support (400).
 - `accept` on `EMFILE` is not handled. `ulimit -n` here is 1048576.

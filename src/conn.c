@@ -1,10 +1,12 @@
 #include "conn.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "model.h"
@@ -26,6 +28,7 @@ static bool connection_read_some(int conn_fd, struct conn_buffer *buffer);
 static bool connection_answer(int conn_fd, const struct config *config,
                               struct conn_buffer *buffer, size_t request_len,
                               int status);
+static void connection_drain(int conn_fd);
 
 void conn_serve(int conn_fd, const struct config *config)
 {
@@ -130,6 +133,25 @@ static bool connection_answer(int conn_fd, const struct config *config,
     bool keeps_open = send_plan_some(&plan, conn_fd, &offset) == SEND_DONE &&
                       !plan.close_after;
     response_plan_close(&plan);
+    if (status != 0) {
+        connection_drain(conn_fd);
+    }
 
     return keeps_open;
+}
+
+/* After an error response, unread request bytes make close() send RST, and
+   the client can lose the response. Stop writing, then read and drop the
+   rest for a short time, so that close() sends FIN. */
+static void connection_drain(int conn_fd)
+{
+    char scrap[DRAIN_CHUNK_SIZE];
+    struct pollfd watch = {.fd = conn_fd, .events = POLLIN};
+    shutdown(conn_fd, SHUT_WR);
+    for (int i = 0; i < DRAIN_READS_MAX; i++) {
+        if (poll(&watch, 1, DRAIN_WAIT_MS) <= 0 ||
+            read(conn_fd, scrap, sizeof(scrap)) <= 0) {
+            return;
+        }
+    }
 }
