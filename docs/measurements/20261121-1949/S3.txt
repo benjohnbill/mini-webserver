@@ -1,0 +1,45 @@
+scene S3, model iter, commit 23a1316
+wrk -t4 -c10 -d10s --timeout 30s http://127.0.0.1:18081/index.html
+  223 requests in 10.10s, 95.04KB read
+Requests/sec:     22.08
+wrk -t4 -c100 -d10s --timeout 30s http://127.0.0.1:18081/index.html
+  221 requests in 10.02s, 94.18KB read
+Requests/sec:     22.06
+wrk -t4 -c1000 -d10s --timeout 30s http://127.0.0.1:18081/index.html
+  222 requests in 10.07s, 94.61KB read
+Requests/sec:     22.04
+
+scene S3, model fork, commit 23a1316
+wrk -t4 -c10 -d10s --timeout 30s http://127.0.0.1:18082/index.html
+  1773 requests in 10.10s, 755.61KB read
+Requests/sec:    175.56
+wrk -t4 -c100 -d10s --timeout 30s http://127.0.0.1:18082/index.html
+  22039 requests in 10.01s, 9.17MB read
+Requests/sec:   2201.73
+wrk -t4 -c1000 -d10s --timeout 30s http://127.0.0.1:18082/index.html
+  214519 requests in 10.10s, 89.28MB read
+Requests/sec:  21239.84
+max server processes: 1001
+
+scene S3, model pool, commit 23a1316
+wrk -t4 -c10 -d10s --timeout 30s http://127.0.0.1:18083/index.html
+  889 requests in 10.10s, 378.87KB read
+Requests/sec:     88.02
+wrk -t4 -c100 -d10s --timeout 30s http://127.0.0.1:18083/index.html
+  889 requests in 10.02s, 378.87KB read
+Requests/sec:     88.73
+wrk -t4 -c1000 -d10s --timeout 30s http://127.0.0.1:18083/index.html
+  888 requests in 10.08s, 378.44KB read
+Requests/sec:     88.13
+
+scene S3, model epoll, commit 23a1316
+wrk -t4 -c10 -d10s --timeout 30s http://127.0.0.1:18084/index.html
+  1760 requests in 10.00s, 750.07KB read
+Requests/sec:    175.95
+wrk -t4 -c100 -d10s --timeout 30s http://127.0.0.1:18084/index.html
+  22174 requests in 10.01s, 9.23MB read
+Requests/sec:   2214.93
+wrk -t4 -c1000 -d10s --timeout 30s http://127.0.0.1:18084/index.html
+  215803 requests in 10.09s, 89.81MB read
+Requests/sec:  21383.02
+

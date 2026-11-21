@@ -1,0 +1,16 @@
+scene S2b, model iter, commit 23a1316
+curl time_total (s):
+118.659227 200
+
+scene S2b, model fork, commit 23a1316
+curl time_total (s):
+0.000479 200
+
+scene S2b, model pool, commit 23a1316
+curl time_total (s):
+87.937552 200
+
+scene S2b, model epoll, commit 23a1316
+curl time_total (s):
+0.000475 200
+
