@@ -1,0 +1,6 @@
+/server
+/server-asan
+/tests/unit
+/tests/unit-asan
+/tests/__pycache__/
+*.dSYM/
