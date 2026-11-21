@@ -6,14 +6,24 @@ TIDY_FLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc
 
 CORE_SRCS = src/http_parse.c src/router.c src/mime.c src/response.c \
 	src/serve.c src/handlers.c
+SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/main.c \
+	src/model_iter.c src/model_fork.c src/model_pool.c src/model_epoll.c
 HEADERS = $(wildcard src/*.h)
 TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS))
 FORMAT_FILES = $(wildcard src/*.c src/*.h tests/*.c tests/*.h)
 
-.PHONY: all test format lint clean
+.PHONY: all test asan format lint clean
 
-all: $(TEST_BINS)
+all: server
+
+server: $(SERVER_SRCS) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_SRCS)
+
+asan: server-asan
+
+server-asan: $(SERVER_SRCS) $(HEADERS)
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $(SERVER_SRCS)
 
 build/test_%: tests/test_%.c tests/check.h $(CORE_SRCS) $(HEADERS)
 	@mkdir -p build
@@ -31,4 +41,4 @@ lint:
 	clang-format --dry-run -Werror $(FORMAT_FILES)
 
 clean:
-	rm -rf build
+	rm -rf server server-asan build
