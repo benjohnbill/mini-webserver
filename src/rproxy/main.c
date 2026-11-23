@@ -154,6 +154,10 @@ static int origin_fetch(struct rproxy *rproxy, const struct request *request,
 static void reply_send(struct tls_session *session, const char *reply,
                        size_t reply_len, const char *cache_name);
 static int reply_get_status(const char *reply, size_t reply_len);
+static bool reply_is_not_modified(const struct request *request,
+                                  const char *reply, size_t reply_len);
+static bool not_modified_send(struct tls_session *session, const char *reply,
+                              size_t reply_len, struct exchange *exchange);
 static void tarpit_hold(int seconds);
 static void connection_drain(int conn_fd);
 static void exchange_log(const struct exchange *exchange);
@@ -771,10 +775,16 @@ static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
         }
         exchange->cache_name = rproxy->cache != NULL ? "miss" : "-";
     }
-    reply_send(session, reply, reply_len,
-               rproxy->cache != NULL ? exchange->cache_name : NULL);
-    exchange->status = reply_get_status(reply, reply_len);
-    exchange->reply_bytes = reply_len;
+    /* With the cache on, a matching If-None-Match gets a 304. */
+    bool is_sent = rproxy->cache != NULL &&
+                   reply_is_not_modified(request, reply, reply_len) &&
+                   not_modified_send(session, reply, reply_len, exchange);
+    if (!is_sent) {
+        reply_send(session, reply, reply_len,
+                   rproxy->cache != NULL ? exchange->cache_name : NULL);
+        exchange->status = reply_get_status(reply, reply_len);
+        exchange->reply_bytes = reply_len;
+    }
     free(reply);
 }
 
@@ -845,6 +855,43 @@ static int reply_get_status(const char *reply, size_t reply_len)
     memcpy(text, reply + STATUS_OFFSET, STATUS_DIGITS);
 
     return atoi(text);
+}
+
+/* A GET whose If-None-Match names the ETag of a 200 reply (RFC 9110
+   section 13.1.2). The Origin never sees If-None-Match (forward.c). */
+static bool reply_is_not_modified(const struct request *request,
+                                  const char *reply, size_t reply_len)
+{
+    const char *if_none_match = http_find_header(request, "If-None-Match");
+
+    return if_none_match != NULL && strcmp(request->method, "GET") == 0 &&
+           reply_get_status(reply, reply_len) == 200 &&
+           cache_is_not_modified(reply, reply_len, if_none_match);
+}
+
+/* Sends a 304 with the ETag and X-Cache, and no body. Returns false, and
+   sends nothing, if the ETag does not fit. On a miss the log keeps the
+   reply bytes from the Origin, for the Scene; on a hit it gets the 304
+   bytes. */
+static bool not_modified_send(struct tls_session *session, const char *reply,
+                              size_t reply_len, struct exchange *exchange)
+{
+    char text[REPLY_TEXT_MAX];
+    size_t etag_len = 0;
+    const char *etag = cache_find_etag(reply, reply_len, &etag_len);
+    bool is_hit = strcmp(exchange->cache_name, "hit") == 0;
+    int len = snprintf(text, sizeof(text),
+                       "HTTP/1.1 304 Not Modified\r\nX-Cache: %s\r\n"
+                       "ETag: %.*s\r\nConnection: close\r\n\r\n",
+                       is_hit ? "HIT" : "MISS", (int)etag_len, etag);
+    if (len < 0 || (size_t)len >= sizeof(text)) {
+        return false;
+    }
+    tls_session_send(session, text, (size_t)len);
+    exchange->status = 304;
+    exchange->reply_bytes = is_hit ? (size_t)len : reply_len;
+
+    return true;
 }
 
 /* Holds the Worker one second at a time, so that a stop does not wait. */

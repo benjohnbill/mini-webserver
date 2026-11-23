@@ -39,6 +39,10 @@ bool cache_store(struct cache *cache, const char *key, const char *reply,
    names any ETag. A Shared function with no lock: it reads only reply. */
 bool cache_is_not_modified(const char *reply, size_t reply_len,
                            const char *if_none_match);
+/* Returns the ETag value in the header section of reply, with its quotes
+   and no spaces around it, and sets *etag_len. NULL if it has none. */
+const char *cache_find_etag(const char *reply, size_t reply_len,
+                            size_t *etag_len);
 
 void cache_stats_get(struct cache *cache, struct cache_stats *stats);
 

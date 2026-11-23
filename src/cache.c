@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #define CACHE_CONTROL_LEN (sizeof("Cache-Control:") - 1)
+#define WEAK_PREFIX "W/"
+#define WEAK_PREFIX_LEN (sizeof(WEAK_PREFIX) - 1)
 #define FNV_OFFSET 14695981039346656037ULL
 #define FNV_PRIME 1099511628211ULL
 
@@ -77,6 +79,12 @@ static void order_make_room(struct cache *cache, uint64_t hash,
                             size_t block_size);
 static void order_append(struct cache *cache, struct cache_entry *entry);
 static void order_unlink(struct cache *cache, struct cache_entry *entry);
+static const char *reply_find_header(const char *reply, size_t reply_len,
+                                     const char *name, size_t *value_len);
+static const char *text_trim_spaces(const char *text, size_t *text_len);
+static bool char_is_space(char byte);
+static bool etag_list_has(const char *list, const char *etag, size_t etag_len);
+static const char *etag_strip_weak(const char *etag, size_t *etag_len);
 
 struct cache *cache_create(const struct cache_options *options)
 {
@@ -168,6 +176,29 @@ bool cache_store(struct cache *cache, const char *key, const char *reply,
     pthread_mutex_unlock(&stripe->lock);
 
     return entry != NULL;
+}
+
+bool cache_is_not_modified(const char *reply, size_t reply_len,
+                           const char *if_none_match)
+{
+    size_t etag_len = 0;
+    const char *etag = cache_find_etag(reply, reply_len, &etag_len);
+    if (etag == NULL) {
+        return false;
+    }
+    size_t list_len = strlen(if_none_match);
+    const char *list = text_trim_spaces(if_none_match, &list_len);
+    if (list_len == 1 && list[0] == '*') {
+        return true;
+    }
+
+    return etag_list_has(if_none_match, etag, etag_len);
+}
+
+const char *cache_find_etag(const char *reply, size_t reply_len,
+                            size_t *etag_len)
+{
+    return reply_find_header(reply, reply_len, "ETag", etag_len);
 }
 
 void cache_stats_get(struct cache *cache, struct cache_stats *stats)
@@ -435,12 +466,78 @@ static void order_unlink(struct cache *cache, struct cache_entry *entry)
     }
 }
 
-bool cache_is_not_modified(const char *reply, size_t reply_len,
-                           const char *if_none_match)
+/* Returns the value of the first header line with this name, with no
+   spaces around it, or NULL. It reads only the header section. */
+static const char *reply_find_header(const char *reply, size_t reply_len,
+                                     const char *name, size_t *value_len)
 {
-    (void)reply;
-    (void)reply_len;
-    (void)if_none_match;
+    size_t name_len = strlen(name);
+    const char *end = reply + reply_len;
+    const char *status_end = memchr(reply, '\n', reply_len);
+    const char *line = status_end != NULL ? status_end + 1 : end;
+    while (line < end) {
+        const char *next = memchr(line, '\n', (size_t)(end - line));
+        size_t line_len =
+            next != NULL ? (size_t)(next - line) : (size_t)(end - line);
+        if (line_len <= 1) {
+            return NULL; /* the empty line: the header ends */
+        }
+        if (line_len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            *value_len = line_len - name_len - 1;
+            return text_trim_spaces(line + name_len + 1, value_len);
+        }
+        line = next != NULL ? next + 1 : end;
+    }
 
-    return false; /* TODO(step 7): tests first, then this body */
+    return NULL;
+}
+
+/* Trims spaces, tabs, and a CR from both ends of text_len bytes. */
+static const char *text_trim_spaces(const char *text, size_t *text_len)
+{
+    while (*text_len > 0 && char_is_space(text[0])) {
+        text++;
+        (*text_len)--;
+    }
+    while (*text_len > 0 && char_is_space(text[*text_len - 1])) {
+        (*text_len)--;
+    }
+
+    return text;
+}
+
+static bool char_is_space(char byte)
+{
+    return byte == ' ' || byte == '\t' || byte == '\r';
+}
+
+/* The weak comparison of RFC 9110 section 13.1.2: both sides lose a W/
+   prefix, and the opaque tags compare with their quotes. */
+static bool etag_list_has(const char *list, const char *etag, size_t etag_len)
+{
+    etag = etag_strip_weak(etag, &etag_len);
+    while (*list != '\0') {
+        size_t item_len = strcspn(list, ",");
+        const char *next = list + item_len;
+        const char *item =
+            etag_strip_weak(text_trim_spaces(list, &item_len), &item_len);
+        if (item_len == etag_len && memcmp(item, etag, etag_len) == 0) {
+            return true;
+        }
+        list = *next == ',' ? next + 1 : next;
+    }
+
+    return false;
+}
+
+static const char *etag_strip_weak(const char *etag, size_t *etag_len)
+{
+    if (*etag_len >= WEAK_PREFIX_LEN &&
+        memcmp(etag, WEAK_PREFIX, WEAK_PREFIX_LEN) == 0) {
+        *etag_len -= WEAK_PREFIX_LEN;
+        return etag + WEAK_PREFIX_LEN;
+    }
+
+    return etag;
 }
