@@ -7,7 +7,9 @@
 /* tests/data/openssl_client_hello.bin is the ClientHello of
    "openssl s_client -servername example.com -alpn h2,http/1.1"
    (OpenSSL 3.5.5). openssl_client_hello.trace is the -trace output of the
-   same connection. The expected values come from that trace. */
+   same connection. The expected values come from that trace. An OpenSSL
+   error line breaks the rsa_pkcs1_sha224 (0x0301) entry of the trace. The
+   raw bytes have 26 signature algorithms. */
 
 #define FILE_MAX 4096
 #define RECORD_MAX 1024
@@ -22,10 +24,10 @@ static size_t fixture_read(const char *path, unsigned char *bytes)
     return len;
 }
 
-static void put_u16(unsigned char *at, size_t value)
+static void put_u16(unsigned char *dest, size_t value)
 {
-    at[0] = (unsigned char)(value >> 8);
-    at[1] = (unsigned char)value;
+    dest[0] = (unsigned char)(value >> 8);
+    dest[1] = (unsigned char)value;
 }
 
 /* Makes one record with a ClientHello: version 0x0303, a zero random, no
@@ -35,33 +37,35 @@ static size_t record_make(const uint16_t *ciphers, size_t cipher_count,
                           size_t extensions_len, unsigned char *record)
 {
     unsigned char *body = record + 9;
-    size_t at = 0;
-    put_u16(body + at, 0x0303);
-    at += 2;
-    memset(body + at, 0, 32);
-    at += 32;
-    body[at++] = 0;
-    put_u16(body + at, cipher_count * 2);
-    at += 2;
+    size_t offset = 0;
+    put_u16(body + offset, 0x0303);
+    offset += 2;
+    memset(body + offset, 0, 32);
+    offset += 32;
+    body[offset++] = 0;
+    put_u16(body + offset, cipher_count * 2);
+    offset += 2;
     for (size_t i = 0; i < cipher_count; i++) {
-        put_u16(body + at, ciphers[i]);
-        at += 2;
+        put_u16(body + offset, ciphers[i]);
+        offset += 2;
     }
-    body[at++] = 1;
-    body[at++] = 0;
-    put_u16(body + at, extensions_len);
-    at += 2;
-    memcpy(body + at, extensions, extensions_len);
-    at += extensions_len;
+    body[offset++] = 1;
+    body[offset++] = 0;
+    put_u16(body + offset, extensions_len);
+    offset += 2;
+    if (extensions_len > 0) {
+        memcpy(body + offset, extensions, extensions_len);
+    }
+    offset += extensions_len;
 
     record[0] = 0x16;
     put_u16(record + 1, 0x0301);
-    put_u16(record + 3, at + 4);
+    put_u16(record + 3, offset + 4);
     record[5] = 1;
     record[6] = 0;
-    put_u16(record + 7, at);
+    put_u16(record + 7, offset);
 
-    return at + 9;
+    return offset + 9;
 }
 
 static enum client_hello_status openssl_hello_parse(struct client_hello *hello)
@@ -116,10 +120,11 @@ static void the_openssl_hello_keeps_the_signature_algorithms_in_order(void)
 {
     struct client_hello hello;
     CHECK_EQ_INT(openssl_hello_parse(&hello), CLIENT_HELLO_OK);
-    CHECK_EQ_INT(hello.signature_count, 25);
+    CHECK_EQ_INT(hello.signature_count, 26);
     CHECK_EQ_INT(hello.signatures[0], 0x0905);
     CHECK_EQ_INT(hello.signatures[3], 0x0403);
-    CHECK_EQ_INT(hello.signatures[24], 0x0602);
+    CHECK_EQ_INT(hello.signatures[21], 0x0301);
+    CHECK_EQ_INT(hello.signatures[25], 0x0602);
 }
 
 static void the_openssl_hello_gives_the_first_alpn_protocol(void)
@@ -155,9 +160,9 @@ static void a_plain_http_request_is_invalid(void)
 {
     const char *text = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
     struct client_hello hello;
-    CHECK_EQ_INT(client_hello_parse((const unsigned char *)text,
-                                    strlen(text), &hello),
-                 CLIENT_HELLO_INVALID);
+    CHECK_EQ_INT(
+        client_hello_parse((const unsigned char *)text, strlen(text), &hello),
+        CLIENT_HELLO_INVALID);
 }
 
 static void one_byte_of_plain_http_is_already_invalid(void)
@@ -174,8 +179,7 @@ static void a_handshake_that_is_not_a_client_hello_is_invalid(void)
     size_t len = record_make(ciphers, 1, NULL, 0, record);
     record[5] = 2; /* ServerHello */
     struct client_hello hello;
-    CHECK_EQ_INT(client_hello_parse(record, len, &hello),
-                 CLIENT_HELLO_INVALID);
+    CHECK_EQ_INT(client_hello_parse(record, len, &hello), CLIENT_HELLO_INVALID);
 }
 
 static void grease_values_stay_in_the_lists(void)
@@ -183,8 +187,8 @@ static void grease_values_stay_in_the_lists(void)
     static const uint16_t ciphers[] = {0x0a0a, 0x1301};
     static const unsigned char extensions[] = {0x1a, 0x1a, 0x00, 0x00};
     unsigned char record[RECORD_MAX];
-    size_t len = record_make(ciphers, 2, extensions, sizeof(extensions),
-                             record);
+    size_t len =
+        record_make(ciphers, 2, extensions, sizeof(extensions), record);
     struct client_hello hello;
     CHECK_EQ_INT(client_hello_parse(record, len, &hello), CLIENT_HELLO_OK);
     CHECK_EQ_INT(hello.cipher_count, 2);
@@ -210,14 +214,13 @@ static void an_extension_longer_than_the_list_is_invalid(void)
 {
     static const uint16_t ciphers[] = {0x1301};
     /* type 0x0017, length 8, but only 2 bytes of data follow. */
-    static const unsigned char extensions[] = {0x00, 0x17, 0x00, 0x08,
-                                               0x00, 0x00};
+    static const unsigned char extensions[] = {0x00, 0x17, 0x00,
+                                               0x08, 0x00, 0x00};
     unsigned char record[RECORD_MAX];
-    size_t len = record_make(ciphers, 1, extensions, sizeof(extensions),
-                             record);
+    size_t len =
+        record_make(ciphers, 1, extensions, sizeof(extensions), record);
     struct client_hello hello;
-    CHECK_EQ_INT(client_hello_parse(record, len, &hello),
-                 CLIENT_HELLO_INVALID);
+    CHECK_EQ_INT(client_hello_parse(record, len, &hello), CLIENT_HELLO_INVALID);
 }
 
 static void an_alpn_name_longer_than_its_extension_is_invalid(void)
@@ -227,11 +230,10 @@ static void an_alpn_name_longer_than_its_extension_is_invalid(void)
     static const unsigned char extensions[] = {0x00, 0x10, 0x00, 0x05, 0x00,
                                                0x03, 0x09, 0x68, 0x32};
     unsigned char record[RECORD_MAX];
-    size_t len = record_make(ciphers, 1, extensions, sizeof(extensions),
-                             record);
+    size_t len =
+        record_make(ciphers, 1, extensions, sizeof(extensions), record);
     struct client_hello hello;
-    CHECK_EQ_INT(client_hello_parse(record, len, &hello),
-                 CLIENT_HELLO_INVALID);
+    CHECK_EQ_INT(client_hello_parse(record, len, &hello), CLIENT_HELLO_INVALID);
 }
 
 static void more_ciphers_than_the_max_is_invalid(void)
@@ -241,11 +243,10 @@ static void more_ciphers_than_the_max_is_invalid(void)
         ciphers[i] = (uint16_t)(0x1000 + i);
     }
     unsigned char record[RECORD_MAX];
-    size_t len = record_make(ciphers, CLIENT_HELLO_CIPHER_MAX + 1, NULL, 0,
-                             record);
+    size_t len =
+        record_make(ciphers, CLIENT_HELLO_CIPHER_MAX + 1, NULL, 0, record);
     struct client_hello hello;
-    CHECK_EQ_INT(client_hello_parse(record, len, &hello),
-                 CLIENT_HELLO_INVALID);
+    CHECK_EQ_INT(client_hello_parse(record, len, &hello), CLIENT_HELLO_INVALID);
 }
 
 static void exactly_the_max_of_ciphers_parses(void)
@@ -255,8 +256,7 @@ static void exactly_the_max_of_ciphers_parses(void)
         ciphers[i] = (uint16_t)(0x1000 + i);
     }
     unsigned char record[RECORD_MAX];
-    size_t len =
-        record_make(ciphers, CLIENT_HELLO_CIPHER_MAX, NULL, 0, record);
+    size_t len = record_make(ciphers, CLIENT_HELLO_CIPHER_MAX, NULL, 0, record);
     struct client_hello hello;
     CHECK_EQ_INT(client_hello_parse(record, len, &hello), CLIENT_HELLO_OK);
     CHECK_EQ_INT(hello.cipher_count, CLIENT_HELLO_CIPHER_MAX);
