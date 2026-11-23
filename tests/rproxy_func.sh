@@ -203,6 +203,12 @@ count=$(grep -c '^GET /off ' "$WORK/A.log")
 [ "$count" = "2" ] && pass "without --cache on every GET reaches the Origin" \
     || fail "without --cache on every GET reaches the Origin: saw $count"
 
+# The JA4 as the rate limit key.
+start_proxy --origin "$HOST:$ORIGIN_A" --rate 5 --rate-key ja4
+got="$(fetch "$BASE/")"
+[ "$got" = "200 A" ] && pass "rproxy starts and serves with --rate-key ja4" \
+    || fail "rproxy starts and serves with --rate-key ja4: got '$got'"
+
 # The real server as the Origin.
 ./server "$SERVER_PORT" www > /dev/null 2> "$WORK/server.err" &
 PIDS+=($!)

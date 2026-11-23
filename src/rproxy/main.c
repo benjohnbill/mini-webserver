@@ -44,6 +44,9 @@
 #define CONN_CLOSED (-2)
 #define NANOSECONDS_PER_SECOND 1e9
 
+/* The key of the rate limit table. */
+enum rate_key { RATE_KEY_IP, RATE_KEY_JA4 };
+
 struct rproxy_config {
     int port;
     const char *cert_file;
@@ -52,6 +55,7 @@ struct rproxy_config {
     int workers;
     double rate;
     double burst;
+    enum rate_key rate_key;
     int tarpit;
     struct cache_options cache_options;
 };
@@ -84,6 +88,7 @@ struct exchange {
     const char *cache_name; /* "hit", "miss", or "-" */
     int origin_index;       /* -1 if no Origin was picked */
     int status;             /* 0 if no reply was sent */
+    size_t reply_bytes;     /* the reply to the client, without X-Cache */
     bool needs_drain;
 };
 
@@ -100,6 +105,7 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
                          const char *value);
 static bool number_parse(const char *text, long min, long max, int *number);
 static bool real_parse(const char *text, double min, double *number);
+static bool rate_key_parse(const char *text, enum rate_key *rate_key);
 static bool origin_add(struct origin_list *list, const char *text);
 static bool rproxy_start(struct rproxy *rproxy);
 static void rproxy_stop(struct rproxy *rproxy);
@@ -160,7 +166,7 @@ int main(int argc, char **argv)
                 "usage: ./rproxy --port P --cert FILE --key FILE "
                 "--origin HOST:PORT [--origin HOST:PORT ...] "
                 "[--origin-timeout S] [--workers N] [--rate R] [--burst B] "
-                "[--tarpit S] [--cache off|on] "
+                "[--rate-key ip|ja4] [--tarpit S] [--cache off|on] "
                 "[--cache-admit all|size|second] [--cache-object-max BYTES] "
                 "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
                 "[--cache-lock global|striped]\n");
@@ -232,6 +238,9 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     if (strcmp(name, "--burst") == 0) {
         return real_parse(value, 1, &config->burst);
     }
+    if (strcmp(name, "--rate-key") == 0) {
+        return rate_key_parse(value, &config->rate_key);
+    }
     if (strcmp(name, "--tarpit") == 0) {
         return number_parse(value, 0, TIMEOUT_MAX, &config->tarpit);
     }
@@ -263,6 +272,20 @@ static bool real_parse(const char *text, double min, double *number)
     *number = value;
 
     return true;
+}
+
+static bool rate_key_parse(const char *text, enum rate_key *rate_key)
+{
+    if (strcmp(text, "ip") == 0) {
+        *rate_key = RATE_KEY_IP;
+        return true;
+    }
+    if (strcmp(text, "ja4") == 0) {
+        *rate_key = RATE_KEY_JA4;
+        return true;
+    }
+
+    return false;
 }
 
 static bool origin_add(struct origin_list *list, const char *text)
@@ -637,6 +660,7 @@ static void reply_send_status(struct tls_session *session, int status,
                        status, reason, body_len, retry_line, body);
     tls_session_send(session, text, (size_t)len);
     exchange->status = status;
+    exchange->reply_bytes = (size_t)len;
 }
 
 static const char *status_get_reason(int status)
@@ -677,8 +701,11 @@ static struct verdict request_decide(struct rproxy *rproxy,
                                       .user_agent = request->user_agent,
                                       .target = request->target};
     if (rproxy->limit != NULL) {
-        signals.retry_after = rate_limit_take(
-            rproxy->limit, exchange->client_ip, clock_get_seconds());
+        const char *key = rproxy->config.rate_key == RATE_KEY_JA4
+                              ? exchange->ja4
+                              : exchange->client_ip;
+        signals.retry_after =
+            rate_limit_take(rproxy->limit, key, clock_get_seconds());
     }
 
     return verdict_decide(&signals);
@@ -747,6 +774,7 @@ static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
     reply_send(session, reply, reply_len,
                rproxy->cache != NULL ? exchange->cache_name : NULL);
     exchange->status = reply_get_status(reply, reply_len);
+    exchange->reply_bytes = reply_len;
     free(reply);
 }
 
@@ -844,7 +872,9 @@ static void connection_drain(int conn_fd)
 }
 
 /* One line for each connection: client IP, JA4, Verdict, cache result,
-   Origin index, status. "-" marks a value that the connection did not reach. */
+   Origin index, status, reply bytes. "-" marks a value that the connection
+   did not reach. On a cache miss or with the cache off, the reply bytes are
+   the bytes that came from the Origin. */
 static void exchange_log(const struct exchange *exchange)
 {
     char origin_text[LOG_NUMBER_MAX] = "-";
@@ -856,8 +886,8 @@ static void exchange_log(const struct exchange *exchange)
     if (exchange->status > 0) {
         snprintf(status_text, sizeof(status_text), "%d", exchange->status);
     }
-    fprintf(stderr, "%s %s %s %s %s %s\n", exchange->client_ip,
+    fprintf(stderr, "%s %s %s %s %s %s %zu\n", exchange->client_ip,
             exchange->ja4[0] != '\0' ? exchange->ja4 : "-",
             exchange->verdict_name, exchange->cache_name, origin_text,
-            status_text);
+            status_text, exchange->reply_bytes);
 }

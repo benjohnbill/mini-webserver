@@ -116,7 +116,7 @@ proxy_start() {
 # the "cache ..." line and the count of each "verdict cache status" triple.
 log_keep() {
     awk '/^cache / { print; next }
-        NF == 6 { count[$3 " " $4 " " $6]++ }
+        NF == 7 { count[$3 " " $4 " " $6]++ }
         END { for (key in count) print "exchanges", key, count[key] }' \
         "$1" | sort >"$2"
 }
