@@ -227,6 +227,8 @@ start_proxy --origin "$HOST:$ORIGIN_A" --block-list "$WORK/other.txt"
 got="$(fetch "$BASE/")"
 [ "$got" = "200 A" ] && pass "a client IP outside the block list passes" \
     || fail "a client IP outside the block list passes: got '$got'"
+# Stop the last rproxy, so that a failed bind does not pass as a stop.
+stop_proxy
 printf '10.0.0.0/33\n' > "$WORK/bad.txt"
 "$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
     --origin "$HOST:$ORIGIN_A" --block-list "$WORK/bad.txt" \
@@ -333,6 +335,8 @@ got="$(signed_fetch "$signature" "$BASE/index.html")"
 got="$(signed_fetch "$broken" "$BASE/data/1.html" | cut -d' ' -f1)"
 [ "$got" = "402" ] && pass "a broken signature is not verified" \
     || fail "a broken signature is not verified: got '$got'"
+# Stop the last rproxy, so that a failed bind does not pass as a stop.
+stop_proxy
 printf 'not-a-key-line\n' > "$WORK/bad_keys.txt"
 "$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
     --origin "$HOST:$ORIGIN_A" --bot-key "$WORK/bad_keys.txt" \
