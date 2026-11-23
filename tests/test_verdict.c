@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdio.h>
 
 #include "check.h"
@@ -39,6 +40,29 @@ static struct verdict decide_with_not_found(unsigned not_found)
         .user_agent = "curl/8.18.0",
         .target = "/",
         .behavior = {.requests = not_found + 1, .not_found = not_found}};
+
+    return verdict_decide(&signals);
+}
+
+static struct verdict decide_for_pow(const char *target, bool is_pow_target,
+                                     bool pow_ok, int retry_after)
+{
+    struct verdict_signals signals = {.user_agent = "curl/8.18.0",
+                                      .target = target,
+                                      .retry_after = retry_after,
+                                      .is_pow_target = is_pow_target,
+                                      .pow_ok = pow_ok};
+
+    return verdict_decide(&signals);
+}
+
+static struct verdict decide_for_pay(const char *user_agent, bool is_pay_target,
+                                     bool bot_verified)
+{
+    struct verdict_signals signals = {.user_agent = user_agent,
+                                      .target = "/data/1.html",
+                                      .is_pay_target = is_pay_target,
+                                      .bot_verified = bot_verified};
 
     return verdict_decide(&signals);
 }
@@ -165,6 +189,121 @@ static void a_denied_crawler_and_a_slowed_client_are_not_blocked(void)
     CHECK(!decide("curl/8.18.0", 7).blocks_client);
 }
 
+static void a_pow_target_without_a_solution_gets_the_challenge(void)
+{
+    struct verdict verdict = decide_for_pow("/data/1.html", true, false, 0);
+    CHECK_EQ_INT(verdict.kind, VERDICT_CHALLENGE);
+    CHECK(!verdict.blocks_client);
+}
+
+static void a_pow_target_with_a_solution_passes(void)
+{
+    CHECK_EQ_INT(decide_for_pow("/data/1.html", true, true, 0).kind,
+                 VERDICT_PASS);
+}
+
+static void a_target_outside_the_pow_prefix_passes_with_no_solution(void)
+{
+    CHECK_EQ_INT(decide_for_pow("/index.html", false, false, 0).kind,
+                 VERDICT_PASS);
+}
+
+static void a_client_over_the_limit_on_a_pow_target_gets_the_challenge(void)
+{
+    struct verdict verdict = decide_for_pow("/data/1.html", true, false, 7);
+    CHECK_EQ_INT(verdict.kind, VERDICT_CHALLENGE);
+    CHECK_EQ_INT(verdict.retry_after, 0);
+}
+
+static void a_solved_pow_target_over_the_limit_is_slowed(void)
+{
+    struct verdict verdict = decide_for_pow("/data/1.html", true, true, 7);
+    CHECK_EQ_INT(verdict.kind, VERDICT_SLOW);
+    CHECK_EQ_INT(verdict.retry_after, 7);
+}
+
+static void a_false_chrome_on_a_pow_target_is_tarpitted_not_challenged(void)
+{
+    struct verdict_signals signals = {.ja4_label = "curl",
+                                      .user_agent = CHROME_AGENT,
+                                      .target = "/data/1.html",
+                                      .is_pow_target = true};
+    CHECK_EQ_INT(verdict_decide(&signals).kind, VERDICT_TARPIT);
+}
+
+static void the_honeypot_under_a_pow_prefix_is_tarpitted_not_challenged(void)
+{
+    struct verdict verdict = decide_for_pow("/trap/", true, false, 0);
+    CHECK_EQ_INT(verdict.kind, VERDICT_TARPIT);
+    CHECK(verdict.blocks_client);
+}
+
+static void a_named_crawler_on_a_pay_target_must_pay(void)
+{
+    struct verdict verdict = decide_for_pay("GPTBot/1.1", true, false);
+    CHECK_EQ_INT(verdict.kind, VERDICT_PAY);
+    CHECK(!verdict.blocks_client);
+}
+
+static void a_named_crawler_outside_the_pay_prefix_is_denied(void)
+{
+    CHECK_EQ_INT(decide_for_pay("GPTBot/1.1", false, false).kind, VERDICT_DENY);
+}
+
+static void a_client_that_is_not_a_crawler_on_a_pay_target_passes(void)
+{
+    CHECK_EQ_INT(decide_for_pay("curl/8.18.0", true, false).kind, VERDICT_PASS);
+    CHECK_EQ_INT(decide_for_pay(NULL, true, false).kind, VERDICT_PASS);
+}
+
+static void a_verified_bot_with_a_crawler_user_agent_passes(void)
+{
+    CHECK_EQ_INT(decide_for_pay("GPTBot/1.1", true, true).kind, VERDICT_PASS);
+    CHECK_EQ_INT(decide_for_pay("GPTBot/1.1", false, true).kind, VERDICT_PASS);
+}
+
+static void a_verified_bot_skips_the_false_chrome_rule(void)
+{
+    struct verdict_signals signals = {.ja4_label = "curl",
+                                      .user_agent = CHROME_AGENT,
+                                      .target = "/",
+                                      .bot_verified = true};
+    CHECK_EQ_INT(verdict_decide(&signals).kind, VERDICT_PASS);
+}
+
+static void a_verified_bot_skips_the_challenge_and_the_rate_limit(void)
+{
+    struct verdict_signals signals = {.user_agent = "GPTBot/1.1",
+                                      .target = "/data/1.html",
+                                      .retry_after = 7,
+                                      .is_pow_target = true,
+                                      .bot_verified = true};
+    struct verdict verdict = verdict_decide(&signals);
+    CHECK_EQ_INT(verdict.kind, VERDICT_PASS);
+    CHECK_EQ_INT(verdict.retry_after, 0);
+}
+
+static void a_verified_bot_in_the_honeypot_is_tarpitted_and_blocked(void)
+{
+    struct verdict_signals signals = {
+        .user_agent = "GPTBot/1.1", .target = "/trap/", .bot_verified = true};
+    struct verdict verdict = verdict_decide(&signals);
+    CHECK_EQ_INT(verdict.kind, VERDICT_TARPIT);
+    CHECK(verdict.blocks_client);
+}
+
+static void a_verified_bot_with_five_404s_is_denied_and_blocked(void)
+{
+    struct verdict_signals signals = {
+        .user_agent = "GPTBot/1.1",
+        .target = "/",
+        .bot_verified = true,
+        .behavior = {.requests = 6, .not_found = 5}};
+    struct verdict verdict = verdict_decide(&signals);
+    CHECK_EQ_INT(verdict.kind, VERDICT_DENY);
+    CHECK(verdict.blocks_client);
+}
+
 int main(void)
 {
     verification_clients_within_the_limit_pass();
@@ -182,6 +321,21 @@ int main(void)
     a_client_with_five_404s_in_the_window_is_denied_and_blocked();
     a_client_with_four_404s_in_the_window_passes();
     a_denied_crawler_and_a_slowed_client_are_not_blocked();
+    a_pow_target_without_a_solution_gets_the_challenge();
+    a_pow_target_with_a_solution_passes();
+    a_target_outside_the_pow_prefix_passes_with_no_solution();
+    a_client_over_the_limit_on_a_pow_target_gets_the_challenge();
+    a_solved_pow_target_over_the_limit_is_slowed();
+    a_false_chrome_on_a_pow_target_is_tarpitted_not_challenged();
+    the_honeypot_under_a_pow_prefix_is_tarpitted_not_challenged();
+    a_named_crawler_on_a_pay_target_must_pay();
+    a_named_crawler_outside_the_pay_prefix_is_denied();
+    a_client_that_is_not_a_crawler_on_a_pay_target_passes();
+    a_verified_bot_with_a_crawler_user_agent_passes();
+    a_verified_bot_skips_the_false_chrome_rule();
+    a_verified_bot_skips_the_challenge_and_the_rate_limit();
+    a_verified_bot_in_the_honeypot_is_tarpitted_and_blocked();
+    a_verified_bot_with_five_404s_is_denied_and_blocked();
     printf("test_verdict: ok\n");
 
     return 0;

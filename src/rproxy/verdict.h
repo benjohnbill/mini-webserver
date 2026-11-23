@@ -11,9 +11,11 @@
 
 enum verdict_kind {
     VERDICT_PASS,
-    VERDICT_DENY,   /* 403 */
-    VERDICT_SLOW,   /* 429 with Retry-After */
-    VERDICT_TARPIT, /* hold the connection, then close it with no reply */
+    VERDICT_DENY,      /* 403 */
+    VERDICT_SLOW,      /* 429 with Retry-After */
+    VERDICT_TARPIT,    /* hold the connection, then close it with no reply */
+    VERDICT_CHALLENGE, /* 401 with X-PoW-Challenge (Proof of work) */
+    VERDICT_PAY,       /* 402 */
 };
 
 struct verdict_signals {
@@ -23,6 +25,10 @@ struct verdict_signals {
     const char *target;     /* the request target */
     int retry_after;        /* from rate_limit_take: 0 if within the limit */
     struct behavior_counts behavior; /* of the client IP, with this request */
+    bool is_pow_target;              /* the target is under a --pow-prefix */
+    bool pow_ok;        /* X-PoW solves the challenge of the client */
+    bool is_pay_target; /* the target is under a --pay-prefix */
+    bool bot_verified;  /* a Web Bot Auth signature passed */
 };
 
 struct verdict {

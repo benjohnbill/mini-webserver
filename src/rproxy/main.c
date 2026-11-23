@@ -979,6 +979,11 @@ static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
         exchange->verdict_name = "tarpit";
         tarpit_hold(rproxy->config.tarpit);
         break;
+    case VERDICT_CHALLENGE: /* step 10 wires the reply */
+    case VERDICT_PAY:       /* step 11 wires the reply */
+        exchange->verdict_name = "deny";
+        reply_send_status(session, 403, 0, exchange);
+        break;
     }
 }
 
