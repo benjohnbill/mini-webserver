@@ -176,6 +176,33 @@ got="$(fetch -H "X-Long: $long" "$BASE/" | cut -d' ' -f1)"
 [ "$got" = "431" ] && pass "a header over 8192 bytes gives 431" \
     || fail "a header over 8192 bytes gives 431: got '$got'"
 
+# The cache: a hit does not reach the Origin.
+start_proxy --origin "$HOST:$ORIGIN_A" --cache on
+: > "$WORK/A.log"
+curl -sk --max-time 5 -D "$WORK/h1" -o /dev/null "$BASE/cached"
+curl -sk --max-time 5 -D "$WORK/h2" -o "$WORK/body" "$BASE/cached"
+count=$(grep -c '^GET /cached ' "$WORK/A.log")
+[ "$count" = "1" ] && grep -qi $'^x-cache: hit\r$' "$WORK/h2" \
+    && [ "$(cat "$WORK/body")" = "A" ] \
+    && pass "a second GET is a cache hit and does not reach the Origin" \
+    || fail "a second GET is a cache hit: Origin saw $count requests"
+grep -qi $'^x-cache: miss\r$' "$WORK/h1" \
+    && pass "the first GET is a cache miss" \
+    || fail "the first GET is a cache miss"
+: > "$WORK/A.log"
+curl -sk --max-time 5 -o /dev/null --data-binary 'x' "$BASE/cached"
+curl -sk --max-time 5 -o /dev/null --data-binary 'x' "$BASE/cached"
+count=$(grep -c '^POST /cached ' "$WORK/A.log")
+[ "$count" = "2" ] && pass "a POST is not cached" \
+    || fail "a POST is not cached: Origin saw $count requests"
+start_proxy --origin "$HOST:$ORIGIN_A"
+: > "$WORK/A.log"
+fetch "$BASE/off" > /dev/null
+fetch "$BASE/off" > /dev/null
+count=$(grep -c '^GET /off ' "$WORK/A.log")
+[ "$count" = "2" ] && pass "without --cache on every GET reaches the Origin" \
+    || fail "without --cache on every GET reaches the Origin: saw $count"
+
 # The real server as the Origin.
 ./server "$SERVER_PORT" www > /dev/null 2> "$WORK/server.err" &
 PIDS+=($!)
