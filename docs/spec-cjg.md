@@ -362,6 +362,32 @@ The owner types the decision code. The generator writes the byte parser and the 
 | 2 | `rate_limit`: the token bucket and the key table | How much may one key ask, and what does the table forget? |
 | 3 | `verdict`: the table from signals to a Verdict | Which signal is strong enough to deny, and which Verification client must still pass? |
 
+### Arena
+
+`bench/arena/scene.sh <crawler> [preset...]` runs one Crawler script and `human.sh` side by side against `rproxy`, for each preset, and writes `docs/measurements/<date>-arena-<crawler>.md`. The Origin is `./server --model pool --delay 10`. The Scene counts the rproxy log lines of each client kind: the Verdicts, the cache hits, the requests to the Origin, and the bytes from the Origin. It does not pass or fail.
+
+| Crawler script | What it does |
+|---|---|
+| `repeat` | It downloads one 2 MiB file again and again, with no conditional headers (the Read the Docs case). |
+| `longtail` | It reads dataset pages (`bench/cache/make-dataset.sh`) in a uniform random order. |
+| `named` | It sends the honest User-Agent `GPTBot/1.1` and walks all pages as fast as it can. |
+| `disguised` | It sends a Chrome-on-macOS User-Agent, but its TLS is curl, so its JA4 is the JA4 of curl. |
+| `spread` | It is `named`, but it sends from 32 source addresses, 127.0.0.2 to 127.0.0.33. |
+
+`human.sh` is a slow Verification client. It loads the home page and its four parts, then waits 1 to 3 s. It sends from 127.0.0.200, so the Scene can find its log lines. It shows if a defense also stops a real user. It is curl, so its JA4 is the JA4 of all Crawler scripts.
+
+| Preset | rproxy flags | Owner slot that it needs |
+|---|---|---|
+| `none` | no flags | none |
+| `cache` | `--cache on` | none: the cache is generated code |
+| `rate-ip` | `--rate 5 --burst 10` | `rate_limit_take` (row 2) and `verdict_decide` (row 3), which turns `retry_after` into a 429 |
+| `rate-ja4` | `rate-ip` and `--rate-key ja4` | `ja4_format` (row 1) for the key, and rows 2 and 3 |
+| `all` | `cache` and `rate-ja4` | rows 1, 2, and 3 |
+
+A Verdict from the User-Agent or the JA4 (deny or tarpit for `named` or `disguised`) needs `verdict_decide` (row 3). Until the owner types a slot, the presets that need it give the same rows as `none` or `cache`.
+
+With `--rate-key ja4`, all clients with one JA4 share one token bucket. All Crawler scripts and `human.sh` use curl, so they share a bucket. While `ja4_format` is a slot, the JA4 of each client is the empty string, so all clients share the key "".
+
 ### Order of work
 
 1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand.
@@ -369,4 +395,4 @@ The owner types the decision code. The generator writes the byte parser and the 
 3. `tls`, `forward`, `main`, and `tests/rproxy_func.sh`.
 4. `rate_limit` and `verdict`: tests first, then the slots.
 5. Done (2026-11-24). The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server. Parity: [`20261124-rproxy-cache-parity.md`](measurements/20261124-rproxy-cache-parity.md).
-6. Crawler scripts and the Scenes of the arena.
+6. Crawler scripts and the Scenes of the arena (section "Arena").
