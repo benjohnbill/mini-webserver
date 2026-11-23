@@ -1,0 +1,6 @@
+cache pid=1561665 hits=31770 misses=219 rejects=19 evictions=0 expired=0 bytes=17402752 entries=200
+exchanges - - - 8
+exchanges no-handshake - - 23
+exchanges no-tls - - 10
+exchanges pass hit 200 31770
+exchanges pass miss 200 219
