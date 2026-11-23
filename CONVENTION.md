@@ -60,6 +60,9 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | A parsed ClientHello | `struct client_hello *hello` | `ch`, `chello` |
    | The rate limit table | `struct rate_limit *limit` | `rl`, `limiter` |
    | The Origins of the Reverse Proxy | `struct origin_list *list` | `backends`, `upstreams` |
+   | The block list (CIDR ranges) | `struct ip_list *block_list` | `list`, `ranges`, `blocklist` |
+   | The JA4 table | `struct ja4_table *fingerprints` | `table`, `ja4s` |
+   | The block table | `struct block_table *blocks` | `table`, `bans`, `jail` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

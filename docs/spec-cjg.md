@@ -442,6 +442,30 @@ The generator writes `ip_list`, `block_table`, `behavior`, `pow`, `bot_auth`, th
 
 `named`, `disguised`, and `spread` stay. With the JA4 table, `disguised` (a Chrome User-Agent with the JA4 of curl) becomes visible. A new preset `layers` turns on every defense.
 
+#### Defaults taken from practice
+
+The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-24). Each row is a value that the generator chose. The owner can change each row.
+
+| Choice | Value | Source |
+|---|---|---|
+| Connection Verdict drop | `rproxy` closes the socket with the ClientHello unread. The kernel then sends RST. No TLS byte goes out | nginx `return 444` (close with no reply) and `ssl_reject_handshake on` (stop before the handshake) |
+| Rule order in `connection_decide` | A table of rules. The first rule that matches wins. No match: pass. Block list hit: drop. Block table hit: drop. A JA4 label alone: pass. Tarpit has no rule yet | nginx `ngx_http_access_module`: "rules are checked in sequence until the first match is found" |
+| Range format | `ADDRESS/BITS` | RFC 4632 section 3.1 (IPv4), RFC 4291 section 2.3 (IPv6) |
+| An address with no `/BITS` | It is one address: `/32` or `/128` | nginx `allow` and `deny` take an address or a CIDR range |
+| Bits after the prefix (`10.9.9.9/8`) | Accepted and set to zero | nginx accepts them and warns "low address bits are meaningless" |
+| An IPv4-mapped IPv6 client (`::ffff:a.b.c.d`) | It matches the IPv4 ranges | RFC 4291 section 2.5.5.2. nginx `ngx_http_access_module` does the same |
+| Comments and blank lines in the two list files | `#` starts a comment to the end of the line. Blank lines are skipped. `\r\n` is accepted | nginx configuration files and `geo` include files |
+| JA4 table line | `JA4 LABEL`, two words. The JA4 has 36 characters. A JA4 two times: the first line wins | nginx `map` include file (`key value`). The first-line rule is our choice |
+| A bad line in a list file | `rproxy` prints the file and the line number, and does not start | nginx `-t`: a bad configuration stops the start |
+| List files reload | No reload. `rproxy` reads them once at the start | Our choice. nginx reloads on `SIGHUP`. A reload needs a lock or a swap of the table |
+| Block table keys | The client IP and the JA4. The empty JA4 (no fingerprint) is never a key | Our choice. SPEC v2 "The layers", row "Trap" |
+| `--block-time` default | 600 s | fail2ban `bantime` default (10 minutes) |
+| Block table bound | 4096 keys, the same as the rate limit table | Our choice |
+| Block table eviction | When it is full, the expired keys leave first. If none expired, the key that expires first leaves | Our choice. nginx `limit_req_zone` also removes old state when its zone is full, by least recent use |
+| Block table concurrency | One mutex for the whole table. A linear search under the lock | Our choice. The rate limit table has the same shape. A search of 4096 keys is cheap next to a TLS handshake |
+| `--block-key KEY` | A key in the block table from the start, for `--block-time`. At most 16 | Our choice, like `fail2ban-client set JAIL banip`. The functional tests use it to test the expiry |
+| Size bounds of the list files | 1024 ranges, 256 JA4 entries, labels of 32 characters, lines of 255 characters | Our choice |
+
 ### Order of work
 
 1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand.
@@ -451,7 +475,7 @@ The generator writes `ip_list`, `block_table`, `behavior`, `pow`, `bot_auth`, th
 5. Done (2026-11-24). The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server. Parity: [`20261124-rproxy-cache-parity.md`](measurements/20261124-rproxy-cache-parity.md).
 6. Crawler scripts and the Scenes of the arena (section "Arena").
 7. Shared core: `http_find_header`, and `ETag` with 304 for static files. Tests first.
-8. Two Verdict stages: `connection_decide` (slot, row 4) with its tests, `ip_list`, `block_table`, and the JA4 table.
+8. Two Verdict stages: `connection_decide` (slot, row 4) with its tests, `ip_list`, `block_table`, and the JA4 table. Done (2026-11-24). The owner chose that the generator writes row 4 by practice. The files: `ip_list`, `ja4_table`, `block_table`, and `connection_verdict` (it holds `connection_decide`). The flags: `--block-list FILE`, `--ja4-list FILE`, `--block-time S`, `--block-key KEY`. A dropped connection logs the Verdict `drop`.
 9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters.
 10. Proof of work.
 11. Web Bot Auth and 402.
