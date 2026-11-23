@@ -63,8 +63,36 @@ A fingerprint of a client, made from its ClientHello by the FoxIO JA4 rules, for
 _Avoid_: TLS hash, JA3 (an older fingerprint with different rules)
 
 **Verdict**:
-The decision of the Reverse Proxy for one request: pass, deny (403), slow down (429), or tarpit.
+A decision of the Reverse Proxy for a client. It has two stages: the connection Verdict and the request Verdict.
 _Avoid_: judgment, action, result
+
+**Connection Verdict**:
+The Verdict before the TLS handshake. It uses the client IP, the JA4, and the block table. It is pass, drop (close with no reply), or tarpit.
+_Avoid_: pre-check, early Verdict, L4 Verdict
+
+**Request Verdict**:
+The Verdict after the request parse. It is pass, deny (403), slow down (429), tarpit, challenge (proof of work), or pay (402).
+_Avoid_: HTTP Verdict, late Verdict
+
+**Block table**:
+The keys (a client IP or a JA4) that the Reverse Proxy blocks until a time. The connection Verdict reads it. A honeypot hit adds a key.
+_Avoid_: ban list, jail, deny list (the block list is the file of CIDR ranges, which does not change at run time)
+
+**Behavior counter**:
+A count for each key of the Reverse Proxy: requests, distinct targets, 404 replies, `robots.txt` reads, and honeypot hits.
+_Avoid_: stats, metrics, score
+
+**Honeypot**:
+The target `/trap/`. A hidden link in `www/index.html` points to it, and `robots.txt` disallows it. A person does not see the link, and a crawler that obeys `robots.txt` does not follow it. So a client that requests it is a crawler that does not obey.
+_Avoid_: trap page, tripwire
+
+**Proof of work**:
+A challenge of the Reverse Proxy: the client must find a counter so that SHA-256 of the nonce and the counter starts with a given number of zero bits. It makes each page cost CPU time for the client.
+_Avoid_: PoW captcha, puzzle, hashcash (the older scheme with this idea)
+
+**Web Bot Auth**:
+A signature on a request by a bot that names itself: RFC 9421 HTTP Message Signatures with an Ed25519 key that the Reverse Proxy knows. A verified bot skips the User-Agent and JA4 rules.
+_Avoid_: bot token, signed agent, verified bot (use it only for a bot whose signature passed)
 
 **Crawler script**:
 A program in `bench/arena/` that acts as one kind of crawler against the Reverse Proxy. A Scene runs Crawler scripts and counts the Verdicts and the load on the Origin.
