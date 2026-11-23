@@ -305,6 +305,48 @@ got="$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
 [ "$got" = "304" ] && pass "a miss with the same If-None-Match is a 304 too" \
     || fail "a miss with the same If-None-Match is a 304 too: got '$got'"
 
+# robots.txt and the Honeypot.
+start_proxy --origin "$HOST:$SERVER_PORT" --tarpit 1 --block-time 60
+curl -sk --max-time 5 -o "$WORK/robots" "$BASE/robots.txt"
+cmp -s "$WORK/robots" www/robots.txt \
+    && pass "GET /robots.txt comes through from ./server" \
+    || fail "GET /robots.txt comes through from ./server"
+got="$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/trap/")"
+[ "$got" = "000" ] \
+    && grep -q '^127\.0\.0\.1 [^ ]* tarpit - - - 0$' "$WORK/rproxy.err" \
+    && pass "a GET of /trap/ is tarpitted" \
+    || fail "a GET of /trap/ is tarpitted: got '$got'"
+grep -q '^behavior 127\.0\.0\.1 requests=2 targets=2 not_found=0 robots=1 trap=1$' \
+    "$WORK/rproxy.err" \
+    && pass "the behavior counters count the robots.txt read and the trap hit" \
+    || fail "the behavior counters count the robots.txt read and the trap hit"
+curl -sk --max-time 5 -o /dev/null "$BASE/" 2>/dev/null
+code=$?
+{ [ "$code" = "35" ] || [ "$code" = "56" ]; } \
+    && grep -q '^127\.0\.0\.1 [^ ]* drop - - - 0$' "$WORK/rproxy.err" \
+    && pass "after the trap the same client IP gets no TLS handshake" \
+    || fail "after the trap the same client IP gets no TLS handshake: curl exit $code"
+got="$(curl -sk --max-time 5 --interface 127.0.0.2 -o /dev/null \
+    -w '%{http_code}' "$BASE/")"
+[ "$got" = "200" ] && pass "a client that did not touch the trap still passes" \
+    || fail "a client that did not touch the trap still passes: got '$got'"
+
+# Five 404 replies in the window: the next request is denied, and the
+# client IP is blocked (fail2ban maxretry 5).
+for _ in 1 2 3 4 5; do
+    curl -sk --max-time 5 --interface 127.0.0.3 -o /dev/null \
+        "$BASE/missing.html"
+done
+got="$(curl -sk --max-time 5 --interface 127.0.0.3 -o /dev/null \
+    -w '%{http_code}' "$BASE/")"
+[ "$got" = "403" ] && pass "a client with five 404 replies is denied" \
+    || fail "a client with five 404 replies is denied: got '$got'"
+curl -sk --max-time 5 --interface 127.0.0.3 -o /dev/null "$BASE/" 2>/dev/null
+code=$?
+[ "$code" = "35" ] || [ "$code" = "56" ] \
+    && pass "after five 404 replies the client IP gets no TLS handshake" \
+    || fail "after five 404 replies the client IP gets no TLS handshake: curl exit $code"
+
 if [ "$FAILS" -gt 0 ]; then
     echo "--- rproxy stderr ---"
     cat "$WORK/rproxy.err"

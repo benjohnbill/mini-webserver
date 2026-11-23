@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "behavior.h"
 #include "block_table.h"
 #include "cache.h"
 #include "cache_options.h"
@@ -41,6 +42,10 @@
 /* fail2ban bantime: 10 minutes. */
 #define DEFAULT_BLOCK_TIME 600
 #define BLOCK_TIME_MAX 86400
+/* fail2ban findtime: 10 minutes. */
+#define BEHAVIOR_WINDOW 600
+/* The same bound as the rate limit table. */
+#define BEHAVIOR_TABLE_KEY_MAX 4096
 /* --block-key can occur this many times. */
 #define BLOCK_KEY_ARG_MAX 16
 /* Room for the headers that rproxy adds to a request for an Origin. */
@@ -87,6 +92,7 @@ struct rproxy {
     struct ip_list *block_list;     /* NULL without --block-list */
     struct ja4_table *fingerprints; /* NULL without --ja4-list */
     struct block_table *blocks;
+    struct behavior *counters;
 };
 
 struct pool {
@@ -104,12 +110,15 @@ struct pool {
 struct exchange {
     char client_ip[INET6_ADDRSTRLEN];
     char ja4[JA4_LEN + 1];
+    const char *ja4_label; /* from the JA4 table: NULL if not there */
     const char *verdict_name;
     const char *cache_name; /* "hit", "miss", or "-" */
     int origin_index;       /* -1 if no Origin was picked */
     int status;             /* 0 if no reply was sent */
     size_t reply_bytes;     /* the reply to the client, without X-Cache */
     bool needs_drain;
+    bool has_behavior; /* the request stage counted this request */
+    struct behavior_counts behavior;
 };
 
 struct request_buffer {
@@ -150,6 +159,7 @@ static void client_ip_get(int conn_fd, char *client_ip, size_t size);
 static enum client_hello_status hello_peek(int conn_fd,
                                            struct client_hello *hello);
 static bool socket_peek_more(int conn_fd, unsigned char *bytes, size_t *len);
+static const char *ja4_label_find(const struct rproxy *rproxy, const char *ja4);
 static enum connection_verdict
 connection_verdict_get(struct rproxy *rproxy, const struct exchange *exchange);
 static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
@@ -164,7 +174,7 @@ static void reply_send_status(struct tls_session *session, int status,
 static const char *status_get_reason(int status);
 static struct verdict request_decide(struct rproxy *rproxy,
                                      const struct request *request,
-                                     const struct exchange *exchange);
+                                     struct exchange *exchange);
 static double clock_get_seconds(void);
 static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
                           const struct request *request,
@@ -185,9 +195,12 @@ static bool reply_is_not_modified(const struct request *request,
                                   const char *reply, size_t reply_len);
 static bool not_modified_send(struct tls_session *session, const char *reply,
                               size_t reply_len, struct exchange *exchange);
+static void client_block(struct rproxy *rproxy,
+                         const struct exchange *exchange);
 static void tarpit_hold(int seconds);
 static void connection_drain(int conn_fd);
 static void exchange_log(const struct exchange *exchange);
+static void behavior_log(const struct exchange *exchange);
 
 int main(int argc, char **argv)
 {
@@ -391,7 +404,8 @@ static bool rproxy_start(struct rproxy *rproxy)
     return true;
 }
 
-/* The files and the block table of the connection Verdict. */
+/* The files and the block table of the connection Verdict, and the
+   behavior counters of the request Verdict. */
 static bool defenses_start(struct rproxy *rproxy)
 {
     const struct rproxy_config *config = &rproxy->config;
@@ -401,6 +415,13 @@ static bool defenses_start(struct rproxy *rproxy)
     rproxy->blocks = block_table_create(BLOCK_TABLE_KEY_MAX);
     if (rproxy->blocks == NULL) {
         fprintf(stderr, "rproxy: block_table_create failed\n");
+        return false;
+    }
+    struct behavior_options options = {.window = BEHAVIOR_WINDOW,
+                                       .key_max = BEHAVIOR_TABLE_KEY_MAX};
+    rproxy->counters = behavior_create(&options);
+    if (rproxy->counters == NULL) {
+        fprintf(stderr, "rproxy: behavior_create failed\n");
         return false;
     }
     double now = clock_get_seconds();
@@ -496,6 +517,7 @@ static void rproxy_stop(struct rproxy *rproxy)
         rate_limit_destroy(rproxy->limit);
     }
     block_table_destroy(rproxy->blocks);
+    behavior_destroy(rproxy->counters);
     free(rproxy->fingerprints);
     free(rproxy->block_list);
     tls_context_destroy(rproxy->context);
@@ -658,6 +680,7 @@ static void connection_serve(struct rproxy *rproxy, int conn_fd)
         return;
     }
     ja4_format(&hello, exchange.ja4);
+    exchange.ja4_label = ja4_label_find(rproxy, exchange.ja4);
     switch (connection_verdict_get(rproxy, &exchange)) {
     case CONN_PASS:
         break;
@@ -751,6 +774,16 @@ static bool socket_peek_more(int conn_fd, unsigned char *bytes, size_t *len)
     return true;
 }
 
+/* An empty JA4 (no ClientHello fingerprint) has no label. */
+static const char *ja4_label_find(const struct rproxy *rproxy, const char *ja4)
+{
+    if (rproxy->fingerprints == NULL || ja4[0] == '\0') {
+        return NULL;
+    }
+
+    return ja4_table_find(rproxy->fingerprints, ja4);
+}
+
 /* The block table has two kinds of keys: client IPs and JA4s. An empty
    JA4 (no ClientHello fingerprint) is never a key. */
 static enum connection_verdict
@@ -765,9 +798,7 @@ connection_verdict_get(struct rproxy *rproxy, const struct exchange *exchange)
         .is_blocked =
             block_table_has_key(rproxy->blocks, exchange->client_ip, now) ||
             (ja4[0] != '\0' && block_table_has_key(rproxy->blocks, ja4, now)),
-        .ja4_label = rproxy->fingerprints != NULL && ja4[0] != '\0'
-                         ? ja4_table_find(rproxy->fingerprints, ja4)
-                         : NULL,
+        .ja4_label = exchange->ja4_label,
     };
 
     return connection_decide(&signals);
@@ -782,6 +813,8 @@ static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
     if (status == 0) {
         struct verdict verdict = request_decide(rproxy, &request, exchange);
         verdict_apply(rproxy, session, &request, &verdict, exchange);
+        behavior_add_reply(rproxy->counters, exchange->client_ip,
+                           exchange->status, clock_get_seconds());
     } else if (status != CONN_CLOSED) {
         reply_send_status(session, status, 0, exchange);
         exchange->needs_drain = true;
@@ -889,19 +922,26 @@ static const char *status_get_reason(int status)
     }
 }
 
+/* The behavior counters count each request of a client IP, this one
+   too, before the Verdict. exchange keeps them for the log. */
 static struct verdict request_decide(struct rproxy *rproxy,
                                      const struct request *request,
-                                     const struct exchange *exchange)
+                                     struct exchange *exchange)
 {
-    struct verdict_signals signals = {.user_agent = request->user_agent,
+    double now = clock_get_seconds();
+    struct verdict_signals signals = {.ja4_label = exchange->ja4_label,
+                                      .user_agent = request->user_agent,
                                       .target = request->target};
     if (rproxy->limit != NULL) {
         const char *key = rproxy->config.rate_key == RATE_KEY_JA4
                               ? exchange->ja4
                               : exchange->client_ip;
-        signals.retry_after =
-            rate_limit_take(rproxy->limit, key, clock_get_seconds());
+        signals.retry_after = rate_limit_take(rproxy->limit, key, now);
     }
+    exchange->has_behavior =
+        behavior_add_request(rproxy->counters, exchange->client_ip,
+                             request->target, now, &exchange->behavior);
+    signals.behavior = exchange->behavior;
 
     return verdict_decide(&signals);
 }
@@ -919,6 +959,9 @@ static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
                           const struct verdict *verdict,
                           struct exchange *exchange)
 {
+    if (verdict->blocks_client) {
+        client_block(rproxy, exchange);
+    }
     switch (verdict->kind) {
     case VERDICT_PASS:
         exchange->verdict_name = "pass";
@@ -1085,6 +1128,16 @@ static bool not_modified_send(struct tls_session *session, const char *reply,
     return true;
 }
 
+/* The next connection of the client IP drops at the connection Verdict,
+   until --block-time ends. The block comes before a tarpit, so that the
+   other connections of the client drop while this one is held. */
+static void client_block(struct rproxy *rproxy, const struct exchange *exchange)
+{
+    double now = clock_get_seconds();
+    block_table_add(rproxy->blocks, exchange->client_ip,
+                    now + rproxy->config.block_time, now);
+}
+
 /* Holds the Worker one second at a time, so that a stop does not wait. */
 static void tarpit_hold(int seconds)
 {
@@ -1128,4 +1181,21 @@ static void exchange_log(const struct exchange *exchange)
             exchange->ja4[0] != '\0' ? exchange->ja4 : "-",
             exchange->verdict_name, exchange->cache_name, origin_text,
             status_text, exchange->reply_bytes);
+    behavior_log(exchange);
+}
+
+/* A second line after a request Verdict: the behavior counters of the
+   client IP with this request, before its reply. It starts with
+   "behavior", so a reader of the 7-field line can skip it. */
+static void behavior_log(const struct exchange *exchange)
+{
+    if (!exchange->has_behavior) {
+        return;
+    }
+    const struct behavior_counts *counts = &exchange->behavior;
+    fprintf(stderr,
+            "behavior %s requests=%u targets=%u not_found=%u robots=%u "
+            "trap=%u\n",
+            exchange->client_ip, counts->requests, counts->targets,
+            counts->not_found, counts->robots_reads, counts->trap_hits);
 }

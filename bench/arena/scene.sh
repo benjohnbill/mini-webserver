@@ -108,9 +108,11 @@ client_view() {
 # A log line: client IP, JA4, Verdict, cache, Origin index, status, reply
 # bytes. A reply from the Origin is a line with an Origin index, no cache
 # hit, and no 502 or 504 of rproxy.
+# A line that starts with "behavior" holds the behavior counters of a
+# client IP. It is not a connection, so it is skipped.
 log_count() {
     awk -v human="$HUMAN_ADDRESS" -v want="$1" '
-        NF != 7 || $1 == "cache" { next }
+        NF != 7 || $1 == "cache" || $1 == "behavior" { next }
         { kind = $1 == human ? "human" : "crawler" }
         kind != want { next }
         { lines++; verdict[$3]++ }
