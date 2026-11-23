@@ -6,7 +6,7 @@ TIDY_FLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc -Isrc/core -Isrc/rproxy
 
 CORE_SRCS = src/core/http_parse.c src/core/router.c src/core/mime.c \
 	src/core/response.c src/core/serve.c src/core/handlers.c
-SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/proxy.c src/cache.c src/cache_options.c src/main.c \
+SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/main.c \
 	src/model_iter.c src/model_fork.c src/model_pool.c src/model_epoll.c
 RPROXY_SRCS = $(CORE_SRCS) src/cache.c src/cache_options.c \
 	$(wildcard src/rproxy/*.c)

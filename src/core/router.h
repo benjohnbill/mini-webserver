@@ -5,7 +5,7 @@
 #include "response.h"
 
 /* Pure: no files. */
-enum route_kind { ROUTE_STATIC, ROUTE_HANDLER, ROUTE_PROXY };
+enum route_kind { ROUTE_STATIC, ROUTE_HANDLER };
 
 struct route {
     enum route_kind kind;

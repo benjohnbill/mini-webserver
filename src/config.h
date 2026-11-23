@@ -17,12 +17,10 @@
 #define PORT_MAX 65535
 #define WORKERS_MAX 1024
 #define TIMEOUT_MAX 3600
-#define PROXY_PREFIX "/proxy/"
-#define PROXY_REQUEST_MAX 4096
-/* 4 MiB, so that a 2 MiB file passes the Proxy and the size admission of
+/* 4 MiB, so that a 2 MiB file passes rproxy and the size admission of
    the cache has a reply to reject. */
-#define PROXY_REPLY_MAX 4194304
-#define PROXY_READ_CHUNK 16384
+#define ORIGIN_REPLY_MAX 4194304
+#define ORIGIN_READ_CHUNK 16384
 #define DELAY_MAX 10000
 #define CACHE_BUCKETS 1024
 /* A multiple of CACHE_BUCKETS, so a key and its seen slot have the same
@@ -71,11 +69,7 @@ struct config {
     int workers;
     int timeout;
     bool log;
-    const char *upstream_host; /* NULL: the Proxy is off */
-    const char *upstream_port;
-    int delay_ms; /* sleep before each answer: a slow origin */
-    struct cache_options cache_options;
-    struct cache *cache; /* NULL: the cache is off */
+    int delay_ms; /* sleep before each answer: a slow Origin */
 };
 
 #endif

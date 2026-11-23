@@ -725,7 +725,7 @@ static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
 
 /* Only a PASS reaches here, so a denied request never reaches the cache.
    A hit does not reach an Origin. With the cache on, the reply gets
-   X-Cache, as the Proxy Route of the server does. */
+   X-Cache. */
 static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
                            const struct request *request,
                            struct exchange *exchange)
@@ -756,7 +756,7 @@ static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
     free(reply);
 }
 
-/* The key is the method, the path, and the query, as in the server.
+/* The key is the method, the path, and the query.
    Returns false if the key does not fit. */
 static bool cache_key_format(const struct request *request, char *key,
                              size_t size)

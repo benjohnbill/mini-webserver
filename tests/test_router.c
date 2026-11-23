@@ -66,29 +66,6 @@ static void dots_inside_a_name_are_not_a_dot_dot_segment(void)
     CHECK_EQ_INT(router_resolve(&request, &route), 0);
 }
 
-static void a_target_under_the_proxy_prefix_is_a_proxy_route(void)
-{
-    struct request request = {.method = "GET", .target = "/proxy/index.html"};
-    struct route route;
-    CHECK_EQ_INT(router_resolve(&request, &route), 0);
-    CHECK_EQ_INT(route.kind, ROUTE_PROXY);
-}
-
-static void a_proxy_route_with_post_gets_405(void)
-{
-    struct request request = {.method = "POST", .target = "/proxy/x"};
-    struct route route;
-    CHECK_EQ_INT(router_resolve(&request, &route), 405);
-}
-
-static void proxy_without_the_slash_is_static(void)
-{
-    struct request request = {.method = "GET", .target = "/proxyfile"};
-    struct route route;
-    CHECK_EQ_INT(router_resolve(&request, &route), 0);
-    CHECK_EQ_INT(route.kind, ROUTE_STATIC);
-}
-
 int main(void)
 {
     the_root_is_static();
@@ -99,9 +76,6 @@ int main(void)
     a_dot_dot_segment_gets_403();
     a_dot_dot_at_the_end_gets_403();
     dots_inside_a_name_are_not_a_dot_dot_segment();
-    a_target_under_the_proxy_prefix_is_a_proxy_route();
-    a_proxy_route_with_post_gets_405();
-    proxy_without_the_slash_is_static();
     printf("test_router: ok\n");
 
     return 0;

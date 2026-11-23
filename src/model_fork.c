@@ -5,7 +5,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "cache.h"
 #include "conn.h"
 #include "model.h"
 
@@ -40,11 +39,6 @@ int model_fork_run(int listen_fd, const struct config *config)
             close(listen_fd);
             conn_serve(conn_fd, config);
             close(conn_fd);
-            /* A private cache is a copy that dies with the child. */
-            if (config->cache != NULL &&
-                config->cache_options.share == CACHE_SHARE_PRIVATE) {
-                cache_report(config->cache);
-            }
             _exit(0);
         }
         close(conn_fd);

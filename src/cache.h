@@ -8,7 +8,7 @@
 #include "config.h"
 
 /* I/O layer. The Reverse Proxy cache: a key ("GET /path?query") maps to a
-   full upstream reply. Safe to call from many threads, and, with
+   full Origin reply. Safe to call from many threads, and, with
    CACHE_SHARE_SHARED, from many processes after fork. */
 
 struct cache_stats {

@@ -250,12 +250,13 @@ static int origin_send(int origin_fd, const char *bytes, size_t len)
 static int origin_read_reply(int origin_fd, char **reply, size_t *reply_len)
 {
     for (;;) {
-        char *data = realloc(*reply, *reply_len + PROXY_READ_CHUNK);
+        char *data = realloc(*reply, *reply_len + ORIGIN_READ_CHUNK);
         if (data == NULL) {
             return 502;
         }
         *reply = data;
-        ssize_t length = read(origin_fd, *reply + *reply_len, PROXY_READ_CHUNK);
+        ssize_t length =
+            read(origin_fd, *reply + *reply_len, ORIGIN_READ_CHUNK);
         if (length == 0) {
             return *reply_len > 0 ? 0 : 502;
         }
@@ -266,7 +267,7 @@ static int origin_read_reply(int origin_fd, char **reply, size_t *reply_len)
             return errno == EAGAIN || errno == EWOULDBLOCK ? 504 : 502;
         }
         *reply_len += (size_t)length;
-        if (*reply_len > PROXY_REPLY_MAX) {
+        if (*reply_len > ORIGIN_REPLY_MAX) {
             return 502;
         }
     }

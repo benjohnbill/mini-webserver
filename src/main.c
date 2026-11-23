@@ -9,8 +9,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "cache.h"
-#include "cache_options.h"
 #include "config.h"
 #include "model.h"
 
@@ -20,7 +18,6 @@ static bool config_init_from_args(struct config *config, int argc, char **argv);
 static bool number_parse(const char *text, long min, long max, int *number);
 static bool option_parse(struct config *config, const char *name, char *value);
 static bool model_is_known(const char *model);
-static bool upstream_parse(struct config *config, char *value);
 static void signals_install(void);
 static void stop_signal_handle(int signal_number);
 static int listen_socket_open(int port);
@@ -36,30 +33,15 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: ./server <port> <root> [--model "
                 "iter|fork|pool|epoll] [--workers N] [--timeout S] [--log] "
-                "[--upstream HOST:PORT] [--delay MS] [--cache off|on] "
-                "[--cache-admit all|size|second] [--cache-object-max BYTES] "
-                "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
-                "[--cache-lock global|striped] "
-                "[--cache-share private|shared]\n");
+                "[--delay MS]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     signals_install();
 
     int listen_fd = listen_socket_open(config.port);
-    if (config.cache_options.is_on) {
-        config.cache = cache_create(&config.cache_options);
-        if (config.cache == NULL) {
-            fprintf(stderr, "server: cache_create failed\n");
-            return 1;
-        }
-    }
     int result = model_run(listen_fd, &config);
     close(listen_fd);
-    if (config.cache != NULL) {
-        cache_report(config.cache);
-        cache_destroy(config.cache);
-    }
 
     return model_result_report(config.model, result);
 }
@@ -71,12 +53,8 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
         .workers = DEFAULT_WORKERS,
         .timeout = DEFAULT_TIMEOUT,
         .log = false,
-        .upstream_host = NULL,
-        .upstream_port = NULL,
         .delay_ms = 0,
-        .cache = NULL,
     };
-    cache_options_init(&config->cache_options);
     if (argc < 3 || !number_parse(argv[1], 1, PORT_MAX, &config->port)) {
         return false;
     }
@@ -121,36 +99,17 @@ static bool option_parse(struct config *config, const char *name, char *value)
     if (strcmp(name, "--timeout") == 0) {
         return number_parse(value, 1, TIMEOUT_MAX, &config->timeout);
     }
-    if (strcmp(name, "--upstream") == 0) {
-        return upstream_parse(config, value);
-    }
     if (strcmp(name, "--delay") == 0) {
         return number_parse(value, 0, DELAY_MAX, &config->delay_ms);
     }
 
-    return cache_options_parse(&config->cache_options, name, value);
+    return false;
 }
 
 static bool model_is_known(const char *model)
 {
     return strcmp(model, "iter") == 0 || strcmp(model, "fork") == 0 ||
            strcmp(model, "pool") == 0 || strcmp(model, "epoll") == 0;
-}
-
-/* "127.0.0.1:9091": splits value in place at the last ':'. */
-static bool upstream_parse(struct config *config, char *value)
-{
-    char *colon = strrchr(value, ':');
-    int port = 0;
-    if (colon == NULL || colon == value ||
-        !number_parse(colon + 1, 1, PORT_MAX, &port)) {
-        return false;
-    }
-    *colon = '\0';
-    config->upstream_host = value;
-    config->upstream_port = colon + 1;
-
-    return true;
 }
 
 /* sa_flags = 0, not signal(): with -D_POSIX_C_SOURCE, signal() keeps the

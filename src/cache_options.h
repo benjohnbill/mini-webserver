@@ -5,8 +5,7 @@
 
 #include "config.h"
 
-/* The --cache options, shared by the server and the Reverse Proxy, so that
-   both have the same names, defaults, and meanings. */
+/* The --cache options of the Reverse Proxy. */
 
 /* Sets the defaults: the cache is off. */
 void cache_options_init(struct cache_options *options);
