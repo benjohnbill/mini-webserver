@@ -209,6 +209,58 @@ got="$(fetch "$BASE/")"
 [ "$got" = "200 A" ] && pass "rproxy starts and serves with --rate-key ja4" \
     || fail "rproxy starts and serves with --rate-key ja4: got '$got'"
 
+# The connection Verdict: a block list hit gets no TLS handshake.
+printf '# test ranges\n127.0.0.0/8\n' > "$WORK/blocked.txt"
+start_proxy --origin "$HOST:$ORIGIN_A" --block-list "$WORK/blocked.txt"
+: > "$WORK/A.log"
+curl -sk --max-time 5 -o /dev/null "$BASE/" 2>/dev/null
+code=$?
+count=$(grep -c '^GET ' "$WORK/A.log")
+{ [ "$code" = "35" ] || [ "$code" = "56" ]; } && [ "$count" = "0" ] \
+    && pass "a client IP in the block list gets no TLS handshake" \
+    || fail "a client IP in the block list gets no TLS handshake: curl exit $code, Origin saw $count"
+grep -q '^127\.0\.0\.1 [^ ]* drop - - - 0$' "$WORK/rproxy.err" \
+    && pass "a dropped connection logs the Verdict drop" \
+    || fail "a dropped connection logs the Verdict drop"
+printf '10.0.0.0/8\n2001:db8::/32\n' > "$WORK/other.txt"
+start_proxy --origin "$HOST:$ORIGIN_A" --block-list "$WORK/other.txt"
+got="$(fetch "$BASE/")"
+[ "$got" = "200 A" ] && pass "a client IP outside the block list passes" \
+    || fail "a client IP outside the block list passes: got '$got'"
+printf '10.0.0.0/33\n' > "$WORK/bad.txt"
+"$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
+    --origin "$HOST:$ORIGIN_A" --block-list "$WORK/bad.txt" \
+    2> "$WORK/bad.err" &
+bad_pid=$!
+sleep 0.5
+if kill -0 "$bad_pid" 2>/dev/null; then
+    kill "$bad_pid"; wait "$bad_pid" 2>/dev/null
+    fail "a bad block list stops rproxy at the start"
+else
+    grep -q 'line 1' "$WORK/bad.err" \
+        && pass "a bad block list stops rproxy at the start" \
+        || fail "a bad block list stops rproxy at the start: no line number"
+fi
+
+# The JA4 table: a label alone does not drop (SPEC 11 row 4).
+printf 't13d1516h2_8daaf6152771_e5627efa2ab1 browser\n' > "$WORK/ja4.txt"
+start_proxy --origin "$HOST:$ORIGIN_A" --ja4-list "$WORK/ja4.txt"
+got="$(fetch "$BASE/")"
+[ "$got" = "200 A" ] && pass "rproxy starts and serves with --ja4-list" \
+    || fail "rproxy starts and serves with --ja4-list: got '$got'"
+
+# The block table: a key is dropped until its time, then it passes.
+start_proxy --origin "$HOST:$ORIGIN_A" --block-key 127.0.0.1 --block-time 2
+curl -sk --max-time 5 -o /dev/null "$BASE/" 2>/dev/null
+code=$?
+[ "$code" = "35" ] || [ "$code" = "56" ] \
+    && pass "a client IP in the block table gets no TLS handshake" \
+    || fail "a client IP in the block table gets no TLS handshake: curl exit $code"
+sleep 2.2
+got="$(fetch "$BASE/")"
+[ "$got" = "200 A" ] && pass "a block table entry expires after --block-time" \
+    || fail "a block table entry expires after --block-time: got '$got'"
+
 # The real server as the Origin.
 ./server "$SERVER_PORT" www > /dev/null 2> "$WORK/server.err" &
 PIDS+=($!)

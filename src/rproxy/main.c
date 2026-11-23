@@ -13,13 +13,17 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "block_table.h"
 #include "cache.h"
 #include "cache_options.h"
 #include "client_hello.h"
 #include "config.h"
+#include "connection_verdict.h"
 #include "forward.h"
 #include "http_parse.h"
+#include "ip_list.h"
 #include "ja4.h"
+#include "ja4_table.h"
 #include "rate_limit.h"
 #include "tls.h"
 #include "verdict.h"
@@ -32,6 +36,13 @@
 #define DEFAULT_BURST 10.0
 #define DEFAULT_TARPIT 10
 #define RATE_LIMIT_KEY_MAX 4096
+/* The same bound as the rate limit table. */
+#define BLOCK_TABLE_KEY_MAX 4096
+/* fail2ban bantime: 10 minutes. */
+#define DEFAULT_BLOCK_TIME 600
+#define BLOCK_TIME_MAX 86400
+/* --block-key can occur this many times. */
+#define BLOCK_KEY_ARG_MAX 16
 /* Room for the headers that rproxy adds to a request for an Origin. */
 #define FORWARD_EXTRA_MAX 512
 #define REPLY_TEXT_MAX 512
@@ -57,6 +68,12 @@ struct rproxy_config {
     double burst;
     enum rate_key rate_key;
     int tarpit;
+    const char *block_list_file; /* NULL when there is no block list */
+    const char *ja4_list_file;   /* NULL when there is no JA4 table */
+    int block_time;
+    /* Keys that are in the block table from the start, for block_time. */
+    const char *block_keys[BLOCK_KEY_ARG_MAX];
+    int block_key_count;
     struct cache_options cache_options;
 };
 
@@ -65,8 +82,11 @@ struct rproxy {
     struct rproxy_config config;
     struct origin_list list;
     struct tls_context *context;
-    struct rate_limit *limit; /* NULL when the rate limit is off */
-    struct cache *cache;      /* NULL when the cache is off */
+    struct rate_limit *limit;       /* NULL when the rate limit is off */
+    struct cache *cache;            /* NULL when the cache is off */
+    struct ip_list *block_list;     /* NULL without --block-list */
+    struct ja4_table *fingerprints; /* NULL without --ja4-list */
+    struct block_table *blocks;
 };
 
 struct pool {
@@ -107,7 +127,12 @@ static bool number_parse(const char *text, long min, long max, int *number);
 static bool real_parse(const char *text, double min, double *number);
 static bool rate_key_parse(const char *text, enum rate_key *rate_key);
 static bool origin_add(struct origin_list *list, const char *text);
+static bool block_key_add(struct rproxy_config *config, const char *key);
 static bool rproxy_start(struct rproxy *rproxy);
+static bool defenses_start(struct rproxy *rproxy);
+static char *file_read_text(const char *path);
+static bool block_list_load(struct rproxy *rproxy);
+static bool ja4_table_load(struct rproxy *rproxy);
 static void rproxy_stop(struct rproxy *rproxy);
 static void signals_install(void);
 static void stop_signal_handle(int signal_number);
@@ -125,6 +150,8 @@ static void client_ip_get(int conn_fd, char *client_ip, size_t size);
 static enum client_hello_status hello_peek(int conn_fd,
                                            struct client_hello *hello);
 static bool socket_peek_more(int conn_fd, unsigned char *bytes, size_t *len);
+static enum connection_verdict
+connection_verdict_get(struct rproxy *rproxy, const struct exchange *exchange);
 static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
                          struct exchange *exchange);
 static int request_read(struct tls_session *session,
@@ -173,7 +200,8 @@ int main(int argc, char **argv)
                 "[--rate-key ip|ja4] [--tarpit S] [--cache off|on] "
                 "[--cache-admit all|size|second] [--cache-object-max BYTES] "
                 "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
-                "[--cache-lock global|striped]\n");
+                "[--cache-lock global|striped] [--block-list FILE] "
+                "[--ja4-list FILE] [--block-time S] [--block-key KEY ...]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -197,7 +225,8 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
         .config = {.origin_timeout = DEFAULT_ORIGIN_TIMEOUT,
                    .workers = DEFAULT_WORKERS,
                    .burst = DEFAULT_BURST,
-                   .tarpit = DEFAULT_TARPIT},
+                   .tarpit = DEFAULT_TARPIT,
+                   .block_time = DEFAULT_BLOCK_TIME},
     };
     cache_options_init(&rproxy->config.cache_options);
     atomic_init(&rproxy->list.next, 0);
@@ -247,6 +276,20 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     }
     if (strcmp(name, "--tarpit") == 0) {
         return number_parse(value, 0, TIMEOUT_MAX, &config->tarpit);
+    }
+    if (strcmp(name, "--block-list") == 0) {
+        config->block_list_file = value;
+        return true;
+    }
+    if (strcmp(name, "--ja4-list") == 0) {
+        config->ja4_list_file = value;
+        return true;
+    }
+    if (strcmp(name, "--block-time") == 0) {
+        return number_parse(value, 1, BLOCK_TIME_MAX, &config->block_time);
+    }
+    if (strcmp(name, "--block-key") == 0) {
+        return block_key_add(config, value);
     }
     return cache_options_parse(&config->cache_options, name, value);
 }
@@ -303,7 +346,18 @@ static bool origin_add(struct origin_list *list, const char *text)
     return true;
 }
 
-/* Loads the certificate and makes the rate limit table and the cache. */
+static bool block_key_add(struct rproxy_config *config, const char *key)
+{
+    if (config->block_key_count == BLOCK_KEY_ARG_MAX) {
+        return false;
+    }
+    config->block_keys[config->block_key_count++] = key;
+
+    return true;
+}
+
+/* Loads the certificate, the block list, and the JA4 table, and makes the
+   block table, the rate limit table, and the cache. */
 static bool rproxy_start(struct rproxy *rproxy)
 {
     rproxy->context =
@@ -311,6 +365,9 @@ static bool rproxy_start(struct rproxy *rproxy)
     if (rproxy->context == NULL) {
         fprintf(stderr, "rproxy: cannot load %s and %s\n",
                 rproxy->config.cert_file, rproxy->config.key_file);
+        return false;
+    }
+    if (!defenses_start(rproxy)) {
         return false;
     }
     if (rproxy->config.rate > 0) {
@@ -334,6 +391,101 @@ static bool rproxy_start(struct rproxy *rproxy)
     return true;
 }
 
+/* The files and the block table of the connection Verdict. */
+static bool defenses_start(struct rproxy *rproxy)
+{
+    const struct rproxy_config *config = &rproxy->config;
+    if (!block_list_load(rproxy) || !ja4_table_load(rproxy)) {
+        return false;
+    }
+    rproxy->blocks = block_table_create(BLOCK_TABLE_KEY_MAX);
+    if (rproxy->blocks == NULL) {
+        fprintf(stderr, "rproxy: block_table_create failed\n");
+        return false;
+    }
+    double now = clock_get_seconds();
+    for (int i = 0; i < config->block_key_count; i++) {
+        if (!block_table_add(rproxy->blocks, config->block_keys[i],
+                             now + config->block_time, now)) {
+            fprintf(stderr, "rproxy: bad --block-key %s\n",
+                    config->block_keys[i]);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* Returns the whole file as a malloc string, or NULL. */
+static char *file_read_text(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    char *text = NULL;
+    long size = -1;
+    if (fseek(file, 0, SEEK_END) == 0) {
+        size = ftell(file);
+    }
+    if (size >= 0 && fseek(file, 0, SEEK_SET) == 0) {
+        text = malloc((size_t)size + 1);
+    }
+    if (text != NULL) {
+        size_t len = fread(text, 1, (size_t)size, file);
+        text[len] = '\0';
+    }
+    fclose(file);
+
+    return text;
+}
+
+static bool block_list_load(struct rproxy *rproxy)
+{
+    const char *path = rproxy->config.block_list_file;
+    if (path == NULL) {
+        return true;
+    }
+    char *text = file_read_text(path);
+    rproxy->block_list = malloc(sizeof(*rproxy->block_list));
+    if (text == NULL || rproxy->block_list == NULL) {
+        fprintf(stderr, "rproxy: cannot read %s\n", path);
+        free(text);
+        return false;
+    }
+    size_t bad_line = ip_list_parse(text, rproxy->block_list);
+    free(text);
+    if (bad_line != 0) {
+        fprintf(stderr, "rproxy: %s line %zu: bad CIDR range\n", path,
+                bad_line);
+    }
+
+    return bad_line == 0;
+}
+
+static bool ja4_table_load(struct rproxy *rproxy)
+{
+    const char *path = rproxy->config.ja4_list_file;
+    if (path == NULL) {
+        return true;
+    }
+    char *text = file_read_text(path);
+    rproxy->fingerprints = malloc(sizeof(*rproxy->fingerprints));
+    if (text == NULL || rproxy->fingerprints == NULL) {
+        fprintf(stderr, "rproxy: cannot read %s\n", path);
+        free(text);
+        return false;
+    }
+    size_t bad_line = ja4_table_parse(text, rproxy->fingerprints);
+    free(text);
+    if (bad_line != 0) {
+        fprintf(stderr, "rproxy: %s line %zu: bad \"JA4 LABEL\" line\n", path,
+                bad_line);
+    }
+
+    return bad_line == 0;
+}
+
 static void rproxy_stop(struct rproxy *rproxy)
 {
     if (rproxy->cache != NULL) {
@@ -343,6 +495,9 @@ static void rproxy_stop(struct rproxy *rproxy)
     if (rproxy->limit != NULL) {
         rate_limit_destroy(rproxy->limit);
     }
+    block_table_destroy(rproxy->blocks);
+    free(rproxy->fingerprints);
+    free(rproxy->block_list);
     tls_context_destroy(rproxy->context);
 }
 
@@ -486,8 +641,10 @@ static void *worker_main(void *arg)
     }
 }
 
-/* SPEC 11: ClientHello and JA4, TLS handshake, request, rate limit,
-   Verdict, cache, Origin. One request for each connection. */
+/* SPEC 11: ClientHello and JA4, connection Verdict, TLS handshake,
+   request, rate limit, request Verdict, cache, Origin. One request for each
+   connection. A drop returns with the ClientHello unread, so close() sends
+   RST and no byte of TLS. */
 static void connection_serve(struct rproxy *rproxy, int conn_fd)
 {
     struct exchange exchange = {
@@ -501,6 +658,19 @@ static void connection_serve(struct rproxy *rproxy, int conn_fd)
         return;
     }
     ja4_format(&hello, exchange.ja4);
+    switch (connection_verdict_get(rproxy, &exchange)) {
+    case CONN_PASS:
+        break;
+    case CONN_DROP:
+        exchange.verdict_name = "drop";
+        exchange_log(&exchange);
+        return;
+    case CONN_TARPIT:
+        exchange.verdict_name = "tarpit";
+        tarpit_hold(rproxy->config.tarpit);
+        exchange_log(&exchange);
+        return;
+    }
 
     struct tls_session *session = tls_session_create(rproxy->context, conn_fd);
     if (session == NULL) {
@@ -579,6 +749,28 @@ static bool socket_peek_more(int conn_fd, unsigned char *bytes, size_t *len)
     *len = (size_t)count;
 
     return true;
+}
+
+/* The block table has two kinds of keys: client IPs and JA4s. An empty
+   JA4 (no ClientHello fingerprint) is never a key. */
+static enum connection_verdict
+connection_verdict_get(struct rproxy *rproxy, const struct exchange *exchange)
+{
+    double now = clock_get_seconds();
+    const char *ja4 = exchange->ja4;
+    struct connection_signals signals = {
+        .is_listed =
+            rproxy->block_list != NULL &&
+            ip_list_has_address(rproxy->block_list, exchange->client_ip),
+        .is_blocked =
+            block_table_has_key(rproxy->blocks, exchange->client_ip, now) ||
+            (ja4[0] != '\0' && block_table_has_key(rproxy->blocks, ja4, now)),
+        .ja4_label = rproxy->fingerprints != NULL && ja4[0] != '\0'
+                         ? ja4_table_find(rproxy->fingerprints, ja4)
+                         : NULL,
+    };
+
+    return connection_decide(&signals);
 }
 
 static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
