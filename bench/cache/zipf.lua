@@ -1,8 +1,9 @@
--- wrk script: GET /proxy/bench/fNNN.txt with a Zipf distribution (s = 1).
+-- wrk script: GET <prefix>/bench/fNNN.txt with a Zipf distribution (s = 1).
 -- Rank 1 is f000. With 200 files, the top 20% of files get about 70% of
 -- the requests. Each thread has a fixed seed, so each run asks for the
 -- same sequence. response() counts the X-Cache header; done() prints the
--- sum of all threads.
+-- sum of all threads. The first script argument is the prefix: "/proxy"
+-- for the Proxy Route of the server, "" for rproxy.
 local FILE_COUNT = 200
 local EXPONENT = 1.0
 local threads = {}
@@ -13,6 +14,7 @@ function setup(thread)
 end
 
 function init(args)
+    prefix = args[1] or "/proxy"
     math.randomseed(42 + thread_id)
     cdf = {}
     local total = 0
@@ -38,7 +40,7 @@ function request()
             high = middle
         end
     end
-    return wrk.format("GET", string.format("/proxy/bench/f%03d.txt", low - 1))
+    return wrk.format("GET", string.format("%s/bench/f%03d.txt", prefix, low - 1))
 end
 
 function response(status, headers, body)

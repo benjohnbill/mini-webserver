@@ -2,11 +2,15 @@
 # Usage: bench/cache/run.sh [phase...]   (default: P0 P1 P2 P3)
 # Phases: P0 P1 P2 P3 (P3 = P3-evict P3-ttl P3-lock P3-share).
 # Each phase changes ONE cache axis. The other axes stay at their defaults.
-# Output: docs/measurements/<date>-cache-<phase>.md, and the raw logs in
-# docs/measurements/<date>-cache-raw/.
+# Output: docs/measurements/<date>-<name>-<phase>.md, and the raw logs in
+# docs/measurements/<date>-<name>-raw/. <name> is "cache" for PROXY=server
+# and "rproxy-cache" for PROXY=rproxy.
 #
 # Each run: an upstream (./server --model fork --delay DELAY_MS, so the
-# delay does not serialize the upstream) and a proxy (./server --upstream).
+# delay does not serialize the upstream) and a proxy. PROXY=server (the
+# default) puts ./server --upstream in the proxy seat, over plain HTTP.
+# PROXY=rproxy puts ./rproxy there, over TLS. rproxy has only the pool
+# model, so the other models and P3-share do not apply to it.
 # wrk warms up for WARMUP s, then measures for DURATION s with zipf.lua.
 # mem.sh samples the Pss of the proxy tree 2 s before the end. SIGTERM
 # stops the proxy, and the script sums the "cache ..." lines of its stderr.
@@ -14,6 +18,7 @@ set -u
 cd "$(dirname "$0")/../.." || exit 1
 
 SERVER=./server
+PROXY=${PROXY:-server}
 HOST=127.0.0.1
 UP_PORT=${UP_PORT:-19181}
 PX_PORT=${PX_PORT:-19180}
@@ -28,7 +33,12 @@ TIGHT_BYTES=${TIGHT_BYTES:-4194304}
 LUA=bench/cache/zipf.lua
 DATE=$(date +%Y%m%d)
 OUT=docs/measurements
-RAW=$OUT/$DATE-cache-raw
+case "$PROXY" in
+server) NAME=cache URL=http://$HOST:$PX_PORT PREFIX=/proxy MODELS="iter fork pool" ;;
+rproxy) NAME=rproxy-cache URL=https://localhost:$PX_PORT PREFIX= MODELS=pool ;;
+*) echo "PROXY must be server or rproxy"; exit 2 ;;
+esac
+RAW=$OUT/$DATE-$NAME-raw
 WORK=$(mktemp -d)
 UP_PID=
 PX_PID=
@@ -108,6 +118,33 @@ shmem_get() {
     awk '/^Shmem:/ {print $2}' /proc/meminfo
 }
 
+# proxy_start <model> <stderr file> <proxy args...>
+proxy_start() {
+    local model=$1 err=$2
+    shift 2
+    if [ "$PROXY" = rproxy ]; then
+        ./rproxy --port "$PX_PORT" --cert build/cert.pem --key build/key.pem \
+            --origin "$HOST:$UP_PORT" "$@" >/dev/null 2>"$err" &
+    else
+        "$SERVER" "$PX_PORT" www --model "$model" \
+            --upstream "$HOST:$UP_PORT" "$@" >/dev/null 2>"$err" &
+    fi
+    PX_PID=$!
+}
+
+# rproxy writes one log line for each exchange to stderr. The raw log keeps
+# the "cache ..." line and the count of each "verdict cache status" triple.
+log_keep() {
+    if [ "$PROXY" = rproxy ]; then
+        awk '/^cache / { print; next }
+            NF == 6 { count[$3 " " $4 " " $6]++ }
+            END { for (key in count) print "exchanges", key, count[key] }' \
+            "$1" | sort >"$2"
+    else
+        cp "$1" "$2"
+    fi
+}
+
 # run_variant <table> <variant> <model> <runs> <proxy args...>
 # Appends one row to <table>: the mean of the runs, and the min to max of
 # req/s when runs > 1.
@@ -122,15 +159,12 @@ run_variant() {
         shmem_before=$(shmem_get)
         local tag="$variant-$model-$run"
         tag=${tag//[^A-Za-z0-9_.-]/_}
-        "$SERVER" "$PX_PORT" www --model "$model" \
-            --upstream "$HOST:$UP_PORT" "$@" \
-            >/dev/null 2>"$RAW/$tag.server.err" &
-        PX_PID=$!
+        proxy_start "$model" "$WORK/proxy.err" "$@"
         port_wait "$PX_PID" "$PX_PORT" || { echo "proxy did not start: $*"; exit 1; }
         wrk -t"$THREADS" -c"$CONNECTIONS" -d"${WARMUP}s" -s "$LUA" \
-            "http://$HOST:$PX_PORT" >/dev/null 2>&1
+            "$URL" -- "$PREFIX" >/dev/null 2>&1
         wrk -t"$THREADS" -c"$CONNECTIONS" -d"${DURATION}s" --latency -s "$LUA" \
-            "http://$HOST:$PX_PORT" >"$RAW/$tag.wrk.txt" 2>&1 &
+            "$URL" -- "$PREFIX" >"$RAW/$tag.wrk.txt" 2>&1 &
         local wrk_pid=$!
         sleep $((DURATION - 2))
         local pss_kib
@@ -141,6 +175,7 @@ run_variant() {
         kill -TERM "$PX_PID"
         wait "$PX_PID" 2>/dev/null
         PX_PID=
+        log_keep "$WORK/proxy.err" "$RAW/$tag.server.err"
         local rps p99 errors hits misses
         read -r rps p99 errors hits misses < <(wrk_parse "$RAW/$tag.wrk.txt")
         counters=$(counters_sum "$RAW/$tag.server.err")
@@ -178,14 +213,14 @@ run_variant() {
 
 table_start() {
     local phase=$1 title=$2
-    local table=$OUT/$DATE-cache-$phase.md
+    local table=$OUT/$DATE-$NAME-$phase.md
     {
         echo "# $phase: $title"
         echo
-        echo "Made by \`bench/cache/run.sh $phase\` at $(date '+%Y-%m-%d %H:%M')," \
+        echo "Made by \`PROXY=$PROXY bench/cache/run.sh $phase\` at $(date '+%Y-%m-%d %H:%M')," \
             "commit $(git rev-parse --short HEAD)."
         echo "Upstream: \`--model fork --delay $DELAY_MS\`. Load:" \
-            "\`wrk -t$THREADS -c$CONNECTIONS -d${DURATION}s --latency -s $LUA\`" \
+            "\`wrk -t$THREADS -c$CONNECTIONS -d${DURATION}s --latency -s $LUA $URL\`" \
             "after a ${WARMUP} s warm-up. Dataset: \`www/bench\`," \
             "200 files, Zipf s = 1."
         echo
@@ -208,6 +243,7 @@ table_start() {
 }
 
 skip_epoll() {
+    [ "$PROXY" = rproxy ] && return
     echo "| (skipped) | epoll | - | - | - | - | - | - | - | 0 |" >>"$1"
     echo "  epoll skipped: the epoll Proxy Route returns 501 (src/core/serve.c)"
     echo
@@ -224,7 +260,7 @@ table_end() {
 phase_p0() {
     local table
     table=$(table_start P0 "baseline, cache off, each model twice (noise floor)")
-    for model in iter fork pool; do
+    for model in $MODELS; do
         run_variant "$table" off "$model" 2 --cache off
     done
     skip_epoll "$table"
@@ -234,7 +270,7 @@ phase_p0() {
 phase_p1() {
     local table
     table=$(table_start P1 "cache off and on, each model")
-    for model in iter fork pool; do
+    for model in $MODELS; do
         run_variant "$table" off "$model" 1 --cache off
         run_variant "$table" on "$model" 1 --cache on
     done
@@ -285,6 +321,10 @@ phase_p3_lock() {
 }
 
 phase_p3_share() {
+    if [ "$PROXY" = rproxy ]; then
+        echo "P3-share does not apply to rproxy: it has no fork" >&2
+        return
+    fi
     local table
     table=$(table_start P3-share "fork, private and shared cache")
     for share in private shared; do
@@ -295,7 +335,7 @@ phase_p3_share() {
 }
 
 tool_check
-make -s server || exit 1
+make -s server rproxy cert || exit 1
 [ -f www/bench/f199.txt ] || bench/cache/make-dataset.sh
 mkdir -p "$RAW"
 upstream_start
