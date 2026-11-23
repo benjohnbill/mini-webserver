@@ -893,8 +893,7 @@ static struct verdict request_decide(struct rproxy *rproxy,
                                      const struct request *request,
                                      const struct exchange *exchange)
 {
-    struct verdict_signals signals = {.ja4 = exchange->ja4,
-                                      .user_agent = request->user_agent,
+    struct verdict_signals signals = {.user_agent = request->user_agent,
                                       .target = request->target};
     if (rproxy->limit != NULL) {
         const char *key = rproxy->config.rate_key == RATE_KEY_JA4

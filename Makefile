@@ -16,7 +16,8 @@ TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache \
 	build/test_client_hello build/test_forward build/test_ja4 \
 	build/test_rate_limit build/test_verdict build/test_ip_list \
-	build/test_ja4_table build/test_block_table build/test_connection_verdict
+	build/test_ja4_table build/test_block_table build/test_connection_verdict \
+	build/test_behavior
 FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
 	src/rproxy/*.c src/rproxy/*.h tests/*.c tests/*.h)
 
@@ -29,7 +30,7 @@ LARGE_BIN_SIZE = 10485760
 # (docs/adr/reverse-proxy-is-a-separate-process.md).
 DECISION_FILES = $(wildcard $(addprefix src/rproxy/,client_hello.* ja4.* \
 	rate_limit.* verdict.* ip_list.* ja4_table.* block_table.* \
-	connection_verdict.*))
+	connection_verdict.* behavior.*))
 # arpa/inet.h is allowed: ip_list uses inet_pton, which turns text into
 # address bytes and does no I/O.
 DECISION_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|poll|netinet/[a-z_]+|openssl/ssl|unistd)\.h[>"]'
@@ -101,6 +102,11 @@ build/test_connection_verdict: tests/test_connection_verdict.c tests/check.h \
 		src/rproxy/connection_verdict.c $(HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/connection_verdict.c
+
+build/test_behavior: tests/test_behavior.c tests/check.h \
+		src/rproxy/behavior.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/behavior.c
 
 # forward is I/O, but its tests call only the functions with no socket.
 build/test_forward: tests/test_forward.c tests/check.h src/rproxy/forward.c \

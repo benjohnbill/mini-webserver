@@ -3,22 +3,42 @@
 #include "check.h"
 #include "verdict.h"
 
-/* The first two tests are the rules that SPEC 11 and GLOSSARY.md fix. The
-   others are the rest of the Verdict table (SPEC 11 row 3). The crawler
-   User-Agents are the ones that each crawler documents. The Chromium JA4
-   is the Chrome example of the FoxIO JA4 README. The other JA4 is the
-   openssl s_client JA4 of tests/test_ja4.c. */
+/* The rules of SPEC 11 row 3 and of the v2 layers. The crawler
+   User-Agents are the ones that each crawler documents. The JA4 labels
+   are the labels of the JA4 table (--ja4-list). */
 
 static struct verdict decide(const char *user_agent, int retry_after)
 {
-    struct verdict_signals signals = {"", user_agent, "/", retry_after};
+    struct verdict_signals signals = {
+        .user_agent = user_agent, .target = "/", .retry_after = retry_after};
 
     return verdict_decide(&signals);
 }
 
-static struct verdict decide_with_ja4(const char *user_agent, const char *ja4)
+static struct verdict decide_with_label(const char *user_agent,
+                                        const char *ja4_label)
 {
-    struct verdict_signals signals = {ja4, user_agent, "/", 0};
+    struct verdict_signals signals = {
+        .ja4_label = ja4_label, .user_agent = user_agent, .target = "/"};
+
+    return verdict_decide(&signals);
+}
+
+static struct verdict decide_for_target(const char *user_agent,
+                                        const char *target)
+{
+    struct verdict_signals signals = {.user_agent = user_agent,
+                                      .target = target};
+
+    return verdict_decide(&signals);
+}
+
+static struct verdict decide_with_not_found(unsigned not_found)
+{
+    struct verdict_signals signals = {
+        .user_agent = "curl/8.18.0",
+        .target = "/",
+        .behavior = {.requests = not_found + 1, .not_found = not_found}};
 
     return verdict_decide(&signals);
 }
@@ -70,25 +90,79 @@ static void a_crawler_over_the_rate_limit_is_denied_not_slowed(void)
     CHECK_EQ_INT(verdict.retry_after, 0);
 }
 
-static void a_chrome_user_agent_with_a_chromium_ja4_passes(void)
+static void a_chrome_user_agent_with_a_browser_ja4_passes(void)
 {
-    CHECK_EQ_INT(
-        decide_with_ja4(CHROME_AGENT, "t13d1516h2_8daaf6152771_02713d6af862")
-            .kind,
-        VERDICT_PASS);
+    CHECK_EQ_INT(decide_with_label(CHROME_AGENT, "browser").kind, VERDICT_PASS);
 }
 
-static void a_chrome_user_agent_with_a_non_chromium_ja4_is_tarpitted(void)
+static void a_chrome_user_agent_with_a_known_non_browser_ja4_is_tarpitted(void)
 {
-    CHECK_EQ_INT(
-        decide_with_ja4(CHROME_AGENT, "t13d3013h2_1d37bd780c83_ecd0401ec68b")
-            .kind,
-        VERDICT_TARPIT);
+    CHECK_EQ_INT(decide_with_label(CHROME_AGENT, "curl").kind, VERDICT_TARPIT);
+    CHECK_EQ_INT(decide_with_label(CHROME_AGENT, "python").kind,
+                 VERDICT_TARPIT);
 }
 
-static void a_chrome_user_agent_without_a_ja4_passes(void)
+static void a_chrome_user_agent_with_an_unknown_ja4_passes(void)
 {
-    CHECK_EQ_INT(decide_with_ja4(CHROME_AGENT, "").kind, VERDICT_PASS);
+    CHECK_EQ_INT(decide_with_label(CHROME_AGENT, NULL).kind, VERDICT_PASS);
+}
+
+static void a_curl_user_agent_with_the_curl_ja4_passes(void)
+{
+    CHECK_EQ_INT(decide_with_label("curl/8.18.0", "curl").kind, VERDICT_PASS);
+}
+
+static void a_false_chrome_is_not_put_in_the_block_table(void)
+{
+    CHECK(!decide_with_label(CHROME_AGENT, "curl").blocks_client);
+}
+
+static void a_request_for_the_honeypot_is_tarpitted_and_blocks_the_client(void)
+{
+    static const char *targets[] = {"/trap/", "/trap/page.html", "/trap/?x=1"};
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        struct verdict verdict = decide_for_target("curl/8.18.0", targets[i]);
+        CHECK_EQ_INT(verdict.kind, VERDICT_TARPIT);
+        CHECK(verdict.blocks_client);
+    }
+}
+
+static void a_target_outside_the_honeypot_passes(void)
+{
+    static const char *targets[] = {"/trap", "/traps/", "/robots.txt",
+                                    "/index.html?/trap/"};
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        struct verdict verdict = decide_for_target("curl/8.18.0", targets[i]);
+        CHECK_EQ_INT(verdict.kind, VERDICT_PASS);
+        CHECK(!verdict.blocks_client);
+    }
+}
+
+static void a_named_crawler_in_the_honeypot_is_tarpitted_not_denied(void)
+{
+    struct verdict verdict = decide_for_target("GPTBot/1.1", "/trap/");
+    CHECK_EQ_INT(verdict.kind, VERDICT_TARPIT);
+    CHECK(verdict.blocks_client);
+}
+
+static void a_client_with_five_404s_in_the_window_is_denied_and_blocked(void)
+{
+    struct verdict verdict = decide_with_not_found(5);
+    CHECK_EQ_INT(verdict.kind, VERDICT_DENY);
+    CHECK(verdict.blocks_client);
+}
+
+static void a_client_with_four_404s_in_the_window_passes(void)
+{
+    struct verdict verdict = decide_with_not_found(4);
+    CHECK_EQ_INT(verdict.kind, VERDICT_PASS);
+    CHECK(!verdict.blocks_client);
+}
+
+static void a_denied_crawler_and_a_slowed_client_are_not_blocked(void)
+{
+    CHECK(!decide("GPTBot/1.1", 0).blocks_client);
+    CHECK(!decide("curl/8.18.0", 7).blocks_client);
 }
 
 int main(void)
@@ -97,9 +171,17 @@ int main(void)
     a_request_over_the_rate_limit_is_slowed_with_its_retry_after();
     a_known_ai_or_seo_crawler_is_denied();
     a_crawler_over_the_rate_limit_is_denied_not_slowed();
-    a_chrome_user_agent_with_a_chromium_ja4_passes();
-    a_chrome_user_agent_with_a_non_chromium_ja4_is_tarpitted();
-    a_chrome_user_agent_without_a_ja4_passes();
+    a_chrome_user_agent_with_a_browser_ja4_passes();
+    a_chrome_user_agent_with_a_known_non_browser_ja4_is_tarpitted();
+    a_chrome_user_agent_with_an_unknown_ja4_passes();
+    a_curl_user_agent_with_the_curl_ja4_passes();
+    a_false_chrome_is_not_put_in_the_block_table();
+    a_request_for_the_honeypot_is_tarpitted_and_blocks_the_client();
+    a_target_outside_the_honeypot_passes();
+    a_named_crawler_in_the_honeypot_is_tarpitted_not_denied();
+    a_client_with_five_404s_in_the_window_is_denied_and_blocked();
+    a_client_with_four_404s_in_the_window_passes();
+    a_denied_crawler_and_a_slowed_client_are_not_blocked();
     printf("test_verdict: ok\n");
 
     return 0;

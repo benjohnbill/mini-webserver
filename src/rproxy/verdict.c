@@ -16,10 +16,6 @@ static const char *const crawler_names[] = {
     "GPTBot", "CCBot", "ClaudeBot", "Bytespider", "PerplexityBot", "AhrefsBot",
 };
 
-/* The JA4 cipher hash (ja4_b) of Chrome and the other Chromium browsers. */
-#define CHROMIUM_CIPHER_HASH "8daaf6152771"
-#define CIPHER_HASH_AT 11
-
 static bool agent_is_crawler(const struct verdict_signals *signals);
 static bool agent_lies_about_chrome(const struct verdict_signals *signals);
 static bool request_is_over_limit(const struct verdict_signals *signals);
@@ -36,11 +32,12 @@ struct verdict verdict_decide(const struct verdict_signals *signals)
         if (rules[i].matches(signals)) {
             int retry_after =
                 rules[i].kind == VERDICT_SLOW ? signals->retry_after : 0;
-            return (struct verdict){rules[i].kind, retry_after};
+            return (struct verdict){.kind = rules[i].kind,
+                                    .retry_after = retry_after};
         }
     }
 
-    return (struct verdict){VERDICT_PASS, 0};
+    return (struct verdict){.kind = VERDICT_PASS};
 }
 
 static bool agent_is_crawler(const struct verdict_signals *signals)
@@ -58,18 +55,12 @@ static bool agent_is_crawler(const struct verdict_signals *signals)
     return false;
 }
 
-/* The User-Agent says Chrome, but the TLS is not Chromium. With no JA4
-   there is no evidence. */
+/* Slot: the JA4 label rule comes next. */
 static bool agent_lies_about_chrome(const struct verdict_signals *signals)
 {
-    if (signals->user_agent == NULL ||
-        strstr(signals->user_agent, "Chrome/") == NULL ||
-        strlen(signals->ja4) < CIPHER_HASH_AT + strlen(CHROMIUM_CIPHER_HASH)) {
-        return false;
-    }
+    (void)signals;
 
-    return strncmp(signals->ja4 + CIPHER_HASH_AT, CHROMIUM_CIPHER_HASH,
-                   strlen(CHROMIUM_CIPHER_HASH)) != 0;
+    return false;
 }
 
 static bool request_is_over_limit(const struct verdict_signals *signals)
