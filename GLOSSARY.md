@@ -43,3 +43,33 @@ _Avoid_: business logic, engine
 **Response plan**:
 The output of the Shared core for one request: the bytes of the status line and the headers, and the source of the body (bytes in memory, or an open file and its size).
 _Avoid_: response object, reply
+
+## Reverse Proxy
+
+**Reverse Proxy**:
+The program `rproxy`. It stands in front of the Origin, terminates TLS, decides a Verdict for each connection, and forwards the accepted requests to the Origin.
+_Avoid_: edge, front proxy, gateway, shield
+
+**Origin**:
+The program `server` when it sits behind the Reverse Proxy. It serves the files and the Handlers.
+_Avoid_: upstream (the code may keep `upstream` for the target of the Proxy Route), backend
+
+**Proxy Route**:
+The Route of the server that sends a target under `/proxy/` to an upstream and relays the reply. It leaves the server when the Reverse Proxy takes over its cache.
+_Avoid_: Reverse Proxy (that name is for `rproxy`)
+
+**ClientHello**:
+The first TLS message of a client. It is plaintext. The Reverse Proxy reads it with `MSG_PEEK` before the TLS handshake.
+_Avoid_: hello packet, handshake (the handshake is all the messages)
+
+**JA4**:
+A fingerprint of a client, made from its ClientHello by the FoxIO JA4 rules, for example `t13d1516h2_8daaf6152771_e5627efa2ab1`. Two clients with the same TLS library usually have the same JA4.
+_Avoid_: TLS hash, JA3 (an older fingerprint with different rules)
+
+**Verdict**:
+The decision of the Reverse Proxy for one request: pass, deny (403), slow down (429), or tarpit.
+_Avoid_: judgment, action, result
+
+**Crawler script**:
+A program in `bench/arena/` that acts as one kind of crawler against the Reverse Proxy. A Scene runs Crawler scripts and counts the Verdicts and the load on the Origin.
+_Avoid_: bot, attacker, attack script

@@ -8,7 +8,7 @@ To be decided at the team meeting. Until then, the rules of `README.md` (section
 
 ## Code
 
-The language is C11 with POSIX.1-2008 (`-std=c11 -D_POSIX_C_SOURCE=200809L`). Use only the C standard library and POSIX APIs. Do not use a complete HTTP or event loop library (libevent, libuv, nginx, Apache, mongoose).
+The language is C11 with POSIX.1-2008 (`-std=c11 -D_POSIX_C_SOURCE=200809L`). Use only the C standard library and POSIX APIs. Exception on `CJG`: the Reverse Proxy links OpenSSL (`docs/adr/openssl-for-the-reverse-proxy.md`). Do not use a complete HTTP or event loop library (libevent, libuv, nginx, Apache, mongoose).
 
 ### Format
 
@@ -38,6 +38,7 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | `get` | Return a value. Change nothing |
    | `send` | Write bytes to a socket |
    | `is_` and `has_` | Ask a question and return `bool` |
+   | `format` | Write the text form of a struct into a buffer that the caller gives |
 
 4. **One concept has one name in all files.** When you add a concept, add a row.
 
@@ -52,6 +53,7 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | The run-time settings | `struct config *config` | `cfg`, `opts` |
    | The Reverse Proxy cache | `struct cache *cache` | `c`, `store` |
    | One stored reply in the cache | `struct cache_entry *entry` | `node`, `item` |
+   | A parsed ClientHello | `struct client_hello *hello` | `ch`, `chello` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

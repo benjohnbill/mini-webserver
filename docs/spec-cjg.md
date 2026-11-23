@@ -32,7 +32,7 @@ Fallback: if S2 on `pool` has no result by a time that the owner sets (open), th
 |---|---|
 | TCP socket server (`socket`, `bind`, `listen` with backlog `SOMAXCONN`, `accept`, `SO_REUSEADDR`) | Forward Proxy and Reverse Proxy (2026-11-22) |
 | Request line, headers (`Host`, `Content-Length`, `Connection`, `Content-Type`, `Transfer-Encoding`), POST body by `Content-Length`. `Transfer-Encoding` is read only to answer 400 | CGI (Handlers are C functions in the server) |
-| Status line, `Content-Type`, `Content-Length`, `Connection`, body | Chunked transfer, Range, TLS, HTTP/2, authentication |
+| Status line, `Content-Type`, `Content-Length`, `Connection`, body | Chunked transfer, Range, HTTP/2, authentication. TLS is in the Reverse Proxy (§11) |
 | Static files from a root folder, MIME types, 400, 403, 404, 405, 411, 413, 414, 431, 500, 505 | Team rules (team meeting) |
 | `Host` missing in an `HTTP/1.1` request gets 400. The owner types this check (§10 slot) | |
 | Two Handlers: `POST /echo` and `GET /api/time` | |
@@ -305,3 +305,55 @@ An agent generates the code in a new session, on the `CJG` branch. Its input is 
 - Slots: the generator does not write the bodies of the §8 rows. For each one it writes the function with its final signature, `(void)` casts for the parameters, `return -1;`, and the comment `/* SLOT(owner): SPEC §8 row N */`. For row 2 and row 6 it leaves only the comment at the place of the call or the check: `/* SLOT(owner): SO_RCVTIMEO */` and `/* SLOT(owner): Host check, HTTP/1.1 only */`. The read side of `model_epoll_run` is a slot. The generator writes its write side.
 - Phases: 1, the Shared core and its unit tests. 2, `conn`, `send_plan`, `main`, `model.h`, and the slots. 3, `tests/func.sh`. 4, `bench/scene.sh` and `www/`.
 - Done when `make`, `make test`, and `make lint` pass. `func.sh` cannot pass yet, because each model is a slot. It must run and report the slot error.
+
+## 11. Reverse Proxy (2026-11-24)
+
+[ADR: separate process](adr/reverse-proxy-is-a-separate-process.md), [ADR: OpenSSL](adr/openssl-for-the-reverse-proxy.md).
+
+The topic is the fight between crawlers and the server. A Crawler script attacks. The Reverse Proxy decides a Verdict. A Scene counts the Verdicts and the load on the Origin.
+
+```text
+client --TLS--> rproxy --HTTP--> server (the Origin, 127.0.0.1)
+```
+
+### Modules
+
+The four decision modules do not use sockets or OpenSSL I/O. Unit tests call them with bytes and values. `ja4` uses only `SHA256()` from OpenSSL.
+
+```text
+src/rproxy/
+  main.c            arguments, listen socket, pool, one connection:
+                    peek, Verdict, TLS, forward
+  tls.c/h           OpenSSL context and handshake (I/O)
+  forward.c/h       one request to the Origin, with X-Forwarded-For and
+                    X-JA4 (I/O)
+  client_hello.c/h  ClientHello bytes -> struct client_hello        test
+  ja4.c/h           struct client_hello -> JA4 string             test
+  rate_limit.c/h    token bucket for each key, time is an argument test
+  verdict.c/h       signals -> Verdict                            test
+tests/
+  test_client_hello.c  test_ja4.c  test_rate_limit.c  test_verdict.c
+  rproxy_func.sh    curl -k through rproxy to a running server
+bench/arena/        Crawler scripts
+```
+
+`client_hello` keeps the values of the wire in their order, GREASE included. `ja4` removes GREASE, sorts, and hashes.
+
+### Code the owner types
+
+The owner types the decision code. The generator writes the byte parser and the I/O. Each owner file starts as a slot (§10): the tests exist first and fail.
+
+| Order | Code | Question it answers |
+|---|---|---|
+| 1 | `ja4_format`: GREASE, the version, the counts, the ALPN characters, the two hashes | Which parts of a ClientHello tell one TLS library from another? |
+| 2 | `rate_limit`: the token bucket and the key table | How much may one key ask, and what does the table forget? |
+| 3 | `verdict`: the table from signals to a Verdict | Which signal is strong enough to deny, and which Verification client must still pass? |
+
+### Order of work
+
+1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand.
+2. `ja4` tests (they fail), and the slot. The expected values come from the FoxIO JA4 document (`technical_details/JA4.md`), checked with `sha256sum`.
+3. `tls`, `forward`, `main`, and `tests/rproxy_func.sh`.
+4. `rate_limit` and `verdict`: tests first, then the slots.
+5. The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server.
+6. Crawler scripts and the Scenes of the arena.
