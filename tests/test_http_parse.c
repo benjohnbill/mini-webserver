@@ -69,6 +69,21 @@ static void a_target_that_does_not_start_with_slash_gets_400(void)
     CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 400);
 }
 
+static void an_http_1_1_request_with_no_host_gets_400(void)
+{
+    char buffer[] = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 400);
+}
+
+static void an_http_1_0_request_with_no_host_is_complete(void)
+{
+    char buffer[] = "GET / HTTP/1.0\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    CHECK(request.host == NULL);
+}
+
 static void a_target_of_2048_bytes_passes(void)
 {
     char buffer[LONG_BUFFER_SIZE];
@@ -337,6 +352,8 @@ int main(void)
     an_unknown_method_gets_405();
     a_request_line_with_no_target_gets_400();
     a_target_that_does_not_start_with_slash_gets_400();
+    an_http_1_1_request_with_no_host_gets_400();
+    an_http_1_0_request_with_no_host_is_complete();
     a_target_of_2048_bytes_passes();
     a_target_over_2048_bytes_gets_414();
     a_long_target_gets_414_when_the_request_line_ends();

@@ -231,7 +231,10 @@ static int header_lines_parse(char *line, struct request *request)
     bool is_http_1_0 = strcmp(request->version, "HTTP/1.0") == 0;
     request->wants_close =
         is_http_1_0 ? !fields.has_keep_alive : fields.has_close;
-    /* SLOT(owner): Host check, HTTP/1.1 only */
+    /* RFC 9112 section 3.2: an HTTP/1.1 request with no Host is a 400. */
+    if (!is_http_1_0 && request->host == NULL) {
+        return 400;
+    }
 
     return body_framing_check(request, &fields);
 }
