@@ -23,7 +23,11 @@ DURATION=${DURATION:-10}
 # human.sh sends from this address (see human.sh).
 HUMAN_ADDRESS=127.0.0.200
 DATE=$(date +%Y%m%d)
-OUT=docs/measurements/$DATE-arena-$CRAWLER.md
+# CACHE_BYTES sets --cache-bytes of the cache presets. A cache smaller
+# than the dataset (16.7 MiB) shows the long tail: rare pages miss.
+CACHE_BYTES=${CACHE_BYTES:-}
+CACHE_FLAG=${CACHE_BYTES:+ --cache-bytes $CACHE_BYTES}
+OUT=docs/measurements/$DATE-arena-$CRAWLER${CACHE_BYTES:+-cache$CACHE_BYTES}.md
 BASE=https://$HOST:$PX_PORT
 WORK=$(mktemp -d)
 ORIGIN_PID=
@@ -41,10 +45,10 @@ trap cleanup EXIT
 preset_flags() {
     case $1 in
     none) echo "" ;;
-    cache) echo "--cache on" ;;
+    cache) echo "--cache on$CACHE_FLAG" ;;
     rate-ip) echo "--rate 5 --burst 10" ;;
     rate-ja4) echo "--rate 5 --burst 10 --rate-key ja4" ;;
-    all) echo "--cache on --rate 5 --burst 10 --rate-key ja4" ;;
+    all) echo "--cache on$CACHE_FLAG --rate 5 --burst 10 --rate-key ja4" ;;
     *) return 1 ;;
     esac
 }
