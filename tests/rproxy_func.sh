@@ -229,6 +229,30 @@ grep -qi $'^x-cache: miss\r$' "$WORK/time2" \
     && pass "a no-store reply of ./server is not cached" \
     || fail "a no-store reply of ./server is not cached"
 
+# ETag and 304: the cache answers If-None-Match.
+etag="$(curl -sk --max-time 5 -D - -o /dev/null "$BASE/style.css" |
+    grep -i '^etag:' | cut -d' ' -f2- | tr -d '\r')"
+[ -n "$etag" ] && pass "a static file of ./server has an ETag" \
+    || fail "a static file of ./server has an ETag"
+curl -sk --max-time 5 -D "$WORK/h304" -o "$WORK/b304" \
+    -H "If-None-Match: $etag" "$BASE/style.css"
+head -n1 "$WORK/h304" | grep -q '^HTTP/1.1 304 ' \
+    && grep -qi $'^x-cache: hit\r$' "$WORK/h304" \
+    && grep -qiF "etag: $etag" "$WORK/h304" \
+    && [ ! -s "$WORK/b304" ] \
+    && pass "a hit with the same If-None-Match is a 304 with no body" \
+    || fail "a hit with the same If-None-Match is a 304 with no body"
+got="$(curl -sk --max-time 5 -o "$WORK/b200" -w '%{http_code}' \
+    -H 'If-None-Match: "other"' "$BASE/style.css")"
+[ "$got" = "200" ] && cmp -s "$WORK/b200" www/style.css \
+    && pass "a different If-None-Match gets the full 200" \
+    || fail "a different If-None-Match gets the full 200: got '$got'"
+start_proxy --origin "$HOST:$SERVER_PORT" --cache on
+got="$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
+    -H "If-None-Match: $etag" "$BASE/style.css")"
+[ "$got" = "304" ] && pass "a miss with the same If-None-Match is a 304 too" \
+    || fail "a miss with the same If-None-Match is a 304 too: got '$got'"
+
 if [ "$FAILS" -gt 0 ]; then
     echo "--- rproxy stderr ---"
     cat "$WORK/rproxy.err"

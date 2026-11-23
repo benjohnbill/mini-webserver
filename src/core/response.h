@@ -33,6 +33,11 @@ void response_plan_init_error(struct response_plan *plan, int status,
 /* 405 with "Allow: <allowed_method>". It closes the connection. */
 void response_plan_init_not_allowed(struct response_plan *plan,
                                     const char *allowed_method);
+/* Adds the line "name: value" at the end of the header section. A text body
+   in header[] stays after the header section. Returns false, and the plan
+   does not change, if the line does not fit. */
+bool response_plan_add_header(struct response_plan *plan, const char *name,
+                              const char *value);
 void response_plan_close(struct response_plan *plan); /* closes file_fd */
 
 #endif

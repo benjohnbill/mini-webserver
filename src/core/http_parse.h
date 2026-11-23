@@ -16,6 +16,10 @@ struct request {
     bool wants_close;    /* from the version and Connection */
     char *body;
     size_t body_len;
+    /* The header lines after the request line, for http_find_header. The
+       parse changes them in place. NULL when the request has none. */
+    char *header_block;
+    size_t header_block_len;
 };
 
 #define HTTP_INCOMPLETE (-1)
@@ -29,5 +33,9 @@ int http_parse_request(char *buffer, size_t len, struct request *request);
    number (-400). The sign is necessary because a length can be equal to a
    status code. Does not change the buffer. */
 long http_frame_measure(const char *buffer, size_t len);
+
+/* Returns the value of the first header with this name, in any case, with
+   no spaces around it. Returns NULL if the request has no such header. */
+const char *http_find_header(const struct request *request, const char *name);
 
 #endif

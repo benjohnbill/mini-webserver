@@ -34,6 +34,12 @@ bool cache_find(struct cache *cache, const char *key, time_t now, char **reply,
 bool cache_store(struct cache *cache, const char *key, const char *reply,
                  size_t reply_len, time_t now);
 
+/* True if the reply has an ETag header that if_none_match names. The
+   comparison is the weak comparison of RFC 9110 section 13.1.2, and "*"
+   names any ETag. A Shared function with no lock: it reads only reply. */
+bool cache_is_not_modified(const char *reply, size_t reply_len,
+                           const char *if_none_match);
+
 void cache_stats_get(struct cache *cache, struct cache_stats *stats);
 
 /* One line to stderr: "cache pid=... hits=... misses=... ...". */

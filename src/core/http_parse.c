@@ -354,3 +354,11 @@ static int content_length_parse(const char *value, long *content_length)
 
     return 0;
 }
+
+const char *http_find_header(const struct request *request, const char *name)
+{
+    (void)request;
+    (void)name;
+
+    return NULL; /* TODO(step 7): tests first, then this body */
+}

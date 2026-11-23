@@ -434,3 +434,13 @@ static void order_unlink(struct cache *cache, struct cache_entry *entry)
         cache->newest = entry->prev;
     }
 }
+
+bool cache_is_not_modified(const char *reply, size_t reply_len,
+                           const char *if_none_match)
+{
+    (void)reply;
+    (void)reply_len;
+    (void)if_none_match;
+
+    return false; /* TODO(step 7): tests first, then this body */
+}

@@ -127,6 +127,11 @@ check_static_files() {
     expect "large.bin has 10485760 bytes" 10485760 \
         "$(curl -s -o /dev/null --max-time 20 -w '%{size_download}' \
             "$BASE/large.bin")"
+    expect "a static file has the ETag of its mtime and size" \
+        "$(stat -c '%Y %s' www/style.css | awk '{printf "\"%x-%x\"", $1, $2}')" \
+        "$(http_header ETag "$BASE/style.css")"
+    expect "a Handler reply has no ETag" "" \
+        "$(http_header ETag "$BASE/api/time")"
     expect "a missing file is 404" 404 "$(http_status "$BASE/missing.html")"
     EMPTY_DIR=$(mktemp -d www/func-empty.XXXXXX)
     expect "a folder with no index.html is 404" 404 \

@@ -217,8 +217,74 @@ static void striped_lru_evicts_across_stripes(void)
     cache_destroy(cache);
 }
 
+#define ETAG_REPLY                                                             \
+    "HTTP/1.1 200 OK\r\nETag: \"6553f100-5\"\r\nContent-Length: 5\r\n\r\n"     \
+    "hello"
+
+static bool reply_is_not_modified(const char *reply, const char *if_none_match)
+{
+    return cache_is_not_modified(reply, strlen(reply), if_none_match);
+}
+
+static void the_same_etag_is_not_modified(void)
+{
+    CHECK(reply_is_not_modified(ETAG_REPLY, "\"6553f100-5\""));
+}
+
+static void a_different_etag_is_modified(void)
+{
+    CHECK(!reply_is_not_modified(ETAG_REPLY, "\"6553f100-6\""));
+}
+
+static void an_etag_in_a_list_is_not_modified(void)
+{
+    CHECK(reply_is_not_modified(ETAG_REPLY, "\"a\", \"6553f100-5\" ,\"b\""));
+}
+
+static void a_star_is_not_modified(void)
+{
+    CHECK(reply_is_not_modified(ETAG_REPLY, "*"));
+}
+
+static void a_weak_etag_matches_by_the_weak_comparison(void)
+{
+    CHECK(reply_is_not_modified(ETAG_REPLY, "W/\"6553f100-5\""));
+}
+
+static void an_etag_without_quotes_does_not_match(void)
+{
+    CHECK(!reply_is_not_modified(ETAG_REPLY, "6553f100-5"));
+}
+
+static void a_reply_with_no_etag_is_modified(void)
+{
+    CHECK(!reply_is_not_modified("HTTP/1.1 200 OK\r\n\r\n", "*"));
+}
+
+static void an_etag_in_the_body_does_not_count(void)
+{
+    const char *reply = "HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n"
+                        "ETag: \"6553f100-5\"\r\n";
+    CHECK(!reply_is_not_modified(reply, "\"6553f100-5\""));
+}
+
+static void an_etag_header_name_in_any_case_counts(void)
+{
+    CHECK(reply_is_not_modified("HTTP/1.1 200 OK\r\netag: \"e\"\r\n\r\n",
+                                "\"e\""));
+}
+
 int main(void)
 {
+    the_same_etag_is_not_modified();
+    a_different_etag_is_modified();
+    an_etag_in_a_list_is_not_modified();
+    a_star_is_not_modified();
+    a_weak_etag_matches_by_the_weak_comparison();
+    an_etag_without_quotes_does_not_match();
+    a_reply_with_no_etag_is_modified();
+    an_etag_in_the_body_does_not_count();
+    an_etag_header_name_in_any_case_counts();
     ok_reply_init();
     a_stored_reply_is_found_with_the_same_bytes();
     a_key_that_was_not_stored_is_a_miss();

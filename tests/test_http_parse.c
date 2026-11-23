@@ -246,8 +246,90 @@ static void an_unknown_method_waits_for_the_header_end(void)
     CHECK_EQ_INT(http_frame_measure(buffer, strlen(buffer)), HTTP_INCOMPLETE);
 }
 
+static void find_header_finds_a_name_in_any_case(void)
+{
+    char buffer[] =
+        "GET / HTTP/1.1\r\nHost: a\r\nif-none-match: \"e1\"\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    const char *value = http_find_header(&request, "If-None-Match");
+    CHECK(value != NULL && strcmp(value, "\"e1\"") == 0);
+}
+
+static void find_header_returns_null_for_an_absent_name(void)
+{
+    char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    CHECK(http_find_header(&request, "X-PoW") == NULL);
+}
+
+static void find_header_returns_null_when_the_request_has_no_header(void)
+{
+    char buffer[] = "GET / HTTP/1.0\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    CHECK(http_find_header(&request, "Host") == NULL);
+}
+
+static void find_header_trims_the_spaces_around_the_value(void)
+{
+    char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\nX-PoW: \t n:42 \t\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    const char *value = http_find_header(&request, "X-PoW");
+    CHECK(value != NULL && strcmp(value, "n:42") == 0);
+}
+
+static void find_header_does_not_match_a_longer_name_with_the_same_start(void)
+{
+    char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\nX-PoW-Challenge: c\r\n"
+                    "X-PoW: n:1\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    const char *value = http_find_header(&request, "X-PoW");
+    CHECK(value != NULL && strcmp(value, "n:1") == 0);
+}
+
+static void find_header_returns_the_first_of_two_same_names(void)
+{
+    char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\nSignature: one\r\n"
+                    "Signature: two\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    const char *value = http_find_header(&request, "Signature");
+    CHECK(value != NULL && strcmp(value, "one") == 0);
+}
+
+static void find_header_works_with_bare_newline_line_ends(void)
+{
+    char buffer[] = "GET / HTTP/1.1\nHost: a\nSignature-Agent: \"x\"\n\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    const char *value = http_find_header(&request, "Signature-Agent");
+    CHECK(value != NULL && strcmp(value, "\"x\"") == 0);
+    CHECK(strcmp(http_find_header(&request, "host"), "a") == 0);
+}
+
+static void find_header_does_not_read_the_body(void)
+{
+    char buffer[] = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 9\r\n"
+                    "\r\nX-PoW: 1";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer) + 1, &request), 0);
+    CHECK(http_find_header(&request, "X-PoW") == NULL);
+}
+
 int main(void)
 {
+    find_header_finds_a_name_in_any_case();
+    find_header_returns_null_for_an_absent_name();
+    find_header_returns_null_when_the_request_has_no_header();
+    find_header_trims_the_spaces_around_the_value();
+    find_header_does_not_match_a_longer_name_with_the_same_start();
+    find_header_returns_the_first_of_two_same_names();
+    find_header_works_with_bare_newline_line_ends();
+    find_header_does_not_read_the_body();
     a_full_get_is_complete();
     a_request_with_no_empty_line_is_incomplete();
     a_request_with_bare_newline_line_ends_is_complete();

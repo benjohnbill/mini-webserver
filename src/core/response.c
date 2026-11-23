@@ -159,3 +159,13 @@ static void plan_write_error(struct response_plan *plan, int status,
     };
     plan_write_head(plan, &head);
 }
+
+bool response_plan_add_header(struct response_plan *plan, const char *name,
+                              const char *value)
+{
+    (void)plan;
+    (void)name;
+    (void)value;
+
+    return false; /* TODO(step 7): tests first, then this body */
+}
