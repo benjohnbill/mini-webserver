@@ -532,4 +532,4 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters. Done (2026-11-24). The generator chose the rules by practice ("Defaults taken from practice"). `struct verdict_signals` now has the JA4 label and the Behavior counters, and `struct verdict` has `blocks_client`.
 10. Proof of work. Done (2026-11-24). The flags: `--pow-prefix PATH` and `--pow-bits N`. A challenge logs the Verdict `challenge`.
 11. Web Bot Auth and 402. Done (2026-11-24). The flags: `--pay-prefix PATH` and `--bot-key FILE`. A 402 logs the Verdict `pay`. `tests/data/bot_test_key.pem` is a test key for `tests/rproxy_func.sh` only.
-12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes.
+12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes. Done (2026-11-24). Results: [`20261124-arena-layers.md`](measurements/20261124-arena-layers.md). The Scene shows one cost: a tarpit holds an rproxy Worker, so `disguised` starves `human.py`.
