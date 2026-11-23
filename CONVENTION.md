@@ -50,6 +50,8 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | The listen socket | `listen_fd` | `sfd`, `server_fd` |
    | An HTTP status code | `status` | `code`, `sc` |
    | The run-time settings | `struct config *config` | `cfg`, `opts` |
+   | The Reverse Proxy cache | `struct cache *cache` | `c`, `store` |
+   | One stored reply in the cache | `struct cache_entry *entry` | `node`, `item` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

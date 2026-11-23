@@ -9,8 +9,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "cache.h"
 #include "config.h"
 #include "model.h"
+
+#define names_count(names) ((int)(sizeof(names) / sizeof((names)[0])))
 
 volatile sig_atomic_t stop_requested = 0;
 
@@ -19,6 +22,9 @@ static bool number_parse(const char *text, long min, long max, int *number);
 static bool option_parse(struct config *config, const char *name, char *value);
 static bool model_is_known(const char *model);
 static bool upstream_parse(struct config *config, char *value);
+static bool cache_option_parse(struct cache_options *options, const char *name,
+                               const char *value);
+static int name_find(const char *value, const char *const *names, int count);
 static void signals_install(void);
 static void stop_signal_handle(int signal_number);
 static int listen_socket_open(int port);
@@ -31,17 +37,33 @@ int main(int argc, char **argv)
 {
     struct config config;
     if (!config_init_from_args(&config, argc, argv)) {
-        fprintf(stderr, "usage: ./server <port> <root> [--model "
-                        "iter|fork|pool|epoll] [--workers N] [--timeout S] "
-                        "[--log] [--upstream HOST:PORT]\n");
+        fprintf(stderr,
+                "usage: ./server <port> <root> [--model "
+                "iter|fork|pool|epoll] [--workers N] [--timeout S] [--log] "
+                "[--upstream HOST:PORT] [--delay MS] [--cache off|on] "
+                "[--cache-admit all|size|second] [--cache-object-max BYTES] "
+                "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
+                "[--cache-lock global|striped] "
+                "[--cache-share private|shared]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     signals_install();
 
     int listen_fd = listen_socket_open(config.port);
+    if (config.cache_options.is_on) {
+        config.cache = cache_create(&config.cache_options);
+        if (config.cache == NULL) {
+            fprintf(stderr, "server: cache_create failed\n");
+            return 1;
+        }
+    }
     int result = model_run(listen_fd, &config);
     close(listen_fd);
+    if (config.cache != NULL) {
+        cache_report(config.cache);
+        cache_destroy(config.cache);
+    }
 
     return model_result_report(config.model, result);
 }
@@ -55,6 +77,16 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
         .log = false,
         .upstream_host = NULL,
         .upstream_port = NULL,
+        .delay_ms = 0,
+        .cache_options = {.is_on = false,
+                          .admit = CACHE_ADMIT_ALL,
+                          .evict = CACHE_EVICT_FIFO,
+                          .lock = CACHE_LOCK_GLOBAL,
+                          .share = CACHE_SHARE_PRIVATE,
+                          .bytes = DEFAULT_CACHE_BYTES,
+                          .object_max = DEFAULT_CACHE_OBJECT_MAX,
+                          .ttl = 0},
+        .cache = NULL,
     };
     if (argc < 3 || !number_parse(argv[1], 1, PORT_MAX, &config->port)) {
         return false;
@@ -103,8 +135,11 @@ static bool option_parse(struct config *config, const char *name, char *value)
     if (strcmp(name, "--upstream") == 0) {
         return upstream_parse(config, value);
     }
+    if (strcmp(name, "--delay") == 0) {
+        return number_parse(value, 0, DELAY_MAX, &config->delay_ms);
+    }
 
-    return false;
+    return cache_option_parse(&config->cache_options, name, value);
 }
 
 static bool model_is_known(const char *model)
@@ -127,6 +162,54 @@ static bool upstream_parse(struct config *config, char *value)
     config->upstream_port = colon + 1;
 
     return true;
+}
+
+/* Each names table is in the order of its enum in config.h. */
+static bool cache_option_parse(struct cache_options *options, const char *name,
+                               const char *value)
+{
+    static const char *const on_names[] = {"off", "on"};
+    static const char *const admit_names[] = {"all", "size", "second"};
+    static const char *const evict_names[] = {"fifo", "lru"};
+    static const char *const lock_names[] = {"global", "striped"};
+    static const char *const share_names[] = {"private", "shared"};
+    int index = -1;
+    if (strcmp(name, "--cache") == 0) {
+        index = name_find(value, on_names, names_count(on_names));
+        options->is_on = index == 1;
+    } else if (strcmp(name, "--cache-admit") == 0) {
+        index = name_find(value, admit_names, names_count(admit_names));
+        options->admit = (enum cache_admit)index;
+    } else if (strcmp(name, "--cache-evict") == 0) {
+        index = name_find(value, evict_names, names_count(evict_names));
+        options->evict = (enum cache_evict)index;
+    } else if (strcmp(name, "--cache-lock") == 0) {
+        index = name_find(value, lock_names, names_count(lock_names));
+        options->lock = (enum cache_lock)index;
+    } else if (strcmp(name, "--cache-share") == 0) {
+        index = name_find(value, share_names, names_count(share_names));
+        options->share = (enum cache_share)index;
+    } else if (strcmp(name, "--cache-bytes") == 0) {
+        return number_parse(value, 1, CACHE_BYTES_MAX, &options->bytes);
+    } else if (strcmp(name, "--cache-object-max") == 0) {
+        return number_parse(value, 1, CACHE_BYTES_MAX, &options->object_max);
+    } else if (strcmp(name, "--cache-ttl") == 0) {
+        return number_parse(value, 0, CACHE_TTL_MAX, &options->ttl);
+    }
+
+    return index >= 0;
+}
+
+/* Returns the index of value in names, or -1. */
+static int name_find(const char *value, const char *const *names, int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (strcmp(value, names[i]) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 /* sa_flags = 0, not signal(): with -D_POSIX_C_SOURCE, signal() keeps the

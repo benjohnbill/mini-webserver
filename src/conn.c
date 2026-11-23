@@ -9,7 +9,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <time.h>
 
+#include "cache.h"
 #include "model.h"
 #include "proxy.h"
 #include "router.h"
@@ -37,6 +39,12 @@ static int connection_fetch_proxy(const struct request *request,
                                   const struct config *config,
                                   struct proxy_reply *reply,
                                   struct response_plan *plan);
+static int cache_fetch(const struct request *request,
+                       const struct config *config, struct proxy_reply *reply,
+                       bool *is_hit);
+static void reply_plan_init(const struct proxy_reply *reply, bool is_hit,
+                            struct response_plan *plan);
+static void delay_sleep(int delay_ms);
 
 void conn_serve(int conn_fd, const struct config *config)
 {
@@ -127,6 +135,9 @@ static bool connection_answer(int conn_fd, const struct config *config,
     struct request request;
     struct response_plan plan;
     struct proxy_reply reply = {0};
+    if (config->delay_ms > 0) {
+        delay_sleep(config->delay_ms);
+    }
     if (status == 0) {
         status = http_parse_request(buffer->data, request_len, &request);
     }
@@ -179,8 +190,9 @@ static bool request_is_proxy(const struct request *request)
     return router_resolve(request, &route) == 0 && route.kind == ROUTE_PROXY;
 }
 
-/* The plan sends the upstream reply as it is, with no header of its own,
-   and closes: the upstream reply already has its own Connection header. */
+/* With the cache off, the plan sends the upstream reply as it is, with no
+   header of its own. The plan closes: the upstream reply already has its
+   own Connection header. */
 static int connection_fetch_proxy(const struct request *request,
                                   const struct config *config,
                                   struct proxy_reply *reply,
@@ -189,9 +201,10 @@ static int connection_fetch_proxy(const struct request *request,
     if (config->upstream_host == NULL) {
         return 404;
     }
-    /* CACHE SLOT: cache_find before proxy_fetch, cache_store after.
-       The owner types this after the team meeting. */
-    int status = proxy_fetch(request, config, reply);
+    bool is_hit = false;
+    int status = config->cache != NULL
+                     ? cache_fetch(request, config, reply, &is_hit)
+                     : proxy_fetch(request, config, reply);
     if (status != 0) {
         return status;
     }
@@ -201,6 +214,63 @@ static int connection_fetch_proxy(const struct request *request,
                                    .body_len = reply->len,
                                    .file_fd = -1,
                                    .close_after = true};
+    if (config->cache != NULL) {
+        reply_plan_init(reply, is_hit, plan);
+    }
 
     return 0;
+}
+
+/* The key is the method, the path, and the query. */
+static int cache_fetch(const struct request *request,
+                       const struct config *config, struct proxy_reply *reply,
+                       bool *is_hit)
+{
+    char key[CACHE_KEY_MAX];
+    int key_len =
+        snprintf(key, sizeof(key), "%s %s", request->method, request->target);
+    if (key_len < 0 || (size_t)key_len >= sizeof(key)) {
+        return proxy_fetch(request, config, reply);
+    }
+    *is_hit =
+        cache_find(config->cache, key, time(NULL), &reply->data, &reply->len);
+    if (*is_hit) {
+        return 0;
+    }
+    int status = proxy_fetch(request, config, reply);
+    if (status == 0) {
+        cache_store(config->cache, key, reply->data, reply->len, time(NULL));
+    }
+
+    return status;
+}
+
+/* Puts "X-Cache: HIT" or "MISS" after the status line. If the status line
+   does not fit the header of the plan, the plan stays as it is. */
+static void reply_plan_init(const struct proxy_reply *reply, bool is_hit,
+                            struct response_plan *plan)
+{
+    const char *line_end = memchr(reply->data, '\n', reply->len);
+    if (line_end == NULL) {
+        return;
+    }
+    size_t status_len = (size_t)(line_end - reply->data) + 1;
+    int head_len =
+        snprintf(plan->header, sizeof(plan->header), "%.*sX-Cache: %s\r\n",
+                 (int)status_len, reply->data, is_hit ? "HIT" : "MISS");
+    if (head_len < 0 || (size_t)head_len >= sizeof(plan->header)) {
+        plan->header[0] = '\0';
+        return;
+    }
+    plan->header_len = (size_t)head_len;
+    plan->body = reply->data + status_len;
+    plan->body_len = reply->len - status_len;
+}
+
+/* --delay: a slow origin. A signal ends the sleep early. */
+static void delay_sleep(int delay_ms)
+{
+    struct timespec delay = {.tv_sec = delay_ms / 1000,
+                             .tv_nsec = (long)(delay_ms % 1000) * 1000000L};
+    nanosleep(&delay, NULL);
 }

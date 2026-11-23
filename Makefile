@@ -6,11 +6,11 @@ TIDY_FLAGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Isrc -Isrc/core
 
 CORE_SRCS = src/core/http_parse.c src/core/router.c src/core/mime.c \
 	src/core/response.c src/core/serve.c src/core/handlers.c
-SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/proxy.c src/main.c \
+SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/proxy.c src/cache.c src/main.c \
 	src/model_iter.c src/model_fork.c src/model_pool.c src/model_epoll.c
 HEADERS = $(wildcard src/*.h src/core/*.h)
 TESTS = http_parse router mime response serve
-TEST_BINS = $(addprefix build/test_,$(TESTS))
+TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache
 FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
 	tests/*.c tests/*.h)
 
@@ -36,6 +36,12 @@ server-asan: $(SERVER_SRCS) $(HEADERS)
 build/test_%: tests/test_%.c tests/check.h $(CORE_SRCS) $(HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< $(CORE_SRCS)
+
+# The cache is in the I/O layer, so its test links src/cache.c, not the
+# Shared core.
+build/test_cache: tests/test_cache.c tests/check.h src/cache.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/cache.c
 
 test: $(TEST_BINS)
 	@for test_bin in $(TEST_BINS); do ./$$test_bin || exit 1; done
