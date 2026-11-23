@@ -3,7 +3,7 @@
 # Runs ./rproxy in front of fake Origins (socat) and in front of ./server,
 # sends curl requests over TLS, and exits 1 if one check fails. Checks
 # marked "(owner slot)" pass only after the owner types SPEC 11 rows 2, 3.
-# Needs: make rproxy cert server, socat, curl, nc.
+# Needs: make rproxy cert server, socat, curl, nc, openssl, sha256sum.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
@@ -97,7 +97,7 @@ fetch() {
     printf ' %s' "$(cat "$WORK/body" 2>/dev/null)"
 }
 
-for tool in socat curl nc; do
+for tool in socat curl nc openssl sha256sum; do
     command -v "$tool" > /dev/null || { echo "FAIL: $tool is missing"; exit 1; }
 done
 for file in "$RPROXY" ./server build/cert.pem build/key.pem; do
@@ -260,6 +260,93 @@ sleep 2.2
 got="$(fetch "$BASE/")"
 [ "$got" = "200 A" ] && pass "a block table entry expires after --block-time" \
     || fail "a block table entry expires after --block-time: got '$got'"
+
+# Proof of work (SPEC 11 v2, row "Test"). --pow-bits 8: a solution has
+# SHA-256 of "NONCE:COUNTER" with 8 leading zero bits, the hex "00".
+pow_hash() {
+    printf '%s' "$1" | sha256sum | cut -c1-2
+}
+start_proxy --origin "$HOST:$ORIGIN_A" --pow-prefix /data/ --pow-bits 8
+curl -sk --max-time 5 -D "$WORK/hpow" -o /dev/null "$BASE/data/1.html"
+challenge="$(grep -i '^x-pow-challenge:' "$WORK/hpow" | cut -d' ' -f2- |
+    tr -d '\r')"
+nonce="${challenge% *}"
+head -n1 "$WORK/hpow" | grep -q '^HTTP/1.1 401 ' \
+    && [ "${challenge#* }" = "8" ] && [ "${#nonce}" = "64" ] \
+    && grep -qiF "www-authenticate: PoW challenge=\"$challenge\"" "$WORK/hpow" \
+    && grep -q '^127\.0\.0\.1 [^ ]* challenge - - 401 ' "$WORK/rproxy.err" \
+    && pass "a pow target with no X-PoW gets 401 and X-PoW-Challenge" \
+    || fail "a pow target with no X-PoW gets 401 and X-PoW-Challenge: '$challenge'"
+counter=0
+while [ "$(pow_hash "$nonce:$counter")" != "00" ]; do
+    counter=$((counter + 1))
+done
+got="$(fetch -H "X-PoW: $nonce:$counter" "$BASE/data/1.html")"
+[ "$got" = "200 A" ] && pass "a correct X-PoW gets 200" \
+    || fail "a correct X-PoW gets 200: got '$got' for $nonce:$counter"
+wrong=0
+while [ "$(pow_hash "$nonce:$wrong")" = "00" ]; do
+    wrong=$((wrong + 1))
+done
+got="$(fetch -H "X-PoW: $nonce:$wrong" "$BASE/data/1.html" | cut -d' ' -f1)"
+[ "$got" = "401" ] && pass "a wrong X-PoW gets 401 again" \
+    || fail "a wrong X-PoW gets 401 again: got '$got'"
+got="$(fetch "$BASE/index.html")"
+[ "$got" = "200 A" ] && pass "a target outside --pow-prefix needs no X-PoW" \
+    || fail "a target outside --pow-prefix needs no X-PoW: got '$got'"
+
+# Web Bot Auth and 402 (SPEC 11 v2, row "Deal"). tests/data holds a TEST
+# key pair: its only use is this file. The signature covers @authority
+# and the signature-agent member agent1 (RFC 9421 section 2.5).
+KEYID=C40IKiW5iEzzt2B5DdKbd4pP26xcG8mbp_gDsQ93cnQ
+AGENT='"https://crawler.example/.well-known/http-message-signatures-directory"'
+GPTBOT='Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.1; +https://openai.com/gptbot)'
+created=$(date +%s)
+params="(\"@authority\" \"signature-agent\";key=\"agent1\");created=$created;expires=$((created + 60));keyid=\"$KEYID\";alg=\"ed25519\";tag=\"web-bot-auth\""
+printf '"@authority": localhost:%s\n"signature-agent";key="agent1": %s\n"@signature-params": %s' \
+    "$PROXY_PORT" "$AGENT" "$params" > "$WORK/base.txt"
+signature="$(openssl pkeyutl -sign -rawin -inkey tests/data/bot_test_key.pem \
+    -in "$WORK/base.txt" | base64 -w0)"
+broken="$(printf '%s' "$signature" | tr 'A-Za-z' 'B-ZAb-za')"
+signed_fetch() {
+    fetch -A "$GPTBOT" -H "Signature-Agent: agent1=$AGENT" \
+        -H "Signature-Input: sig1=$params" -H "Signature: sig1=:$1:" "$2"
+}
+start_proxy --origin "$HOST:$ORIGIN_A" --pay-prefix /data/ \
+    --bot-key tests/data/bot_test_keys.txt
+curl -sk --max-time 5 -D "$WORK/hpay" -o /dev/null -A "$GPTBOT" \
+    "$BASE/data/1.html"
+head -n1 "$WORK/hpay" | grep -q '^HTTP/1.1 402 ' \
+    && grep -qi $'^crawler-price: USD 0.01\r$' "$WORK/hpay" \
+    && grep -q '^127\.0\.0\.1 [^ ]* pay - - 402 ' "$WORK/rproxy.err" \
+    && pass "a crawler User-Agent on a pay target gets 402 and crawler-price" \
+    || fail "a crawler User-Agent on a pay target gets 402 and crawler-price"
+got="$(fetch -A "$GPTBOT" "$BASE/index.html" | cut -d' ' -f1)"
+[ "$got" = "403" ] && pass "a crawler User-Agent outside --pay-prefix is denied" \
+    || fail "a crawler User-Agent outside --pay-prefix is denied: got '$got'"
+got="$(signed_fetch "$signature" "$BASE/data/1.html")"
+[ "$got" = "200 A" ] && pass "a signed crawler passes on a pay target" \
+    || fail "a signed crawler passes on a pay target: got '$got'"
+got="$(signed_fetch "$signature" "$BASE/index.html")"
+[ "$got" = "200 A" ] && pass "a signed crawler is not denied" \
+    || fail "a signed crawler is not denied: got '$got'"
+got="$(signed_fetch "$broken" "$BASE/data/1.html" | cut -d' ' -f1)"
+[ "$got" = "402" ] && pass "a broken signature is not verified" \
+    || fail "a broken signature is not verified: got '$got'"
+printf 'not-a-key-line\n' > "$WORK/bad_keys.txt"
+"$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
+    --origin "$HOST:$ORIGIN_A" --bot-key "$WORK/bad_keys.txt" \
+    2> "$WORK/bad.err" &
+bad_pid=$!
+sleep 0.5
+if kill -0 "$bad_pid" 2>/dev/null; then
+    kill "$bad_pid"; wait "$bad_pid" 2>/dev/null
+    fail "a bad --bot-key file stops rproxy at the start"
+else
+    grep -q 'line 1' "$WORK/bad.err" \
+        && pass "a bad --bot-key file stops rproxy at the start" \
+        || fail "a bad --bot-key file stops rproxy at the start: no line number"
+fi
 
 # The real server as the Origin.
 ./server "$SERVER_PORT" www > /dev/null 2> "$WORK/server.err" &

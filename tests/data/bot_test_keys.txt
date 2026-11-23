@@ -1,0 +1,3 @@
+# A TEST KEY for tests/rproxy_func.sh: the public half of
+# tests/data/bot_test_key.pem. The keyid is its JWK thumbprint (RFC 7638).
+C40IKiW5iEzzt2B5DdKbd4pP26xcG8mbp_gDsQ93cnQ D+mBW3KMy54ixzz40V91orHThxDwmUrtQHeTZReUNq0=

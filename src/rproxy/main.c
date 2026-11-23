@@ -13,8 +13,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <openssl/rand.h>
+
 #include "behavior.h"
 #include "block_table.h"
+#include "bot_auth.h"
 #include "cache.h"
 #include "cache_options.h"
 #include "client_hello.h"
@@ -25,6 +28,7 @@
 #include "ip_list.h"
 #include "ja4.h"
 #include "ja4_table.h"
+#include "pow.h"
 #include "rate_limit.h"
 #include "tls.h"
 #include "verdict.h"
@@ -48,10 +52,20 @@
 #define BEHAVIOR_TABLE_KEY_MAX 4096
 /* --block-key can occur this many times. */
 #define BLOCK_KEY_ARG_MAX 16
+/* --pow-prefix and --pay-prefix can each occur this many times. */
+#define PREFIX_ARG_MAX 8
+/* Anubis DefaultDifficulty is 4 leading zero hex digits: 16 bits. */
+#define DEFAULT_POW_BITS 16
+/* The HMAC key of the pow nonce. RFC 2104 section 3: a key as long as
+   the hash output (SHA-256: 32 bytes). */
+#define POW_SECRET_LEN 32
+/* The value of crawler-price in a 402: the example of Cloudflare pay per
+   crawl. rproxy takes no payment. */
+#define PAY_PRICE "USD 0.01"
 /* Room for the headers that rproxy adds to a request for an Origin. */
 #define FORWARD_EXTRA_MAX 512
 #define REPLY_TEXT_MAX 512
-#define RETRY_LINE_MAX 64
+#define HEADER_LINES_MAX 256
 #define STATUS_TEXT_MAX 8
 #define LOG_NUMBER_MAX 16
 #define STATUS_DIGITS 3
@@ -79,6 +93,14 @@ struct rproxy_config {
     /* Keys that are in the block table from the start, for block_time. */
     const char *block_keys[BLOCK_KEY_ARG_MAX];
     int block_key_count;
+    /* Targets that start with one of these need a Proof of work. */
+    const char *pow_prefixes[PREFIX_ARG_MAX];
+    int pow_prefix_count;
+    int pow_bits;
+    /* Targets that start with one of these make a crawler pay (402). */
+    const char *pay_prefixes[PREFIX_ARG_MAX];
+    int pay_prefix_count;
+    const char *bot_key_file; /* NULL when there is no Web Bot Auth */
     struct cache_options cache_options;
 };
 
@@ -93,6 +115,8 @@ struct rproxy {
     struct ja4_table *fingerprints; /* NULL without --ja4-list */
     struct block_table *blocks;
     struct behavior *counters;
+    struct bot_key_set *keys; /* NULL without --bot-key */
+    unsigned char pow_secret[POW_SECRET_LEN];
 };
 
 struct pool {
@@ -137,11 +161,13 @@ static bool real_parse(const char *text, double min, double *number);
 static bool rate_key_parse(const char *text, enum rate_key *rate_key);
 static bool origin_add(struct origin_list *list, const char *text);
 static bool block_key_add(struct rproxy_config *config, const char *key);
+static bool prefix_add(const char **prefixes, int *count, const char *prefix);
 static bool rproxy_start(struct rproxy *rproxy);
 static bool defenses_start(struct rproxy *rproxy);
 static char *file_read_text(const char *path);
 static bool block_list_load(struct rproxy *rproxy);
 static bool ja4_table_load(struct rproxy *rproxy);
+static bool bot_keys_load(struct rproxy *rproxy);
 static void rproxy_stop(struct rproxy *rproxy);
 static void signals_install(void);
 static void stop_signal_handle(int signal_number);
@@ -170,12 +196,32 @@ static bool buffer_reserve(struct request_buffer *buffer, size_t capacity);
 static bool buffer_read_some(struct tls_session *session,
                              struct request_buffer *buffer);
 static void reply_send_status(struct tls_session *session, int status,
-                              int retry_after, struct exchange *exchange);
+                              const char *header_lines,
+                              struct exchange *exchange);
 static const char *status_get_reason(int status);
 static struct verdict request_decide(struct rproxy *rproxy,
                                      const struct request *request,
                                      struct exchange *exchange);
+static bool target_has_prefix(const char *target, const char *const *prefixes,
+                              int count);
+static bool request_has_pow(const struct rproxy *rproxy,
+                            const struct request *request,
+                            const struct exchange *exchange);
+static bool request_is_signed(const struct rproxy *rproxy,
+                              const struct request *request);
+static const char *request_find_header(const void *context, const char *name);
 static double clock_get_seconds(void);
+static double wall_clock_get_seconds(void);
+/* The pow nonce and the signature times are wall clock times, so that
+   they mean the same thing to the client. */
+static double wall_clock_get_seconds(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+
+    return (double)now.tv_sec + (double)now.tv_nsec / NANOSECONDS_PER_SECOND;
+}
+
 static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
                           const struct request *request,
                           const struct verdict *verdict,
@@ -195,6 +241,8 @@ static bool reply_is_not_modified(const struct request *request,
                                   const char *reply, size_t reply_len);
 static bool not_modified_send(struct tls_session *session, const char *reply,
                               size_t reply_len, struct exchange *exchange);
+static void challenge_send(struct rproxy *rproxy, struct tls_session *session,
+                           struct exchange *exchange);
 static void client_block(struct rproxy *rproxy,
                          const struct exchange *exchange);
 static void tarpit_hold(int seconds);
@@ -214,7 +262,9 @@ int main(int argc, char **argv)
                 "[--cache-admit all|size|second] [--cache-object-max BYTES] "
                 "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
                 "[--cache-lock global|striped] [--block-list FILE] "
-                "[--ja4-list FILE] [--block-time S] [--block-key KEY ...]\n");
+                "[--ja4-list FILE] [--block-time S] [--block-key KEY ...] "
+                "[--pow-prefix PATH ...] [--pow-bits N] "
+                "[--pay-prefix PATH ...] [--bot-key FILE]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -239,7 +289,8 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
                    .workers = DEFAULT_WORKERS,
                    .burst = DEFAULT_BURST,
                    .tarpit = DEFAULT_TARPIT,
-                   .block_time = DEFAULT_BLOCK_TIME},
+                   .block_time = DEFAULT_BLOCK_TIME,
+                   .pow_bits = DEFAULT_POW_BITS},
     };
     cache_options_init(&rproxy->config.cache_options);
     atomic_init(&rproxy->list.next, 0);
@@ -303,6 +354,21 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     }
     if (strcmp(name, "--block-key") == 0) {
         return block_key_add(config, value);
+    }
+    if (strcmp(name, "--pow-prefix") == 0) {
+        return prefix_add(config->pow_prefixes, &config->pow_prefix_count,
+                          value);
+    }
+    if (strcmp(name, "--pow-bits") == 0) {
+        return number_parse(value, 0, POW_BITS_MAX, &config->pow_bits);
+    }
+    if (strcmp(name, "--pay-prefix") == 0) {
+        return prefix_add(config->pay_prefixes, &config->pay_prefix_count,
+                          value);
+    }
+    if (strcmp(name, "--bot-key") == 0) {
+        config->bot_key_file = value;
+        return true;
     }
     return cache_options_parse(&config->cache_options, name, value);
 }
@@ -369,6 +435,17 @@ static bool block_key_add(struct rproxy_config *config, const char *key)
     return true;
 }
 
+/* A prefix is a path that starts with "/". */
+static bool prefix_add(const char **prefixes, int *count, const char *prefix)
+{
+    if (*count == PREFIX_ARG_MAX || prefix[0] != '/') {
+        return false;
+    }
+    prefixes[(*count)++] = prefix;
+
+    return true;
+}
+
 /* Loads the certificate, the block list, and the JA4 table, and makes the
    block table, the rate limit table, and the cache. */
 static bool rproxy_start(struct rproxy *rproxy)
@@ -405,11 +482,18 @@ static bool rproxy_start(struct rproxy *rproxy)
 }
 
 /* The files and the block table of the connection Verdict, and the
-   behavior counters of the request Verdict. */
+   behavior counters, the Web Bot Auth keys, and the pow secret of the
+   request Verdict. A new secret at each start: a restart makes the old
+   challenges invalid. */
 static bool defenses_start(struct rproxy *rproxy)
 {
     const struct rproxy_config *config = &rproxy->config;
-    if (!block_list_load(rproxy) || !ja4_table_load(rproxy)) {
+    if (!block_list_load(rproxy) || !ja4_table_load(rproxy) ||
+        !bot_keys_load(rproxy)) {
+        return false;
+    }
+    if (RAND_bytes(rproxy->pow_secret, POW_SECRET_LEN) != 1) {
+        fprintf(stderr, "rproxy: RAND_bytes failed\n");
         return false;
     }
     rproxy->blocks = block_table_create(BLOCK_TABLE_KEY_MAX);
@@ -507,6 +591,29 @@ static bool ja4_table_load(struct rproxy *rproxy)
     return bad_line == 0;
 }
 
+static bool bot_keys_load(struct rproxy *rproxy)
+{
+    const char *path = rproxy->config.bot_key_file;
+    if (path == NULL) {
+        return true;
+    }
+    char *text = file_read_text(path);
+    rproxy->keys = malloc(sizeof(*rproxy->keys));
+    if (text == NULL || rproxy->keys == NULL) {
+        fprintf(stderr, "rproxy: cannot read %s\n", path);
+        free(text);
+        return false;
+    }
+    size_t bad_line = bot_auth_parse_keys(text, rproxy->keys);
+    free(text);
+    if (bad_line != 0) {
+        fprintf(stderr, "rproxy: %s line %zu: bad \"KEYID BASE64\" line\n",
+                path, bad_line);
+    }
+
+    return bad_line == 0;
+}
+
 static void rproxy_stop(struct rproxy *rproxy)
 {
     if (rproxy->cache != NULL) {
@@ -518,6 +625,7 @@ static void rproxy_stop(struct rproxy *rproxy)
     }
     block_table_destroy(rproxy->blocks);
     behavior_destroy(rproxy->counters);
+    free(rproxy->keys);
     free(rproxy->fingerprints);
     free(rproxy->block_list);
     tls_context_destroy(rproxy->context);
@@ -816,7 +924,7 @@ static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
         behavior_add_reply(rproxy->counters, exchange->client_ip,
                            exchange->status, clock_get_seconds());
     } else if (status != CONN_CLOSED) {
-        reply_send_status(session, status, 0, exchange);
+        reply_send_status(session, status, NULL, exchange);
         exchange->needs_drain = true;
     }
     free(buffer.data);
@@ -870,23 +978,21 @@ static bool buffer_read_some(struct tls_session *session,
     return count > 0;
 }
 
-/* A short text reply of rproxy itself. retry_after > 0 adds Retry-After. */
+/* A short text reply of rproxy itself. header_lines is NULL, or more
+   header lines, each with its CRLF. */
 static void reply_send_status(struct tls_session *session, int status,
-                              int retry_after, struct exchange *exchange)
+                              const char *header_lines,
+                              struct exchange *exchange)
 {
-    char retry_line[RETRY_LINE_MAX] = "";
     char body[REPLY_TEXT_MAX];
     char text[REPLY_TEXT_MAX * 2];
-    if (retry_after > 0) {
-        snprintf(retry_line, sizeof(retry_line), "Retry-After: %d\r\n",
-                 retry_after);
-    }
     const char *reason = status_get_reason(status);
     int body_len = snprintf(body, sizeof(body), "%d %s\n", status, reason);
     int len = snprintf(text, sizeof(text),
                        "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\n"
                        "Content-Length: %d\r\n%sConnection: close\r\n\r\n%s",
-                       status, reason, body_len, retry_line, body);
+                       status, reason, body_len,
+                       header_lines != NULL ? header_lines : "", body);
     tls_session_send(session, text, (size_t)len);
     exchange->status = status;
     exchange->reply_bytes = (size_t)len;
@@ -897,6 +1003,10 @@ static const char *status_get_reason(int status)
     switch (status) {
     case 400:
         return "Bad Request";
+    case 401:
+        return "Unauthorized";
+    case 402:
+        return "Payment Required";
     case 403:
         return "Forbidden";
     case 405:
@@ -923,7 +1033,8 @@ static const char *status_get_reason(int status)
 }
 
 /* The behavior counters count each request of a client IP, this one
-   too, before the Verdict. exchange keeps them for the log. */
+   too, before the Verdict. exchange keeps them for the log. The pow and
+   the signature are checked only when a flag turns them on. */
 static struct verdict request_decide(struct rproxy *rproxy,
                                      const struct request *request,
                                      struct exchange *exchange)
@@ -942,8 +1053,62 @@ static struct verdict request_decide(struct rproxy *rproxy,
         behavior_add_request(rproxy->counters, exchange->client_ip,
                              request->target, now, &exchange->behavior);
     signals.behavior = exchange->behavior;
+    const struct rproxy_config *config = &rproxy->config;
+    signals.is_pow_target = target_has_prefix(
+        request->target, config->pow_prefixes, config->pow_prefix_count);
+    signals.pow_ok =
+        signals.is_pow_target && request_has_pow(rproxy, request, exchange);
+    signals.is_pay_target = target_has_prefix(
+        request->target, config->pay_prefixes, config->pay_prefix_count);
+    signals.bot_verified = request_is_signed(rproxy, request);
 
     return verdict_decide(&signals);
+}
+
+/* A plain prefix of the target, as an nginx "location /data/" prefix. */
+static bool target_has_prefix(const char *target, const char *const *prefixes,
+                              int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (strncmp(target, prefixes[i], strlen(prefixes[i])) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool request_has_pow(const struct rproxy *rproxy,
+                            const struct request *request,
+                            const struct exchange *exchange)
+{
+    return pow_is_solved(http_find_header(request, "X-PoW"),
+                         exchange->client_ip, wall_clock_get_seconds(),
+                         rproxy->pow_secret, POW_SECRET_LEN,
+                         rproxy->config.pow_bits);
+}
+
+/* The signature covers @authority, so a request with no Host cannot
+   be verified. */
+static bool request_is_signed(const struct rproxy *rproxy,
+                              const struct request *request)
+{
+    if (rproxy->keys == NULL || request->host == NULL) {
+        return false;
+    }
+    struct bot_auth_message message = {.method = request->method,
+                                       .authority = request->host,
+                                       .target = request->target,
+                                       .find_header = request_find_header,
+                                       .context = request};
+
+    return bot_auth_decide(&message, rproxy->keys, wall_clock_get_seconds(),
+                           NULL) == BOT_AUTH_VERIFIED;
+}
+
+static const char *request_find_header(const void *context, const char *name)
+{
+    return http_find_header(context, name);
 }
 
 static double clock_get_seconds(void)
@@ -969,20 +1134,28 @@ static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
         break;
     case VERDICT_DENY:
         exchange->verdict_name = "deny";
-        reply_send_status(session, 403, 0, exchange);
+        reply_send_status(session, 403, NULL, exchange);
         break;
-    case VERDICT_SLOW:
+    case VERDICT_SLOW: {
+        char retry_line[HEADER_LINES_MAX];
+        snprintf(retry_line, sizeof(retry_line), "Retry-After: %d\r\n",
+                 verdict->retry_after);
         exchange->verdict_name = "slow";
-        reply_send_status(session, 429, verdict->retry_after, exchange);
+        reply_send_status(session, 429, retry_line, exchange);
         break;
+    }
     case VERDICT_TARPIT:
         exchange->verdict_name = "tarpit";
         tarpit_hold(rproxy->config.tarpit);
         break;
-    case VERDICT_CHALLENGE: /* step 10 wires the reply */
-    case VERDICT_PAY:       /* step 11 wires the reply */
-        exchange->verdict_name = "deny";
-        reply_send_status(session, 403, 0, exchange);
+    case VERDICT_CHALLENGE:
+        exchange->verdict_name = "challenge";
+        challenge_send(rproxy, session, exchange);
+        break;
+    case VERDICT_PAY:
+        exchange->verdict_name = "pay";
+        reply_send_status(session, 402, "crawler-price: " PAY_PRICE "\r\n",
+                          exchange);
         break;
     }
 }
@@ -1006,7 +1179,7 @@ static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
         int status =
             origin_fetch(rproxy, request, exchange, &reply, &reply_len);
         if (status != 0) {
-            reply_send_status(session, status, 0, exchange);
+            reply_send_status(session, status, NULL, exchange);
             return;
         }
         if (has_key) {
@@ -1131,6 +1304,24 @@ static bool not_modified_send(struct tls_session *session, const char *reply,
     exchange->reply_bytes = is_hit ? (size_t)len : reply_len;
 
     return true;
+}
+
+/* A 401 with the challenge for the client IP in the current window. RFC
+   9110 section 15.5.2: a 401 has WWW-Authenticate. The scheme follows
+   PrivateToken of RFC 9577: the challenge is an auth-param. */
+static void challenge_send(struct rproxy *rproxy, struct tls_session *session,
+                           struct exchange *exchange)
+{
+    char challenge[POW_CHALLENGE_MAX + 1];
+    char lines[HEADER_LINES_MAX];
+    pow_format_challenge(exchange->client_ip, wall_clock_get_seconds(),
+                         rproxy->pow_secret, POW_SECRET_LEN,
+                         rproxy->config.pow_bits, challenge);
+    snprintf(lines, sizeof(lines),
+             "X-PoW-Challenge: %s\r\n"
+             "WWW-Authenticate: PoW challenge=\"%s\"\r\n",
+             challenge, challenge);
+    reply_send_status(session, 401, lines, exchange);
 }
 
 /* The next connection of the client IP drops at the connection Verdict,
