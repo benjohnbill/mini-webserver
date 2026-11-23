@@ -15,7 +15,8 @@ HEADERS = $(wildcard src/*.h src/core/*.h src/rproxy/*.h)
 TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache \
 	build/test_client_hello build/test_forward build/test_ja4 \
-	build/test_rate_limit build/test_verdict
+	build/test_rate_limit build/test_verdict build/test_ip_list \
+	build/test_ja4_table build/test_block_table build/test_connection_verdict
 FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
 	src/rproxy/*.c src/rproxy/*.h tests/*.c tests/*.h)
 
@@ -27,8 +28,11 @@ LARGE_BIN_SIZE = 10485760
 # The decision modules of the Reverse Proxy use no sockets and no OpenSSL I/O
 # (docs/adr/reverse-proxy-is-a-separate-process.md).
 DECISION_FILES = $(wildcard $(addprefix src/rproxy/,client_hello.* ja4.* \
-	rate_limit.* verdict.*))
-DECISION_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|poll|netinet/[a-z_]+|arpa/inet|openssl/ssl|unistd)\.h[>"]'
+	rate_limit.* verdict.* ip_list.* ja4_table.* block_table.* \
+	connection_verdict.*))
+# arpa/inet.h is allowed: ip_list uses inet_pton, which turns text into
+# address bytes and does no I/O.
+DECISION_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|poll|netinet/[a-z_]+|openssl/ssl|unistd)\.h[>"]'
 CORE_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|sys/select|poll|netinet/[a-z_]+|arpa/inet|conn|send_plan|model)\.h[>"]'
 
 .PHONY: all test asan www cert format lint clean
@@ -77,6 +81,26 @@ build/test_verdict: tests/test_verdict.c tests/check.h src/rproxy/verdict.c \
 		$(HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/verdict.c
+
+build/test_ip_list: tests/test_ip_list.c tests/check.h src/rproxy/ip_list.c \
+		$(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/ip_list.c
+
+build/test_ja4_table: tests/test_ja4_table.c tests/check.h \
+		src/rproxy/ja4_table.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/ja4_table.c
+
+build/test_block_table: tests/test_block_table.c tests/check.h \
+		src/rproxy/block_table.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/block_table.c
+
+build/test_connection_verdict: tests/test_connection_verdict.c tests/check.h \
+		src/rproxy/connection_verdict.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/connection_verdict.c
 
 # forward is I/O, but its tests call only the functions with no socket.
 build/test_forward: tests/test_forward.c tests/check.h src/rproxy/forward.c \
