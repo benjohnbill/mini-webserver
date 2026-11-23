@@ -8,6 +8,8 @@ CORE_SRCS = src/core/http_parse.c src/core/router.c src/core/mime.c \
 	src/core/response.c src/core/serve.c src/core/handlers.c
 SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/proxy.c src/cache.c src/main.c \
 	src/model_iter.c src/model_fork.c src/model_pool.c src/model_epoll.c
+RPROXY_SRCS = $(CORE_SRCS) $(wildcard src/rproxy/*.c)
+RPROXY_LIBS = -lssl -lcrypto -lm
 HEADERS = $(wildcard src/*.h src/core/*.h src/rproxy/*.h)
 TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache \
@@ -28,9 +30,9 @@ DECISION_FILES = $(wildcard $(addprefix src/rproxy/,client_hello.* ja4.* \
 DECISION_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|poll|netinet/[a-z_]+|arpa/inet|openssl/ssl|unistd)\.h[>"]'
 CORE_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|sys/select|poll|netinet/[a-z_]+|arpa/inet|conn|send_plan|model)\.h[>"]'
 
-.PHONY: all test asan www format lint clean
+.PHONY: all test asan www cert format lint clean
 
-all: server
+all: server rproxy
 
 server: $(SERVER_SRCS) $(HEADERS)
 	$(CC) $(CFLAGS) -o $@ $(SERVER_SRCS)
@@ -39,6 +41,21 @@ asan: server-asan
 
 server-asan: $(SERVER_SRCS) $(HEADERS)
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $(SERVER_SRCS)
+
+rproxy: $(RPROXY_SRCS) $(HEADERS)
+	$(CC) $(CFLAGS) -o $@ $(RPROXY_SRCS) $(RPROXY_LIBS)
+
+rproxy-asan: $(RPROXY_SRCS) $(HEADERS)
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $(RPROXY_SRCS) $(RPROXY_LIBS)
+
+# A self-signed certificate for localhost, for rproxy and its tests.
+cert: build/cert.pem
+
+build/cert.pem:
+	@mkdir -p build
+	openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+		-keyout build/key.pem -out build/cert.pem
 
 build/test_%: tests/test_%.c tests/check.h $(CORE_SRCS) $(HEADERS)
 	@mkdir -p build
@@ -108,4 +125,4 @@ lint:
 	clang-format --dry-run -Werror $(FORMAT_FILES)
 
 clean:
-	rm -rf server server-asan build
+	rm -rf server server-asan rproxy rproxy-asan build
