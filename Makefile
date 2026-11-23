@@ -11,7 +11,7 @@ SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/proxy.c src/cache.c sr
 HEADERS = $(wildcard src/*.h src/core/*.h src/rproxy/*.h)
 TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache \
-	build/test_client_hello
+	build/test_client_hello build/test_ja4
 FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
 	src/rproxy/*.c src/rproxy/*.h tests/*.c tests/*.h)
 
@@ -48,6 +48,13 @@ build/test_client_hello: tests/test_client_hello.c tests/check.h \
 		src/rproxy/client_hello.c $(HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/client_hello.c
+
+# ja4 uses SHA256() of OpenSSL (docs/adr/openssl-for-the-reverse-proxy.md).
+build/test_ja4: tests/test_ja4.c tests/check.h src/rproxy/ja4.c \
+		src/rproxy/client_hello.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/ja4.c \
+		src/rproxy/client_hello.c -lcrypto
 
 # The cache is in the I/O layer, so its test links src/cache.c, not the
 # Shared core.
