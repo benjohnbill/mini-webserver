@@ -87,7 +87,7 @@ The file that `--ja4-list` names: a JA4 and a label on each line, for example `c
 _Avoid_: fingerprint database, JA4 list (the flag name only)
 
 **Behavior counter**:
-A count for each key of the Reverse Proxy: requests, distinct targets, 404 replies, `robots.txt` reads, and honeypot hits.
+A count for each key of the Reverse Proxy: requests, distinct targets, 404 replies, `robots.txt` reads, and honeypot hits. The key is the client IP. The counts start again at zero when the window of the key ends.
 _Avoid_: stats, metrics, score
 
 **Honeypot**:

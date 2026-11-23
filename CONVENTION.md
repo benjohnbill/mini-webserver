@@ -63,6 +63,7 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | The block list (CIDR ranges) | `struct ip_list *block_list` | `list`, `ranges`, `blocklist` |
    | The JA4 table | `struct ja4_table *fingerprints` | `table`, `ja4s` |
    | The block table | `struct block_table *blocks` | `table`, `bans`, `jail` |
+   | The Behavior counter table | `struct behavior *counters` | `table`, `stats`, `tracker` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

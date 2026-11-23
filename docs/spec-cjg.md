@@ -334,6 +334,8 @@ src/rproxy/
   ja4.c/h           struct client_hello -> JA4 string             test
   rate_limit.c/h    token bucket for each key, time is an argument test
   verdict.c/h       signals -> Verdict                            test
+  behavior.c/h      Behavior counters for each key, time is an argument
+                                                                  test
 tests/
   test_client_hello.c  test_ja4.c  test_rate_limit.c  test_verdict.c
   rproxy_func.sh    curl -k through rproxy to a running server
@@ -470,7 +472,21 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 | Rate limit table full | It forgets the key used longest ago | nginx `limit_req_zone` |
 | `verdict_decide` (row 3) | An ordered rule table. The first rule that matches decides. The default is pass | Cloudflare custom rules |
 | Crawler User-Agents | GPTBot, CCBot, ClaudeBot, Bytespider, PerplexityBot, AhrefsBot get deny (403). Deny comes before slow | Cloudflare "AI Scrapers and Crawlers"; ai.robots.txt |
-| A false browser | A `Chrome/` User-Agent with a JA4 that is not a browser JA4 gets tarpit. An empty JA4 passes | JA4 against the User-Agent, as bot management products check it |
+| A false browser | Step 9: a `Chrome/` User-Agent whose JA4 label (the JA4 table) is known and is not `browser` gets tarpit. A JA4 that is not in the table passes, so a real browser that the table does not know is not punished. It replaces the rule of step 8, which compared the cipher hash with the hash of Chromium | JA4 against the User-Agent, as bot management products check it. FoxIO: a JA4 database maps a JA4 to an application |
+| `robots.txt` | `User-agent: *` and `Disallow: /trap/` | RFC 9309 sections 2.1 and 2.2 |
+| Honeypot link | `<a href="/trap/" rel="nofollow" hidden aria-hidden="true" tabindex="-1">` before the script of `www/index.html`. `hidden` takes it out of the page and of the reading order. `tabindex="-1"` keeps it out of the tab order | The common honeypot link: a person cannot see it, a crawler that parses links finds it. `rel="nofollow"`: HTML link types |
+| Trap page | `www/trap/index.html`, a short page with `<meta name="robots" content="noindex, nofollow">`. The Origin answers 200 | Our choice. A 200 shows the crawler nothing unusual |
+| Honeypot hit | A target whose path starts with `/trap/`: tarpit, and the client IP goes in the block table for `--block-time`. The JA4 does not go in, because all curl clients share one JA4 | SPEC v2 "The layers", row "Trap". fail2ban: one ban for each IP |
+| Rule order in `verdict_decide` | Honeypot, scanner, crawler names, false browser, rate limit. The two rules that block come first, so a named crawler that ignores `robots.txt` is caught too | Our choice |
+| Behavior counter key | The client IP | fail2ban counts failures for each IP. The block table blocks the client IP |
+| Behavior counter window | A fixed window for each key: 600 s from its first request. Then all counts start at zero | fail2ban `findtime` default (10 minutes). A fixed window is the simplest window |
+| Behavior counter bound | 4096 keys. When the table is full, the key used longest ago leaves. One mutex, a linear search | The same shape as the rate limit table (nginx `limit_req_zone`) |
+| Distinct targets | A set of 256 bits for each key. A target sets the bit of the FNV-1a hash of the whole target, query too. A new bit counts one. So the count can be low, never high, and it stops at 256 | Linear counting (Whang, Vander-Zanden, Taylor 1990): a Bloom filter with one hash function |
+| `robots.txt` read and trap hit | The path before `?`. A read is the path `/robots.txt` exactly. A hit is a path that starts with `/trap/` | RFC 9309 section 2.3 (the file is at `/robots.txt`), section 2.2.2 (a rule matches a path prefix) |
+| 404 replies | `rproxy` counts the status of its reply to the client after the request Verdict, from the Origin or from the cache | fail2ban `nginx-botsearch`: 404 replies of a client are its failures |
+| Scanner rule | 5 replies of 404 in the window: the next request gets deny (403), and the client IP goes in the block table for `--block-time` | fail2ban `jail.conf` defaults: `maxretry = 5`, `findtime = 10m`, `bantime = 10m` |
+| Counters with no rule | Requests, distinct targets, and `robots.txt` reads go to the log only. The trap hits count too, but the rule reads the target | No common threshold exists. The rate limit covers the volume of requests |
+| Behavior log line | After the 7-field line of a request: `behavior IP requests=N targets=N not_found=N robots=N trap=N`, the counts with this request and before its reply. `scene.sh` skips the lines that start with `behavior` | Our choice. The 7 fields stay for `scene.sh` |
 | Over the rate limit | Slow (429 with Retry-After) | RFC 6585 §4; nginx `limit_req` |
 | Host check | An HTTP/1.1 request with no Host gets 400. HTTP/1.0 with no Host passes | RFC 9112 §3.2 |
 
@@ -484,7 +500,7 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 6. Crawler scripts and the Scenes of the arena (section "Arena").
 7. Shared core: `http_find_header`, and `ETag` with 304 for static files. Tests first.
 8. Two Verdict stages: `connection_decide` (slot, row 4) with its tests, `ip_list`, `block_table`, and the JA4 table. Done (2026-11-24). The owner chose that the generator writes row 4 by practice. The files: `ip_list`, `ja4_table`, `block_table`, and `connection_verdict` (it holds `connection_decide`). The flags: `--block-list FILE`, `--ja4-list FILE`, `--block-time S`, `--block-key KEY`. A dropped connection logs the Verdict `drop`.
-9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters.
+9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters. Done (2026-11-24). The generator chose the rules by practice ("Defaults taken from practice"). `struct verdict_signals` now has the JA4 label and the Behavior counters, and `struct verdict` has `blocks_client`.
 10. Proof of work.
 11. Web Bot Auth and 402.
 12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes.
