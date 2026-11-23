@@ -17,7 +17,7 @@ TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache \
 	build/test_client_hello build/test_forward build/test_ja4 \
 	build/test_rate_limit build/test_verdict build/test_ip_list \
 	build/test_ja4_table build/test_block_table build/test_connection_verdict \
-	build/test_behavior build/test_pow
+	build/test_behavior build/test_pow build/test_bot_auth
 FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
 	src/rproxy/*.c src/rproxy/*.h tests/*.c tests/*.h)
 
@@ -30,7 +30,7 @@ LARGE_BIN_SIZE = 10485760
 # (docs/adr/reverse-proxy-is-a-separate-process.md).
 DECISION_FILES = $(wildcard $(addprefix src/rproxy/,client_hello.* ja4.* \
 	rate_limit.* verdict.* ip_list.* ja4_table.* block_table.* \
-	connection_verdict.* behavior.* pow.*))
+	connection_verdict.* behavior.* pow.* bot_auth.*))
 # arpa/inet.h is allowed: ip_list uses inet_pton, which turns text into
 # address bytes and does no I/O.
 DECISION_BANNED_INCLUDE = '\#include [<"](sys/socket|sys/epoll|poll|netinet/[a-z_]+|openssl/ssl|unistd)\.h[>"]'
@@ -121,10 +121,15 @@ build/test_ja4: tests/test_ja4.c tests/check.h src/rproxy/ja4.c \
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/ja4.c \
 		src/rproxy/client_hello.c -lcrypto
 
-# pow uses HMAC() and SHA256() of OpenSSL libcrypto.
+# pow and bot_auth use the hashes and signatures of OpenSSL libcrypto.
 build/test_pow: tests/test_pow.c tests/check.h src/rproxy/pow.c $(HEADERS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/pow.c -lcrypto
+
+build/test_bot_auth: tests/test_bot_auth.c tests/check.h \
+		src/rproxy/bot_auth.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/bot_auth.c -lcrypto
 
 # The cache is in the I/O layer, so its test links src/cache.c, not the
 # Shared core.
