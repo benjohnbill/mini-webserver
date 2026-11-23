@@ -39,6 +39,9 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | `send` | Write bytes to a socket |
    | `is_` and `has_` | Ask a question and return `bool` |
    | `format` | Write the text form of a struct into a buffer that the caller gives |
+   | `take` | Use up one unit of a limited supply. Return 0 if it was there |
+   | `decide` | Turn signals into one choice from an enum |
+   | `fetch` | Send a request and read the full reply |
 
 4. **One concept has one name in all files.** When you add a concept, add a row.
 
@@ -54,6 +57,8 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | The Reverse Proxy cache | `struct cache *cache` | `c`, `store` |
    | One stored reply in the cache | `struct cache_entry *entry` | `node`, `item` |
    | A parsed ClientHello | `struct client_hello *hello` | `ch`, `chello` |
+   | The rate limit table | `struct rate_limit *limit` | `rl`, `limiter` |
+   | The Origins of the Reverse Proxy | `struct origin_list *list` | `backends`, `upstreams` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

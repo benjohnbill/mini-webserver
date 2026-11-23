@@ -200,6 +200,24 @@ static void the_frame_check_does_not_change_the_buffer(void)
     CHECK(memcmp(before, buffer, sizeof(buffer)) == 0);
 }
 
+static void the_user_agent_header_is_kept(void)
+{
+    char buffer[] =
+        "GET / HTTP/1.1\r\nHost: a\r\nuser-agent: curl/8.18.0\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    CHECK(request.user_agent != NULL);
+    CHECK(strcmp(request.user_agent, "curl/8.18.0") == 0);
+}
+
+static void no_user_agent_header_gives_null(void)
+{
+    char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    CHECK(request.user_agent == NULL);
+}
+
 static void connection_close_sets_wants_close(void)
 {
     char buffer[] = "GET / HTTP/1.1\r\nHost: a\r\nconnection: Close\r\n\r\n";
@@ -253,6 +271,8 @@ int main(void)
     a_post_with_its_full_body_is_complete();
     the_frame_check_does_not_change_the_buffer();
     connection_close_sets_wants_close();
+    the_user_agent_header_is_kept();
+    no_user_agent_header_gives_null();
     a_header_line_with_no_colon_gets_400();
     a_bad_header_line_gets_400_before_an_unknown_version();
     an_unknown_method_waits_for_the_header_end();

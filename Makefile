@@ -11,7 +11,8 @@ SERVER_SRCS = $(CORE_SRCS) src/send_plan.c src/conn.c src/proxy.c src/cache.c sr
 HEADERS = $(wildcard src/*.h src/core/*.h src/rproxy/*.h)
 TESTS = http_parse router mime response serve
 TEST_BINS = $(addprefix build/test_,$(TESTS)) build/test_cache \
-	build/test_client_hello build/test_ja4
+	build/test_client_hello build/test_forward build/test_ja4 \
+	build/test_rate_limit build/test_verdict
 FORMAT_FILES = $(wildcard src/*.c src/*.h src/core/*.c src/core/*.h \
 	src/rproxy/*.c src/rproxy/*.h tests/*.c tests/*.h)
 
@@ -49,6 +50,22 @@ build/test_client_hello: tests/test_client_hello.c tests/check.h \
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/client_hello.c
 
+build/test_rate_limit: tests/test_rate_limit.c tests/check.h \
+		src/rproxy/rate_limit.c $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/rate_limit.c -lm
+
+build/test_verdict: tests/test_verdict.c tests/check.h src/rproxy/verdict.c \
+		$(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/verdict.c
+
+# forward is I/O, but its tests call only the functions with no socket.
+build/test_forward: tests/test_forward.c tests/check.h src/rproxy/forward.c \
+		$(CORE_SRCS) $(HEADERS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/rproxy/forward.c $(CORE_SRCS)
+
 # ja4 uses SHA256() of OpenSSL (docs/adr/openssl-for-the-reverse-proxy.md).
 build/test_ja4: tests/test_ja4.c tests/check.h src/rproxy/ja4.c \
 		src/rproxy/client_hello.c $(HEADERS)
@@ -63,7 +80,10 @@ build/test_cache: tests/test_cache.c tests/check.h src/cache.c $(HEADERS)
 	$(CC) $(CFLAGS) $(SANITIZE) -o $@ $< src/cache.c
 
 test: $(TEST_BINS)
-	@for test_bin in $(TEST_BINS); do ./$$test_bin || exit 1; done
+	@failed=; for test_bin in $(TEST_BINS); do \
+		./$$test_bin || failed="$$failed $$test_bin"; done; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; \
+		echo '(owner slots fail until typed: SPEC 11)'; exit 1; fi
 
 www: www/image.png www/large.bin
 

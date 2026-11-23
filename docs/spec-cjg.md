@@ -339,6 +339,16 @@ bench/arena/        Crawler scripts
 
 `client_hello` keeps the values of the wire in their order, GREASE included. `ja4` removes GREASE, sorts, and hashes.
 
+### Origins and forwarding (user said 2026-11-24: "1~5번 전부 기본안으로 가자.")
+
+- `--origin HOST:PORT` can occur more than once (at most `ORIGIN_MAX`, 8). The Origins get the requests in turn (Round-Robin), as the default of nginx `upstream` and of Envoy.
+- If the connect to an Origin fails, `rproxy` tries the next Origin once. If that also fails, the client gets 502. An Origin that does not answer in `--origin-timeout` seconds gives 504. There is no active health check.
+- Order for one connection: ClientHello and JA4, TLS handshake, request, rate limit, Verdict, cache, Origin. The Verdict comes after the request, because the User-Agent and the target are in the request, and 403 and 429 are HTTP replies. A denied request and a cache hit do not reach an Origin.
+- `--rate R --burst B` turns on the rate limit for each client IP. `--rate 0` (the default) turns it off. `--tarpit S` sets how long a tarpit holds a connection (default 10 s). In `pool`, a tarpit holds a Worker.
+- `rproxy` builds the request to the Origin from the parsed fields: the request line, `Host`, `User-Agent`, `Content-Type`, `Content-Length`, the body, `X-Forwarded-For`, `X-JA4`, and `Connection: close`. It does not copy other headers, so no hop-by-hop header reaches the Origin. nginx copies all headers except the hop-by-hop headers. The list here is shorter, because the Shared core keeps only these fields.
+- Size limits are the limits of the Shared core (§6): 431, 413, and 414 come from `http_parse_request`.
+- One request for each client connection. `rproxy` closes after the reply.
+
 ### Code the owner types
 
 The owner types the decision code. The generator writes the byte parser and the I/O. Each owner file starts as a slot (§10): the tests exist first and fail.
