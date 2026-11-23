@@ -28,12 +28,6 @@
 #define CACHE_SEEN_SLOTS 4096
 #define CACHE_STRIPES 16
 #define CACHE_KEY_MAX (TARGET_MAX + 16)
-/* Shared mode: block size classes are powers of two, 64 B to 8 MiB. */
-#define CACHE_CLASS_MIN_SHIFT 6
-#define CACHE_CLASS_COUNT 18
-/* Shared mode: the arena is this many times --cache-bytes, because a block
-   is rounded up to its class and a free block stays in its class. */
-#define CACHE_ARENA_FACTOR 2
 #define CACHE_BYTES_MAX 1073741824
 #define CACHE_TTL_MAX 86400
 
@@ -47,14 +41,12 @@
 enum cache_admit { CACHE_ADMIT_ALL, CACHE_ADMIT_SIZE, CACHE_ADMIT_SECOND };
 enum cache_evict { CACHE_EVICT_FIFO, CACHE_EVICT_LRU };
 enum cache_lock { CACHE_LOCK_GLOBAL, CACHE_LOCK_STRIPED };
-enum cache_share { CACHE_SHARE_PRIVATE, CACHE_SHARE_SHARED };
 
 struct cache_options {
     bool is_on;
     enum cache_admit admit;
     enum cache_evict evict;
     enum cache_lock lock;
-    enum cache_share share;
     int bytes;      /* the budget for all entries */
     int object_max; /* admit size: the largest reply */
     int ttl;        /* seconds, 0: no expiry */

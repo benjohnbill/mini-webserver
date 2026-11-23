@@ -235,12 +235,6 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     if (strcmp(name, "--tarpit") == 0) {
         return number_parse(value, 0, TIMEOUT_MAX, &config->tarpit);
     }
-    /* Threads share the memory of the process, so the cache is always
-       private: rproxy has no fork. */
-    if (strcmp(name, "--cache-share") == 0) {
-        return false;
-    }
-
     return cache_options_parse(&config->cache_options, name, value);
 }
 

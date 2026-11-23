@@ -15,7 +15,6 @@ void cache_options_init(struct cache_options *options)
                                       .admit = CACHE_ADMIT_ALL,
                                       .evict = CACHE_EVICT_FIFO,
                                       .lock = CACHE_LOCK_GLOBAL,
-                                      .share = CACHE_SHARE_PRIVATE,
                                       .bytes = DEFAULT_CACHE_BYTES,
                                       .object_max = DEFAULT_CACHE_OBJECT_MAX,
                                       .ttl = 0};
@@ -29,7 +28,6 @@ bool cache_options_parse(struct cache_options *options, const char *name,
     static const char *const admit_names[] = {"all", "size", "second"};
     static const char *const evict_names[] = {"fifo", "lru"};
     static const char *const lock_names[] = {"global", "striped"};
-    static const char *const share_names[] = {"private", "shared"};
     int index = -1;
     if (strcmp(name, "--cache") == 0) {
         index = name_find(value, on_names, names_count(on_names));
@@ -43,9 +41,6 @@ bool cache_options_parse(struct cache_options *options, const char *name,
     } else if (strcmp(name, "--cache-lock") == 0) {
         index = name_find(value, lock_names, names_count(lock_names));
         options->lock = (enum cache_lock)index;
-    } else if (strcmp(name, "--cache-share") == 0) {
-        index = name_find(value, share_names, names_count(share_names));
-        options->share = (enum cache_share)index;
     } else if (strcmp(name, "--cache-bytes") == 0) {
         return number_parse(value, 1, CACHE_BYTES_MAX, &options->bytes);
     } else if (strcmp(name, "--cache-object-max") == 0) {

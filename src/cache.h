@@ -8,8 +8,7 @@
 #include "config.h"
 
 /* I/O layer. The Reverse Proxy cache: a key ("GET /path?query") maps to a
-   full Origin reply. Safe to call from many threads, and, with
-   CACHE_SHARE_SHARED, from many processes after fork. */
+   full Origin reply. Safe to call from many threads. */
 
 struct cache_stats {
     unsigned long hits;
@@ -21,8 +20,7 @@ struct cache_stats {
     size_t entries;
 };
 
-/* Returns NULL if memory or a lock cannot be set up. With
-   CACHE_SHARE_SHARED, call it before fork. */
+/* Returns NULL if memory or a lock cannot be set up. */
 struct cache *cache_create(const struct cache_options *options);
 void cache_destroy(struct cache *cache);
 

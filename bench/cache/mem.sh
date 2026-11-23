@@ -2,7 +2,7 @@
 # Usage: bench/cache/mem.sh PID...
 # Prints the total Pss in KiB of each PID and all of its descendants.
 # Pss, not RSS: after fork, a child shares the pages of its parent
-# (copy-on-write) and the pages of a MAP_SHARED cache. RSS counts a shared
+# (copy-on-write). RSS counts a shared
 # page once in each process, so a sum of RSS counts it many times. Pss
 # divides a shared page among the processes that map it, so the sum is the
 # real memory of the process tree.

@@ -16,7 +16,6 @@ static struct cache_options options_init(void)
                                   .admit = CACHE_ADMIT_ALL,
                                   .evict = CACHE_EVICT_FIFO,
                                   .lock = CACHE_LOCK_GLOBAL,
-                                  .share = CACHE_SHARE_PRIVATE,
                                   .bytes = DEFAULT_CACHE_BYTES,
                                   .object_max = DEFAULT_CACHE_OBJECT_MAX,
                                   .ttl = 0};
@@ -188,22 +187,6 @@ static void striped_lru_evicts_across_stripes(void)
     cache_destroy(cache);
 }
 
-static void shared_mode_reuses_an_evicted_block(void)
-{
-    struct cache_options options = options_init();
-    options.share = CACHE_SHARE_SHARED;
-    options.bytes = 4096;
-    struct cache *cache = cache_create(&options);
-    for (int i = 0; i < 100; i++) {
-        char key[16];
-        snprintf(key, sizeof(key), "GET /%d", i);
-        CHECK(cache_store(cache, key, ok_reply, sizeof(ok_reply), 0));
-    }
-    CHECK(key_is_found(cache, "GET /99", 0));
-    CHECK(!key_is_found(cache, "GET /0", 0));
-    cache_destroy(cache);
-}
-
 int main(void)
 {
     ok_reply_init();
@@ -219,7 +202,6 @@ int main(void)
     an_entry_expires_when_the_ttl_has_passed();
     an_entry_does_not_expire_with_ttl_zero();
     striped_lru_evicts_across_stripes();
-    shared_mode_reuses_an_evicted_block();
     printf("test_cache: ok\n");
 
     return 0;
