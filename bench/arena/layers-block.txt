@@ -1,0 +1,6 @@
+# rproxy --block-list file of the layers preset: one CIDR range on each line.
+# On localhost a range stands in for the range of a hosting network (an ASN).
+# 127.0.0.16 to 127.0.0.31: 16 of the 32 source addresses of spread.sh.
+# It does not hold 127.0.0.1 (all other Crawler scripts) or 127.0.0.200
+# (human.py).
+127.0.0.16/28

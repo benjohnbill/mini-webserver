@@ -1,0 +1,8 @@
+# rproxy --ja4-list file of the layers preset: "JA4 LABEL".
+# Captured 2026-11-24 from the rproxy log (field 2) at eb4fc59, OpenSSL 3.5.5.
+# The SNI letter is "i": the Arena connects to 127.0.0.1, an IP address.
+# curl -sk (curl and its OpenSSL):
+t13i3012h2_1d37bd780c83_8537cf56674e curl
+# Python 3.14 urllib with arena.tls_context() (human.py, solver.py,
+# signed.py). It is a stand-in for a browser: SPEC 11 "Arena, v2".
+t13i301100_1d37bd780c83_ecd0401ec68b browser
