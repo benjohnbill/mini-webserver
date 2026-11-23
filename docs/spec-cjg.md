@@ -366,7 +366,7 @@ The owner types the decision code. The generator writes the byte parser and the 
 
 ### Arena
 
-`bench/arena/scene.sh <crawler> [preset...]` runs one Crawler script and `human.sh` side by side against `rproxy`, for each preset, and writes `docs/measurements/<date>-arena-<crawler>.md`. The Origin is `./server --model pool --delay 10`. The Scene counts the rproxy log lines of each client kind: the Verdicts, the cache hits, the requests to the Origin, and the bytes from the Origin. It does not pass or fail.
+`bench/arena/scene.sh <crawler> [preset...]` runs one Crawler script and `human.py` side by side against `rproxy`, for each preset, and writes `docs/measurements/<date>-arena-<crawler>.md`. The Origin is `./server --model pool --delay 10`. The Scene counts the rproxy log lines of each client kind: the Verdicts, the cache hits, the requests to the Origin, and the bytes from the Origin. It does not pass or fail.
 
 | Crawler script | What it does |
 |---|---|
@@ -432,7 +432,7 @@ The generator writes `ip_list`, `block_table`, `behavior`, `pow`, `bot_auth`, th
 
 #### Arena, v2
 
-`human.sh` becomes a Python `urllib` client with a Chrome User-Agent. Its JA4 differs from curl: no ALPN (`00`), and other extensions (captured 2026-11-24 with lab probe 10). It is still OpenSSL, not the BoringSSL of a real Chrome, so it is a stand-in for a browser.
+`human.sh` becomes `human.py`, a Python `urllib` client with a Chrome User-Agent. Its JA4 differs from curl: no ALPN (`00`), and other extensions (captured 2026-11-24 with lab probe 10). It is still OpenSSL, not the BoringSSL of a real Chrome, so it is a stand-in for a browser.
 
 | New Crawler script | What it does | Layer it shows |
 |---|---|---|
@@ -443,6 +443,25 @@ The generator writes `ip_list`, `block_table`, `behavior`, `pow`, `bot_auth`, th
 | `signed` | Python. It signs each request with Ed25519 (Web Bot Auth) and names itself | a good bot passes |
 
 `named`, `disguised`, and `spread` stay. With the JA4 table, `disguised` (a Chrome User-Agent with the JA4 of curl) becomes visible. A new preset `layers` turns on every defense.
+
+The generator chose these parts of step 12 by common practice (2026-11-24). The owner can change each row.
+
+| Choice | Value | Source |
+|---|---|---|
+| Python scripts | `human.py`, `solver.py`, `signed.py`, with `bench/arena/arena.py` for the shared parts. `scene.sh` runs `<name>.sh` or `<name>.py`. The summary line is the line of `lib.sh`, with `pow_cpu_s` added | The extension says the language. Standard library only |
+| JA4 table of `layers` | `bench/arena/layers-ja4.txt`: the JA4 of curl is `curl`, the JA4 of Python `urllib` is `browser` (a stand-in). Captured from the rproxy log at `eb4fc59` | SPEC "Arena, v2" |
+| Block list of `layers` | `bench/arena/layers-block.txt`: `127.0.0.16/28`, 16 of the 32 addresses of `spread`. It does not hold 127.0.0.1 or 127.0.0.200 | A stand-in for the range of one hosting network |
+| Rate key of `layers` | The client IP, not the JA4: `human.py`, `solver.py`, and `signed.py` share one JA4 | Our choice |
+| Proof of work of `layers` | `--pow-prefix /api/ --pow-bits 16`. `human.py` loads `/api/time`, so it meets the challenge | 16 bits is difficulty 4 of Anubis, its default |
+| Pay of `layers` | `--pay-prefix /bench/`: the dataset, which `named`, `spread`, and `signed` walk | Pay for each crawl protects content |
+| A solution again | `human.py` and `solver.py` send a solution again until the next 401 (`POW_REUSE=0`: once only) | A browser keeps the Anubis cookie. A crawler that solves does the same |
+| CPU time of a solution | `time.thread_time()` of the solving thread | Process time counts the other threads too |
+| `signed` | The User-Agent of `named` (GPTBot/1.1), so the signature is the only difference. The Dictionary form of `Signature-Agent` (`agent1`). `expires` is `created` + 60. The key is `tests/data/bot_test_key.pem` | draft-meunier-web-bot-auth-architecture-05 |
+| Ed25519 in Python | `openssl pkeyutl -sign -rawin -in FILE`, one process for each request. The base goes into a temporary file: Ed25519 signs in one shot, and `pkeyutl` cannot read it from a pipe | No new pip package. `tests/rproxy_func.sh` signs the same way |
+| `polite` | Reads `robots.txt` once, then the links of `/` and the dataset. It skips a target that a `Disallow` path starts. One request, then 1 s | RFC 9309 section 2.2.2. A crawl delay of 1 s is common |
+| `trapped` | `/`, every `href` and `src` of it, then `BATCH` dataset pages, again and again. The User-Agent of curl | Our choice |
+| `revalidate` | Each loop keeps the `ETag` of its first reply, then sends `If-None-Match` with it | RFC 9110 section 13.1.2 |
+| `www/image.png` | `scene.sh` runs `make www` when it is missing. Without it, each page load of `human.py` gets a 404, and the scanner rule blocks `human.py` | Found in a fresh checkout |
 
 #### Defaults taken from practice
 
