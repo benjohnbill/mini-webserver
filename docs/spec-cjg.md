@@ -465,6 +465,14 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 | Block table concurrency | One mutex for the whole table. A linear search under the lock | Our choice. The rate limit table has the same shape. A search of 4096 keys is cheap next to a TLS handshake |
 | `--block-key KEY` | A key in the block table from the start, for `--block-time`. At most 16 | Our choice, like `fail2ban-client set JAIL banip`. The functional tests use it to test the expiry |
 | Size bounds of the list files | 1024 ranges, 256 JA4 entries, labels of 32 characters, lines of 255 characters | Our choice |
+| `ja4_format` (row 1) | The FoxIO rules: `t`, version, `d` or `i` (SNI), cipher count, extension count, ALPN, then the cipher hash and the extension hash. GREASE values leave every list and count | FoxIO `technical_details/JA4.md`; RFC 8701 |
+| `rate_limit` (row 2) | A token bucket for each key. `rate` tokens come back each second, up to `burst`. A new key starts full. A refused request takes no token. Retry-After is ceil((1 - tokens) / rate), at least 1 | nginx `limit_req`, Envoy `local_ratelimit`; RFC 9110 §10.2.3 |
+| Rate limit table full | It forgets the key used longest ago | nginx `limit_req_zone` |
+| `verdict_decide` (row 3) | An ordered rule table. The first rule that matches decides. The default is pass | Cloudflare custom rules |
+| Crawler User-Agents | GPTBot, CCBot, ClaudeBot, Bytespider, PerplexityBot, AhrefsBot get deny (403). Deny comes before slow | Cloudflare "AI Scrapers and Crawlers"; ai.robots.txt |
+| A false browser | A `Chrome/` User-Agent with a JA4 that is not a browser JA4 gets tarpit. An empty JA4 passes | JA4 against the User-Agent, as bot management products check it |
+| Over the rate limit | Slow (429 with Retry-After) | RFC 6585 §4; nginx `limit_req` |
+| Host check | An HTTP/1.1 request with no Host gets 400. HTTP/1.0 with no Host passes | RFC 9112 §3.2 |
 
 ### Order of work
 

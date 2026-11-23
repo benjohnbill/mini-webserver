@@ -35,6 +35,13 @@ static void bits_after_the_prefix_in_the_address_are_ignored(void)
     CHECK(ip_list_has_address(&block_list, "10.0.0.1"));
 }
 
+static void bits_after_a_prefix_inside_a_byte_are_ignored(void)
+{
+    CHECK_EQ_INT(ip_list_parse("10.0.0.200/25\n", &block_list), 0);
+    CHECK(ip_list_has_address(&block_list, "10.0.0.130"));
+    CHECK(!ip_list_has_address(&block_list, "10.0.0.127"));
+}
+
 static void a_zero_bit_prefix_matches_every_address_of_its_family(void)
 {
     CHECK_EQ_INT(ip_list_parse("0.0.0.0/0\n", &block_list), 0);
@@ -128,6 +135,7 @@ int main(void)
     a_bare_address_matches_only_itself();
     a_prefix_that_is_not_on_a_byte_boundary_matches_by_bits();
     bits_after_the_prefix_in_the_address_are_ignored();
+    bits_after_a_prefix_inside_a_byte_are_ignored();
     a_zero_bit_prefix_matches_every_address_of_its_family();
     an_ipv6_range_matches_ipv6_addresses();
     an_ipv4_mapped_ipv6_address_matches_an_ipv4_range();
