@@ -5,8 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
+#define CACHE_CONTROL_LEN (sizeof("Cache-Control:") - 1)
 #define FNV_OFFSET 14695981039346656037ULL
 #define FNV_PRIME 1099511628211ULL
 
@@ -65,6 +67,8 @@ static bool entry_copy(const struct cache_entry *entry, char **reply,
 static void entry_touch(struct cache *cache, struct cache_entry *entry);
 static void entry_remove(struct cache *cache, struct cache_entry *entry);
 static bool reply_is_ok(const char *key, const char *reply, size_t reply_len);
+static bool reply_forbids_store(const char *reply, size_t reply_len);
+static bool line_has_word(const char *line, size_t line_len, const char *word);
 static bool admission_pass(struct cache *cache, uint64_t hash, size_t reply_len,
                            size_t block_size);
 static struct cache_entry *entry_create(struct cache *cache, uint64_t hash,
@@ -285,13 +289,51 @@ static void entry_remove(struct cache *cache, struct cache_entry *entry)
     free(entry);
 }
 
-/* Only a GET with status 200 is stored. */
+/* Only a GET with status 200 is stored, and only if the Origin allows it
+   (RFC 9111 sections 5.2.2.5 and 5.2.2.7). */
 static bool reply_is_ok(const char *key, const char *reply, size_t reply_len)
 {
     return strncmp(key, "GET ", strlen("GET ")) == 0 &&
            reply_len > strlen("HTTP/1.x 200") &&
            strncmp(reply, "HTTP/1.", strlen("HTTP/1.")) == 0 &&
-           strncmp(reply + strlen("HTTP/1.x"), " 200", strlen(" 200")) == 0;
+           strncmp(reply + strlen("HTTP/1.x"), " 200", strlen(" 200")) == 0 &&
+           !reply_forbids_store(reply, reply_len);
+}
+
+/* True if a Cache-Control line of the header says no-store or private. */
+static bool reply_forbids_store(const char *reply, size_t reply_len)
+{
+    const char *line = reply;
+    const char *end = reply + reply_len;
+    while (line < end) {
+        const char *next = memchr(line, '\n', (size_t)(end - line));
+        size_t line_len =
+            next != NULL ? (size_t)(next - line) : (size_t)(end - line);
+        if (line_len <= 1) {
+            return false; /* the empty line: the header ends */
+        }
+        if (line_len > CACHE_CONTROL_LEN &&
+            strncasecmp(line, "Cache-Control:", CACHE_CONTROL_LEN) == 0 &&
+            (line_has_word(line, line_len, "no-store") ||
+             line_has_word(line, line_len, "private"))) {
+            return true;
+        }
+        line = next != NULL ? next + 1 : end;
+    }
+
+    return false;
+}
+
+static bool line_has_word(const char *line, size_t line_len, const char *word)
+{
+    size_t word_len = strlen(word);
+    for (size_t i = 0; i + word_len <= line_len; i++) {
+        if (strncasecmp(line + i, word, word_len) == 0) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /* The admission policy. For CACHE_ADMIT_SECOND, a first miss records the

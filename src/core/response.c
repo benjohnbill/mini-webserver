@@ -12,6 +12,7 @@ struct plan_head {
     const char *content_type;
     off_t content_length;
     bool close_after;
+    bool no_store;
     const char *allowed_method; /* NULL: no Allow header */
     const char *text;           /* NULL: the body is not in header[] */
 };
@@ -24,13 +25,14 @@ static void plan_write_error(struct response_plan *plan, int status,
 
 bool response_plan_init(struct response_plan *plan, int status,
                         const char *content_type, off_t content_length,
-                        bool close_after)
+                        bool close_after, bool no_store)
 {
     struct plan_head head = {
         .status = status,
         .content_type = content_type,
         .content_length = content_length,
         .close_after = close_after,
+        .no_store = no_store,
     };
 
     return plan_write_head(plan, &head);
@@ -38,13 +40,14 @@ bool response_plan_init(struct response_plan *plan, int status,
 
 void response_plan_init_text(struct response_plan *plan, int status,
                              const char *content_type, const char *text,
-                             bool close_after)
+                             bool close_after, bool no_store)
 {
     struct plan_head head = {
         .status = status,
         .content_type = content_type,
         .content_length = (off_t)strlen(text),
         .close_after = close_after,
+        .no_store = no_store,
         .text = text,
     };
     plan_write_head(plan, &head);
@@ -84,10 +87,11 @@ static bool plan_write_head(struct response_plan *plan,
                           "Content-Type: %s\r\n"
                           "Content-Length: %lld\r\n"
                           "Connection: %s\r\n"
-                          "%s\r\n%s",
+                          "%s%s\r\n%s",
                           head->status, status_get_reason(head->status),
                           head->content_type, (long long)head->content_length,
                           head->close_after ? "close" : "keep-alive",
+                          head->no_store ? "Cache-Control: no-store\r\n" : "",
                           allow_line, head->text != NULL ? head->text : "");
 
     plan->body = NULL;

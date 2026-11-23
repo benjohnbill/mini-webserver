@@ -64,7 +64,7 @@ static int static_file_open(const struct request *request,
         return errno_to_status(errno);
     }
     if (!response_plan_init(plan, 200, mime_find_type(path), info.st_size,
-                            !serve_keeps_open(request, 200))) {
+                            !serve_keeps_open(request, 200), false)) {
         close(fd);
         return 0;
     }

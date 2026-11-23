@@ -18,14 +18,16 @@ struct response_plan {
 };
 
 /* The caller sets body or file_fd after this call, if it returns true.
-   False: the header did not fit, and the plan is a 500 now. */
+   False: the header did not fit, and the plan is a 500 now. no_store adds
+   "Cache-Control: no-store", for a reply that a cache must not keep (a
+   Handler reply). */
 bool response_plan_init(struct response_plan *plan, int status,
                         const char *content_type, off_t content_length,
-                        bool close_after);
+                        bool close_after, bool no_store);
 /* A short generated body goes into header[], so the plan owns it. */
 void response_plan_init_text(struct response_plan *plan, int status,
                              const char *content_type, const char *text,
-                             bool close_after);
+                             bool close_after, bool no_store);
 void response_plan_init_error(struct response_plan *plan, int status,
                               bool close_after);
 /* 405 with "Allow: <allowed_method>". It closes the connection. */
