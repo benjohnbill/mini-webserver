@@ -477,7 +477,7 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 | Honeypot link | `<a href="/trap/" rel="nofollow" hidden aria-hidden="true" tabindex="-1">` before the script of `www/index.html`. `hidden` takes it out of the page and of the reading order. `tabindex="-1"` keeps it out of the tab order | The common honeypot link: a person cannot see it, a crawler that parses links finds it. `rel="nofollow"`: HTML link types |
 | Trap page | `www/trap/index.html`, a short page with `<meta name="robots" content="noindex, nofollow">`. The Origin answers 200 | Our choice. A 200 shows the crawler nothing unusual |
 | Honeypot hit | A target whose path starts with `/trap/`: tarpit, and the client IP goes in the block table for `--block-time`. The JA4 does not go in, because all curl clients share one JA4 | SPEC v2 "The layers", row "Trap". fail2ban: one ban for each IP |
-| Rule order in `verdict_decide` | Honeypot, scanner, crawler names, false browser, rate limit. The two rules that block come first, so a named crawler that ignores `robots.txt` is caught too | Our choice |
+| Rule order in `verdict_decide` | Steps 10 and 11: honeypot, scanner, verified bot (pass), pay, crawler names, false browser, Proof of work, rate limit. The two rules that block come first, so a named crawler that ignores `robots.txt` is caught too. They also hold for a verified bot | Our choice |
 | Behavior counter key | The client IP | fail2ban counts failures for each IP. The block table blocks the client IP |
 | Behavior counter window | A fixed window for each key: 600 s from its first request. Then all counts start at zero | fail2ban `findtime` default (10 minutes). A fixed window is the simplest window |
 | Behavior counter bound | 4096 keys. When the table is full, the key used longest ago leaves. One mutex, a linear search | The same shape as the rate limit table (nginx `limit_req_zone`) |
@@ -489,6 +489,16 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 | Behavior log line | After the 7-field line of a request: `behavior IP requests=N targets=N not_found=N robots=N trap=N`, the counts with this request and before its reply. `scene.sh` skips the lines that start with `behavior` | Our choice. The 7 fields stay for `scene.sh` |
 | Over the rate limit | Slow (429 with Retry-After) | RFC 6585 §4; nginx `limit_req` |
 | Host check | An HTTP/1.1 request with no Host gets 400. HTTP/1.0 with no Host passes | RFC 9112 §3.2 |
+| A verified bot | A bot with a valid Web Bot Auth signature passes after the honeypot and scanner rules. So it skips the User-Agent, JA4, Proof of work, and rate limit rules | Cloudflare verified bots: a verified bot skips the bot challenges and blocks |
+| Pay rule | A crawler User-Agent (the crawler names) with no valid signature, on a `--pay-prefix` target, gets pay (402). It comes before the crawler deny, so a pay target shows 402 and other targets still show 403 | Cloudflare pay per crawl: "Charge" takes the place of "Block" for a crawler on that content |
+| 402 reply | `crawler-price: USD 0.01` and a short text body. `rproxy` takes no payment: it does not read `crawler-exact-price` or `crawler-max-price`. A crawler gets in when it signs (Web Bot Auth) | Cloudflare pay per crawl, "Crawl pages": `HTTP 402`, `crawler-price: USD 0.01` |
+| `--pow-prefix`, `--pay-prefix` | Each flag can occur up to 8 times. A prefix starts with `/`. A target matches when it starts with the prefix, as text (`/data/` matches `/data/1.html?x=1`) | nginx `location /data/` (a prefix match). The repeat is the same as `--origin` |
+| `--pow-bits` default | 16 | Anubis `DefaultDifficulty = 4`: 4 leading zero hex digits (`web/js/worker/sha256.ts`), so 16 bits |
+| Pow secret | 32 random bytes from OpenSSL `RAND_bytes` at each start. A restart makes the old challenges invalid | RFC 2104 section 3: an HMAC key as long as the hash output |
+| 401 challenge reply | `X-PoW-Challenge: NONCE BITS`, `WWW-Authenticate: PoW challenge="NONCE BITS"`, and a short text body | RFC 9110 §15.5.2: a 401 has `WWW-Authenticate`. RFC 9577 §2.1 (`PrivateToken challenge=...`): a challenge as an auth-param |
+| When the pow and the signature are checked | `X-PoW` only on a `--pow-prefix` target. The signature only with `--bot-key`, and only when the request has Host, because the signature covers `@authority` | Our choice: no hash and no signature check that no rule reads |
+| Clock of the pow and the signature | The wall clock (`CLOCK_REALTIME`). The rate limit and the counters keep the monotonic clock | RFC 9421 `created` and `expires` are wall clock times |
+| `--bot-key FILE` | Read once at the start, as `--ja4-list`. A bad line prints the file and the line number, and stops the start | nginx `-t` |
 
 ### Order of work
 
@@ -501,6 +511,6 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 7. Shared core: `http_find_header`, and `ETag` with 304 for static files. Tests first.
 8. Two Verdict stages: `connection_decide` (slot, row 4) with its tests, `ip_list`, `block_table`, and the JA4 table. Done (2026-11-24). The owner chose that the generator writes row 4 by practice. The files: `ip_list`, `ja4_table`, `block_table`, and `connection_verdict` (it holds `connection_decide`). The flags: `--block-list FILE`, `--ja4-list FILE`, `--block-time S`, `--block-key KEY`. A dropped connection logs the Verdict `drop`.
 9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters. Done (2026-11-24). The generator chose the rules by practice ("Defaults taken from practice"). `struct verdict_signals` now has the JA4 label and the Behavior counters, and `struct verdict` has `blocks_client`.
-10. Proof of work.
-11. Web Bot Auth and 402.
+10. Proof of work. Done (2026-11-24). The flags: `--pow-prefix PATH` and `--pow-bits N`. A challenge logs the Verdict `challenge`.
+11. Web Bot Auth and 402. Done (2026-11-24). The flags: `--pay-prefix PATH` and `--bot-key FILE`. A 402 logs the Verdict `pay`. `tests/data/bot_test_key.pem` is a test key for `tests/rproxy_func.sh` only.
 12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes.
