@@ -4,7 +4,8 @@
 #include <string.h>
 
 /* Source: Cloudflare "AI Scrapers and Crawlers" rule, ai.robots.txt, JA4,
-   fail2ban (jail.conf maxretry and findtime, the nginx-botsearch filter). */
+   fail2ban (jail.conf maxretry and findtime, the nginx-botsearch filter),
+   Cloudflare verified bots and pay per crawl, Anubis (Proof of work). */
 
 /* The rule table: the first rule that matches decides. */
 struct verdict_rule {
@@ -25,17 +26,26 @@ static const char *const crawler_names[] = {
 
 static bool request_is_in_honeypot(const struct verdict_signals *signals);
 static bool client_is_scanner(const struct verdict_signals *signals);
+static bool bot_is_verified(const struct verdict_signals *signals);
+static bool crawler_must_pay(const struct verdict_signals *signals);
 static bool agent_is_crawler(const struct verdict_signals *signals);
 static bool agent_lies_about_chrome(const struct verdict_signals *signals);
+static bool request_needs_pow(const struct verdict_signals *signals);
 static bool request_is_over_limit(const struct verdict_signals *signals);
 
 /* The two rules that block come first: they are the strongest evidence,
-   and a crawler that names itself but ignores robots.txt is caught too. */
+   and a crawler that names itself but ignores robots.txt is caught too.
+   They hold for a verified bot too. A verified bot then passes, so it
+   skips the User-Agent, JA4, Proof of work, and rate limit rules. Pay
+   comes before the crawler deny, so a pay target gets 402, not 403. */
 static const struct verdict_rule rules[] = {
     {request_is_in_honeypot, VERDICT_TARPIT, true},
     {client_is_scanner, VERDICT_DENY, true},
+    {bot_is_verified, VERDICT_PASS, false},
+    {crawler_must_pay, VERDICT_PAY, false},
     {agent_is_crawler, VERDICT_DENY, false},
     {agent_lies_about_chrome, VERDICT_TARPIT, false},
+    {request_needs_pow, VERDICT_CHALLENGE, false},
     {request_is_over_limit, VERDICT_SLOW, false},
 };
 
@@ -67,6 +77,18 @@ static bool client_is_scanner(const struct verdict_signals *signals)
     return signals->behavior.not_found >= SCANNER_NOT_FOUND_MAX;
 }
 
+static bool bot_is_verified(const struct verdict_signals *signals)
+{
+    return signals->bot_verified;
+}
+
+/* A crawler that names itself, with no valid signature (that rule came
+   first), on a --pay-prefix target. */
+static bool crawler_must_pay(const struct verdict_signals *signals)
+{
+    return signals->is_pay_target && agent_is_crawler(signals);
+}
+
 static bool agent_is_crawler(const struct verdict_signals *signals)
 {
     if (signals->user_agent == NULL) {
@@ -91,6 +113,11 @@ static bool agent_lies_about_chrome(const struct verdict_signals *signals)
            strstr(signals->user_agent, "Chrome/") != NULL &&
            signals->ja4_label != NULL &&
            strcmp(signals->ja4_label, BROWSER_LABEL) != 0;
+}
+
+static bool request_needs_pow(const struct verdict_signals *signals)
+{
+    return signals->is_pow_target && !signals->pow_ok;
 }
 
 static bool request_is_over_limit(const struct verdict_signals *signals)
