@@ -11,6 +11,7 @@ struct request {
     char *version;
     char *host;          /* NULL if absent */
     char *content_type;  /* NULL if absent; POST /echo sends it back */
+    char *user_agent;    /* NULL if absent; a signal of the Verdict */
     long content_length; /* -1 if absent */
     bool wants_close;    /* from the version and Connection */
     char *body;

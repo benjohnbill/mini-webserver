@@ -273,6 +273,8 @@ static void header_fields_record(const char *name, char *value,
         request->host = value;
     } else if (strcasecmp(name, "Content-Type") == 0) {
         request->content_type = value;
+    } else if (strcasecmp(name, "User-Agent") == 0) {
+        request->user_agent = value;
     } else if (strcasecmp(name, "Content-Length") == 0) {
         fields->content_length_count++;
         fields->content_length = value;
