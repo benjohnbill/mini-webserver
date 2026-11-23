@@ -222,6 +222,12 @@ got="$(curl -sk --max-time 5 -H 'Content-Type: text/plain' \
     --data-binary 'hello' "$BASE/echo")"
 [ "$got" = "hello" ] && pass "POST /echo comes through from ./server" \
     || fail "POST /echo comes through from ./server: got '$got'"
+start_proxy --origin "$HOST:$SERVER_PORT" --cache on
+curl -sk --max-time 5 -o /dev/null "$BASE/api/time"
+curl -sk --max-time 5 -D "$WORK/time2" -o /dev/null "$BASE/api/time"
+grep -qi $'^x-cache: miss\r$' "$WORK/time2" \
+    && pass "a no-store reply of ./server is not cached" \
+    || fail "a no-store reply of ./server is not cached"
 
 if [ "$FAILS" -gt 0 ]; then
     echo "--- rproxy stderr ---"

@@ -61,6 +61,43 @@ static void echo_sends_back_the_body_and_its_content_type(void)
     response_plan_close(&plan);
 }
 
+static void plan_for(char *buffer, struct response_plan *plan)
+{
+    struct config config = {.root = "www"};
+    struct request request;
+    CHECK_EQ_INT(http_parse_request(buffer, strlen(buffer), &request), 0);
+    serve_request(&request, &config, plan);
+}
+
+static void the_time_handler_says_no_store(void)
+{
+    char buffer[] = "GET /api/time HTTP/1.1\r\nHost: a\r\n\r\n";
+    struct response_plan plan;
+    plan_for(buffer, &plan);
+    CHECK(strstr(plan.header, "\r\nCache-Control: no-store\r\n") != NULL);
+    response_plan_close(&plan);
+}
+
+static void the_echo_handler_says_no_store(void)
+{
+    char buffer[] = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n"
+                    "\r\nhi";
+    struct response_plan plan;
+    plan_for(buffer, &plan);
+    CHECK(strstr(plan.header, "\r\nCache-Control: no-store\r\n") != NULL);
+    response_plan_close(&plan);
+}
+
+static void a_static_file_has_no_cache_control(void)
+{
+    char buffer[] = "GET /index.html HTTP/1.1\r\nHost: a\r\n\r\n";
+    struct response_plan plan;
+    plan_for(buffer, &plan);
+    CHECK(strstr(plan.header, "HTTP/1.1 200 OK\r\n") == plan.header);
+    CHECK(strstr(plan.header, "Cache-Control") == NULL);
+    response_plan_close(&plan);
+}
+
 static void a_dot_dot_target_gets_a_403_plan_that_closes(void)
 {
     char buffer[] = "GET /../secret HTTP/1.1\r\nHost: a\r\n\r\n";
@@ -83,6 +120,9 @@ int main(void)
     an_error_closes();
     echo_sends_back_the_body_and_its_content_type();
     a_dot_dot_target_gets_a_403_plan_that_closes();
+    the_time_handler_says_no_store();
+    the_echo_handler_says_no_store();
+    a_static_file_has_no_cache_control();
     printf("test_serve: ok\n");
 
     return 0;

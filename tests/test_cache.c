@@ -72,6 +72,36 @@ static void a_reply_that_is_not_200_is_not_stored(void)
     cache_destroy(cache);
 }
 
+static void a_reply_with_cache_control_no_store_is_not_stored(void)
+{
+    struct cache_options options = options_init();
+    struct cache *cache = cache_create(&options);
+    const char *reply = "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n"
+                        "Content-Length: 2\r\n\r\nok";
+    CHECK(!cache_store(cache, "GET /a", reply, strlen(reply), 0));
+    cache_destroy(cache);
+}
+
+static void cache_control_private_in_any_case_is_not_stored(void)
+{
+    struct cache_options options = options_init();
+    struct cache *cache = cache_create(&options);
+    const char *reply = "HTTP/1.1 200 OK\r\ncache-control: Private, max-age=0"
+                        "\r\nContent-Length: 2\r\n\r\nok";
+    CHECK(!cache_store(cache, "GET /a", reply, strlen(reply), 0));
+    cache_destroy(cache);
+}
+
+static void no_store_in_the_body_does_not_stop_the_store(void)
+{
+    struct cache_options options = options_init();
+    struct cache *cache = cache_create(&options);
+    const char *reply = "HTTP/1.1 200 OK\r\nContent-Length: 23\r\n\r\n"
+                        "Cache-Control: no-store";
+    CHECK(cache_store(cache, "GET /a", reply, strlen(reply), 0));
+    cache_destroy(cache);
+}
+
 static void a_post_is_not_stored(void)
 {
     struct cache_options options = options_init();
@@ -193,6 +223,9 @@ int main(void)
     a_stored_reply_is_found_with_the_same_bytes();
     a_key_that_was_not_stored_is_a_miss();
     a_reply_that_is_not_200_is_not_stored();
+    a_reply_with_cache_control_no_store_is_not_stored();
+    cache_control_private_in_any_case_is_not_stored();
+    no_store_in_the_body_does_not_stop_the_store();
     a_post_is_not_stored();
     size_admission_rejects_a_reply_over_the_object_max();
     second_admission_stores_a_key_on_its_second_miss();
