@@ -388,6 +388,60 @@ A Verdict from the User-Agent or the JA4 (deny or tarpit for `named` or `disguis
 
 With `--rate-key ja4`, all clients with one JA4 share one token bucket. All Crawler scripts and `human.sh` use curl, so they share a bucket. While `ja4_format` is a slot, the JA4 of each client is the empty string, so all clients share the key "".
 
+### v2: a place for each defense layer (2026-11-24)
+
+User said 2026-11-24: "1~4번 전부 추천대로 가자." The goal: each layer of the study page "crawler 트래픽과 서버의 방어" has a place in `rproxy` and a Crawler script that shows it. CAPTCHA is out: a person must solve it, so a Scene cannot measure it. Reverse DNS is out: it is not in the layer figure, and Web Bot Auth does the same job (a good bot proves its name).
+
+#### Two Verdict stages
+
+| Stage | When | Signals | Verdicts |
+|---|---|---|---|
+| Connection | after the ClientHello peek, before the TLS handshake | client IP, JA4, the block table | pass, drop (close with no reply), tarpit |
+| Request | after the request parse | the connection signals, User-Agent, target, rate limit, behavior counters, proof of work token, bot signature | pass, deny (403), slow (429), tarpit, challenge (proof of work), pay (402) |
+
+Before the handshake there is no HTTP, so the connection stage can only close or hold. A dropped connection costs no RSA signature (0.9 ms each, measured in the parity note).
+
+New order for one connection: ClientHello and JA4, connection Verdict, TLS handshake, request, rate limit and behavior counters, request Verdict, cache, Origin.
+
+#### The layers
+
+| Layer (study page) | Defense | Stage | Module, with unit tests | Owner decides |
+|---|---|---|---|---|
+| IP, network | Block list of CIDR ranges, `--block-list FILE`. On localhost a CIDR list stands in for an ASN list | connection | `ip_list`: parse, match | the ranges in the file |
+| TLS fingerprint | JA4 table, `--ja4-list FILE`: JA4 to a label (`curl`, `python`, `browser`) | connection and request | `ja4` (row 1); the table lookup | the labels, and what a label means |
+| HTTP header | User-Agent table. `www/robots.txt` on the Origin, with `Disallow: /trap/` | request | `verdict` (row 3) | which User-Agent and JA4 pairs are a lie |
+| Volume and behavior | Rate limit. Behavior counters for each key: requests, distinct targets, 404s, robots.txt read, honeypot hits | request | `rate_limit` (row 2); `behavior` | the limits and which counter means a crawler |
+| Test | Proof of work on targets under `--pow-prefix`: a 401 with `X-PoW-Challenge: NONCE BITS`. The client sends `X-PoW: NONCE:COUNTER`, and SHA-256 of that text must start with BITS zero bits. The nonce is an HMAC of the client IP and the time window, so `rproxy` keeps no state | request | `pow`: make and check | where and how hard |
+| Trap | Tarpit (exists). Honeypot: a hidden link in `www/index.html` to `/trap/`, which `robots.txt` disallows. A hit puts the key in the block table for `--block-time` seconds | request, then connection | `block_table`: time is an argument | the trap paths, the block time |
+| Deal | Web Bot Auth: an RFC 9421 signature with Ed25519 over `@authority` and `signature-agent`, keys from `--bot-key FILE`. A verified bot skips the User-Agent and JA4 rules. A crawler User-Agent with no valid signature gets 402 on `--pay-prefix` targets | request | `bot_auth`: verify (test vector: RFC 9421 Appendix B.2.6) | which bots, which targets |
+| Cache | Hit (exists). New: the Origin sends `ETag` for static files, and the cache answers `If-None-Match` with 304 | request | Shared core and `cache` | none |
+
+The Shared core keeps only some headers (§11 "Origins and forwarding"). v2 needs more (`If-None-Match`, `X-PoW`, `Signature`, `Signature-Input`, `Signature-Agent`), so `struct request` keeps the header block, and `http_find_header` finds one header by name.
+
+#### Code the owner types, v2
+
+Rows 1 to 3 stay. Row 3 gets the new signals. One row is new:
+
+| Order | Code | Question it answers |
+|---|---|---|
+| 4 | `connection_decide`: IP, JA4, and block table to a connection Verdict | What may the server decide before it spends a TLS handshake? |
+
+The generator writes `ip_list`, `block_table`, `behavior`, `pow`, `bot_auth`, the header lookup, the 304 path, and the I/O. Each has its tests first. The owner also writes the files that hold decisions: the block list, the JA4 table, the trap paths in `robots.txt`.
+
+#### Arena, v2
+
+`human.sh` becomes a Python `urllib` client with a Chrome User-Agent. Its JA4 differs from curl: no ALPN (`00`), and other extensions (captured 2026-11-24 with lab probe 10). It is still OpenSSL, not the BoringSSL of a real Chrome, so it is a stand-in for a browser.
+
+| New Crawler script | What it does | Layer it shows |
+|---|---|---|
+| `polite` | It reads `robots.txt`, skips each `Disallow` path, sends 1 request per second, and names itself | robots.txt works for a crawler that obeys |
+| `trapped` | It follows every link, the hidden `/trap/` link too | honeypot, then the block table at the connection stage |
+| `revalidate` | It is `repeat` with `If-None-Match` | 304 |
+| `solver` | Python. It solves each proof of work challenge | the cost of each page for a crawler |
+| `signed` | Python. It signs each request with Ed25519 (Web Bot Auth) and names itself | a good bot passes |
+
+`named`, `disguised`, and `spread` stay. With the JA4 table, `disguised` (a Chrome User-Agent with the JA4 of curl) becomes visible. A new preset `layers` turns on every defense.
+
 ### Order of work
 
 1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand.
@@ -396,3 +450,9 @@ With `--rate-key ja4`, all clients with one JA4 share one token bucket. All Craw
 4. `rate_limit` and `verdict`: tests first, then the slots.
 5. Done (2026-11-24). The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server. Parity: [`20261124-rproxy-cache-parity.md`](measurements/20261124-rproxy-cache-parity.md).
 6. Crawler scripts and the Scenes of the arena (section "Arena").
+7. Shared core: `http_find_header`, and `ETag` with 304 for static files. Tests first.
+8. Two Verdict stages: `connection_decide` (slot, row 4) with its tests, `ip_list`, `block_table`, and the JA4 table.
+9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters.
+10. Proof of work.
+11. Web Bot Auth and 402.
+12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes.
