@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "cache.h"
+#include "cache_options.h"
 #include "client_hello.h"
 #include "config.h"
 #include "forward.h"
@@ -51,6 +53,7 @@ struct rproxy_config {
     double rate;
     double burst;
     int tarpit;
+    struct cache_options cache_options;
 };
 
 /* What all Workers share. */
@@ -59,6 +62,7 @@ struct rproxy {
     struct origin_list list;
     struct tls_context *context;
     struct rate_limit *limit; /* NULL when the rate limit is off */
+    struct cache *cache;      /* NULL when the cache is off */
 };
 
 struct pool {
@@ -77,8 +81,9 @@ struct exchange {
     char client_ip[INET6_ADDRSTRLEN];
     char ja4[JA4_LEN + 1];
     const char *verdict_name;
-    int origin_index; /* -1 if no Origin was picked */
-    int status;       /* 0 if no reply was sent */
+    const char *cache_name; /* "hit", "miss", or "-" */
+    int origin_index;       /* -1 if no Origin was picked */
+    int status;             /* 0 if no reply was sent */
     bool needs_drain;
 };
 
@@ -135,6 +140,13 @@ static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
 static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
                            const struct request *request,
                            struct exchange *exchange);
+static bool cache_key_format(const struct request *request, char *key,
+                             size_t size);
+static int origin_fetch(struct rproxy *rproxy, const struct request *request,
+                        struct exchange *exchange, char **reply,
+                        size_t *reply_len);
+static void reply_send(struct tls_session *session, const char *reply,
+                       size_t reply_len, const char *cache_name);
 static int reply_get_status(const char *reply, size_t reply_len);
 static void tarpit_hold(int seconds);
 static void connection_drain(int conn_fd);
@@ -148,7 +160,10 @@ int main(int argc, char **argv)
                 "usage: ./rproxy --port P --cert FILE --key FILE "
                 "--origin HOST:PORT [--origin HOST:PORT ...] "
                 "[--origin-timeout S] [--workers N] [--rate R] [--burst B] "
-                "[--tarpit S]\n");
+                "[--tarpit S] [--cache off|on] "
+                "[--cache-admit all|size|second] [--cache-object-max BYTES] "
+                "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
+                "[--cache-lock global|striped]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -174,6 +189,7 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
                    .burst = DEFAULT_BURST,
                    .tarpit = DEFAULT_TARPIT},
     };
+    cache_options_init(&rproxy->config.cache_options);
     atomic_init(&rproxy->list.next, 0);
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc || !option_parse(rproxy, argv[i], argv[i + 1])) {
@@ -219,8 +235,13 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     if (strcmp(name, "--tarpit") == 0) {
         return number_parse(value, 0, TIMEOUT_MAX, &config->tarpit);
     }
+    /* Threads share the memory of the process, so the cache is always
+       private: rproxy has no fork. */
+    if (strcmp(name, "--cache-share") == 0) {
+        return false;
+    }
 
-    return false;
+    return cache_options_parse(&config->cache_options, name, value);
 }
 
 static bool number_parse(const char *text, long min, long max, int *number)
@@ -261,7 +282,7 @@ static bool origin_add(struct origin_list *list, const char *text)
     return true;
 }
 
-/* Loads the certificate and makes the rate limit table. */
+/* Loads the certificate and makes the rate limit table and the cache. */
 static bool rproxy_start(struct rproxy *rproxy)
 {
     rproxy->context =
@@ -281,12 +302,23 @@ static bool rproxy_start(struct rproxy *rproxy)
             return false;
         }
     }
+    if (rproxy->config.cache_options.is_on) {
+        rproxy->cache = cache_create(&rproxy->config.cache_options);
+        if (rproxy->cache == NULL) {
+            fprintf(stderr, "rproxy: cache_create failed\n");
+            return false;
+        }
+    }
 
     return true;
 }
 
 static void rproxy_stop(struct rproxy *rproxy)
 {
+    if (rproxy->cache != NULL) {
+        cache_report(rproxy->cache);
+        cache_destroy(rproxy->cache);
+    }
     if (rproxy->limit != NULL) {
         rate_limit_destroy(rproxy->limit);
     }
@@ -434,10 +466,11 @@ static void *worker_main(void *arg)
 }
 
 /* SPEC 11: ClientHello and JA4, TLS handshake, request, rate limit,
-   Verdict, Origin. One request for each connection. */
+   Verdict, cache, Origin. One request for each connection. */
 static void connection_serve(struct rproxy *rproxy, int conn_fd)
 {
-    struct exchange exchange = {.verdict_name = "-", .origin_index = -1};
+    struct exchange exchange = {
+        .verdict_name = "-", .cache_name = "-", .origin_index = -1};
     struct client_hello hello;
     connection_set_timeouts(conn_fd);
     client_ip_get(conn_fd, exchange.client_ip, sizeof(exchange.client_ip));
@@ -690,9 +723,54 @@ static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
     }
 }
 
+/* Only a PASS reaches here, so a denied request never reaches the cache.
+   A hit does not reach an Origin. With the cache on, the reply gets
+   X-Cache, as the Proxy Route of the server does. */
 static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
                            const struct request *request,
                            struct exchange *exchange)
+{
+    char key[CACHE_KEY_MAX];
+    bool has_key =
+        rproxy->cache != NULL && cache_key_format(request, key, sizeof(key));
+    char *reply = NULL;
+    size_t reply_len = 0;
+    if (has_key &&
+        cache_find(rproxy->cache, key, time(NULL), &reply, &reply_len)) {
+        exchange->cache_name = "hit";
+    } else {
+        int status =
+            origin_fetch(rproxy, request, exchange, &reply, &reply_len);
+        if (status != 0) {
+            reply_send_status(session, status, 0, exchange);
+            return;
+        }
+        if (has_key) {
+            cache_store(rproxy->cache, key, reply, reply_len, time(NULL));
+        }
+        exchange->cache_name = rproxy->cache != NULL ? "miss" : "-";
+    }
+    reply_send(session, reply, reply_len,
+               rproxy->cache != NULL ? exchange->cache_name : NULL);
+    exchange->status = reply_get_status(reply, reply_len);
+    free(reply);
+}
+
+/* The key is the method, the path, and the query, as in the server.
+   Returns false if the key does not fit. */
+static bool cache_key_format(const struct request *request, char *key,
+                             size_t size)
+{
+    int key_len =
+        snprintf(key, size, "%s %s", request->method, request->target);
+
+    return key_len >= 0 && (size_t)key_len < size;
+}
+
+/* Returns 0 with *reply set to a malloc reply, or a status code. */
+static int origin_fetch(struct rproxy *rproxy, const struct request *request,
+                        struct exchange *exchange, char **reply,
+                        size_t *reply_len)
 {
     size_t size = HEADER_MAX + FORWARD_EXTRA_MAX + request->body_len;
     char *request_bytes = malloc(size);
@@ -703,24 +781,35 @@ static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
                                      exchange->ja4, request_bytes, size);
     if (request_len == 0) {
         free(request_bytes);
-        reply_send_status(session, 500, 0, exchange);
-        return;
+        return 500;
     }
-    char *reply = NULL;
-    size_t reply_len = 0;
     size_t first = origin_list_pick(&rproxy->list);
     exchange->origin_index = (int)first;
-    int status =
-        forward_fetch(&rproxy->list, first, request_bytes, request_len,
-                      rproxy->config.origin_timeout, &reply, &reply_len);
+    int status = forward_fetch(&rproxy->list, first, request_bytes, request_len,
+                               rproxy->config.origin_timeout, reply, reply_len);
     free(request_bytes);
-    if (status != 0) {
-        reply_send_status(session, status, 0, exchange);
+
+    return status;
+}
+
+/* cache_name NULL sends the reply as it is. Otherwise "X-Cache: HIT" or
+   "MISS" goes after the status line. */
+static void reply_send(struct tls_session *session, const char *reply,
+                       size_t reply_len, const char *cache_name)
+{
+    const char *line_end =
+        cache_name == NULL ? NULL : memchr(reply, '\n', reply_len);
+    if (line_end == NULL) {
+        tls_session_send(session, reply, reply_len);
         return;
     }
-    tls_session_send(session, reply, reply_len);
-    exchange->status = reply_get_status(reply, reply_len);
-    free(reply);
+    size_t status_len = (size_t)(line_end - reply) + 1;
+    const char *header = strcmp(cache_name, "hit") == 0 ? "X-Cache: HIT\r\n"
+                                                        : "X-Cache: MISS\r\n";
+    if (tls_session_send(session, reply, status_len) &&
+        tls_session_send(session, header, strlen(header))) {
+        tls_session_send(session, reply + status_len, reply_len - status_len);
+    }
 }
 
 /* Returns the status code of an HTTP reply, or 0 if it has none. */
@@ -760,8 +849,8 @@ static void connection_drain(int conn_fd)
     }
 }
 
-/* One line for each connection: client IP, JA4, Verdict, Origin index,
-   status. "-" marks a value that the connection did not reach. */
+/* One line for each connection: client IP, JA4, Verdict, cache result,
+   Origin index, status. "-" marks a value that the connection did not reach. */
 static void exchange_log(const struct exchange *exchange)
 {
     char origin_text[LOG_NUMBER_MAX] = "-";
@@ -773,7 +862,8 @@ static void exchange_log(const struct exchange *exchange)
     if (exchange->status > 0) {
         snprintf(status_text, sizeof(status_text), "%d", exchange->status);
     }
-    fprintf(stderr, "%s %s %s %s %s\n", exchange->client_ip,
+    fprintf(stderr, "%s %s %s %s %s %s\n", exchange->client_ip,
             exchange->ja4[0] != '\0' ? exchange->ja4 : "-",
-            exchange->verdict_name, origin_text, status_text);
+            exchange->verdict_name, exchange->cache_name, origin_text,
+            status_text);
 }
