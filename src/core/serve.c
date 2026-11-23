@@ -27,7 +27,11 @@ void serve_request(const struct request *request, const struct config *config,
         return;
     }
 
-    if (status == 0 && route.kind == ROUTE_HANDLER) {
+    if (status == 0 && route.kind == ROUTE_PROXY) {
+        /* The Shared core has no sockets. conn.c fetches a Proxy Route
+           before it calls serve_request. Only epoll gets here. */
+        status = 501;
+    } else if (status == 0 && route.kind == ROUTE_HANDLER) {
         status = route.handler(request, plan);
     } else if (status == 0) {
         status = static_file_open(request, config, plan);

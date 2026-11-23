@@ -127,6 +127,12 @@ static const char *status_get_reason(int status)
         return "URI Too Long";
     case 431:
         return "Request Header Fields Too Large";
+    case 501:
+        return "Not Implemented";
+    case 502:
+        return "Bad Gateway";
+    case 504:
+        return "Gateway Timeout";
     case 505:
         return "HTTP Version Not Supported";
     default:

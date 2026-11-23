@@ -211,10 +211,10 @@ static void connection_reply(struct epoll_loop *loop,
                              struct connection *connection, long frame)
 {
     struct request request;
-    int status = frame < HTTP_INCOMPLETE
-                     ? (int)-frame
-                     : http_parse_request(connection->buffer, (size_t)frame,
-                                          &request);
+    int status =
+        frame < HTTP_INCOMPLETE
+            ? (int)-frame
+            : http_parse_request(connection->buffer, (size_t)frame, &request);
     if (status == 0) {
         serve_request(&request, loop->config, &connection->plan);
     } else {
@@ -245,9 +245,9 @@ static void connection_receive(struct epoll_loop *loop,
         connection->capacity = want;
     }
 
-    ssize_t length = read(connection->conn_fd,
-                          connection->buffer + connection->used,
-                          connection->capacity - connection->used);
+    ssize_t length =
+        read(connection->conn_fd, connection->buffer + connection->used,
+             connection->capacity - connection->used);
     if (length < 0 && (errno == EAGAIN || errno == EINTR)) {
         return; /* nothing yet: back to epoll_wait, serve the others */
     }

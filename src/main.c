@@ -16,9 +16,9 @@ volatile sig_atomic_t stop_requested = 0;
 
 static bool config_init_from_args(struct config *config, int argc, char **argv);
 static bool number_parse(const char *text, long min, long max, int *number);
-static bool option_parse(struct config *config, const char *name,
-                         const char *value);
+static bool option_parse(struct config *config, const char *name, char *value);
 static bool model_is_known(const char *model);
+static bool upstream_parse(struct config *config, char *value);
 static void signals_install(void);
 static void stop_signal_handle(int signal_number);
 static int listen_socket_open(int port);
@@ -33,7 +33,7 @@ int main(int argc, char **argv)
     if (!config_init_from_args(&config, argc, argv)) {
         fprintf(stderr, "usage: ./server <port> <root> [--model "
                         "iter|fork|pool|epoll] [--workers N] [--timeout S] "
-                        "[--log]\n");
+                        "[--log] [--upstream HOST:PORT]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -53,6 +53,8 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
         .workers = DEFAULT_WORKERS,
         .timeout = DEFAULT_TIMEOUT,
         .log = false,
+        .upstream_host = NULL,
+        .upstream_port = NULL,
     };
     if (argc < 3 || !number_parse(argv[1], 1, PORT_MAX, &config->port)) {
         return false;
@@ -86,8 +88,7 @@ static bool number_parse(const char *text, long min, long max, int *number)
     return true;
 }
 
-static bool option_parse(struct config *config, const char *name,
-                         const char *value)
+static bool option_parse(struct config *config, const char *name, char *value)
 {
     if (strcmp(name, "--model") == 0) {
         config->model = value;
@@ -99,6 +100,9 @@ static bool option_parse(struct config *config, const char *name,
     if (strcmp(name, "--timeout") == 0) {
         return number_parse(value, 1, TIMEOUT_MAX, &config->timeout);
     }
+    if (strcmp(name, "--upstream") == 0) {
+        return upstream_parse(config, value);
+    }
 
     return false;
 }
@@ -107,6 +111,22 @@ static bool model_is_known(const char *model)
 {
     return strcmp(model, "iter") == 0 || strcmp(model, "fork") == 0 ||
            strcmp(model, "pool") == 0 || strcmp(model, "epoll") == 0;
+}
+
+/* "127.0.0.1:9091": splits value in place at the last ':'. */
+static bool upstream_parse(struct config *config, char *value)
+{
+    char *colon = strrchr(value, ':');
+    int port = 0;
+    if (colon == NULL || colon == value ||
+        !number_parse(colon + 1, 1, PORT_MAX, &port)) {
+        return false;
+    }
+    *colon = '\0';
+    config->upstream_host = value;
+    config->upstream_port = colon + 1;
+
+    return true;
 }
 
 /* sa_flags = 0, not signal(): with -D_POSIX_C_SOURCE, signal() keeps the

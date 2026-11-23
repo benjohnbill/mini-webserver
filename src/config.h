@@ -17,6 +17,10 @@
 #define PORT_MAX 65535
 #define WORKERS_MAX 1024
 #define TIMEOUT_MAX 3600
+#define PROXY_PREFIX "/proxy/"
+#define PROXY_REQUEST_MAX 4096
+#define PROXY_REPLY_MAX 1048576
+#define PROXY_READ_CHUNK 16384
 
 #define DEFAULT_MODEL "pool"
 #define DEFAULT_WORKERS 4
@@ -29,6 +33,8 @@ struct config {
     int workers;
     int timeout;
     bool log;
+    const char *upstream_host; /* NULL: the Proxy is off */
+    const char *upstream_port;
 };
 
 #endif

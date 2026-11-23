@@ -11,6 +11,8 @@
 #include <sys/time.h>
 
 #include "model.h"
+#include "proxy.h"
+#include "router.h"
 #include "send_plan.h"
 #include "serve.h"
 
@@ -30,6 +32,11 @@ static bool connection_answer(int conn_fd, const struct config *config,
                               struct conn_buffer *buffer, size_t request_len,
                               int status);
 static void connection_drain(int conn_fd);
+static bool request_is_proxy(const struct request *request);
+static int connection_fetch_proxy(const struct request *request,
+                                  const struct config *config,
+                                  struct proxy_reply *reply,
+                                  struct response_plan *plan);
 
 void conn_serve(int conn_fd, const struct config *config)
 {
@@ -119,10 +126,16 @@ static bool connection_answer(int conn_fd, const struct config *config,
 {
     struct request request;
     struct response_plan plan;
+    struct proxy_reply reply = {0};
     if (status == 0) {
         status = http_parse_request(buffer->data, request_len, &request);
     }
-    if (status == 0) {
+    if (status == 0 && request_is_proxy(&request)) {
+        status = connection_fetch_proxy(&request, config, &reply, &plan);
+        if (status != 0) {
+            response_plan_init_error(&plan, status, true);
+        }
+    } else if (status == 0) {
         serve_request(&request, config, &plan);
     } else {
         response_plan_init_error(&plan, status, true);
@@ -135,6 +148,7 @@ static bool connection_answer(int conn_fd, const struct config *config,
     bool keeps_open = send_plan_some(&plan, conn_fd, &offset) == SEND_DONE &&
                       !plan.close_after;
     response_plan_close(&plan);
+    proxy_reply_destroy(&reply);
     if (status != 0) {
         connection_drain(conn_fd);
     }
@@ -156,4 +170,37 @@ static void connection_drain(int conn_fd)
             return;
         }
     }
+}
+
+static bool request_is_proxy(const struct request *request)
+{
+    struct route route;
+
+    return router_resolve(request, &route) == 0 && route.kind == ROUTE_PROXY;
+}
+
+/* The plan sends the upstream reply as it is, with no header of its own,
+   and closes: the upstream reply already has its own Connection header. */
+static int connection_fetch_proxy(const struct request *request,
+                                  const struct config *config,
+                                  struct proxy_reply *reply,
+                                  struct response_plan *plan)
+{
+    if (config->upstream_host == NULL) {
+        return 404;
+    }
+    /* CACHE SLOT: cache_find before proxy_fetch, cache_store after.
+       The owner types this after the team meeting. */
+    int status = proxy_fetch(request, config, reply);
+    if (status != 0) {
+        return status;
+    }
+    *plan = (struct response_plan){.header = "",
+                                   .header_len = 0,
+                                   .body = reply->data,
+                                   .body_len = reply->len,
+                                   .file_fd = -1,
+                                   .close_after = true};
+
+    return 0;
 }

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "config.h"
 #include "handlers.h"
 
 struct handler_route {
@@ -35,7 +36,10 @@ int router_resolve(const struct request *request, struct route *route)
         return strcmp(request->method, route->allowed_method) == 0 ? 0 : 405;
     }
 
-    route->kind = ROUTE_STATIC;
+    route->kind =
+        strncmp(request->target, PROXY_PREFIX, strlen(PROXY_PREFIX)) == 0
+            ? ROUTE_PROXY
+            : ROUTE_STATIC;
     route->allowed_method = "GET";
     route->handler = NULL;
 
