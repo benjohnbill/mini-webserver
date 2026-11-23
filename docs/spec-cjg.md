@@ -40,7 +40,7 @@ Fallback: if S2 on `pool` has no result by a time that the owner sets (open), th
 | Four Concurrency models (§4) | |
 | `SIGINT` and `SIGTERM` shutdown, `SIGPIPE` ignored, child reaping for `fork` | |
 
-Proxy extension point: tomorrow the Proxy adds a third Route kind. The I/O layer (`conn` and the `epoll` loop) relays the bytes, because the Shared core does not use sockets.
+Proxy: the Reverse Proxy is a separate program, `rproxy` (§11). The server has no Route that forwards a request. It is the Origin behind `rproxy`. `--delay MS` makes it a slow Origin for the cache Scenes.
 
 ## 3. HTTP behavior
 
@@ -118,12 +118,15 @@ src/
   conn.c/h        blocking: read to the empty line, body, keep-alive loop
   model.h         the four model entry points
   model_iter.c  model_fork.c  model_pool.c  model_epoll.c
+  cache.c/h       the Reverse Proxy cache. Only rproxy links it (§11) test
+  cache_options.c/h  the --cache options of rproxy
 tests/
   check.h  test_http_parse.c  test_router.c  test_mime.c  test_response.c
-  test_serve.c
+  test_serve.c  test_cache.c
   func.sh         curl and nc against a running server
 bench/
   scene.sh        scene.sh <S2|S2b|S3> <model>
+  cache/run.sh    the cache Scenes: rproxy in front of a slow Origin
 www/              index.html, style.css, app.js, image.png, large.bin
 docs/measurements/
 ```
@@ -365,5 +368,5 @@ The owner types the decision code. The generator writes the byte parser and the 
 2. `ja4` tests (they fail), and the slot. The expected values come from the FoxIO JA4 document (`technical_details/JA4.md`), checked with `sha256sum`.
 3. `tls`, `forward`, `main`, and `tests/rproxy_func.sh`.
 4. `rate_limit` and `verdict`: tests first, then the slots.
-5. The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server.
+5. Done (2026-11-24). The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server. Parity: [`20261124-rproxy-cache-parity.md`](measurements/20261124-rproxy-cache-parity.md).
 6. Crawler scripts and the Scenes of the arena.

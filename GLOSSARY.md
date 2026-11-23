@@ -52,11 +52,7 @@ _Avoid_: edge, front proxy, gateway, shield
 
 **Origin**:
 The program `server` when it sits behind the Reverse Proxy. It serves the files and the Handlers.
-_Avoid_: upstream (the code may keep `upstream` for the target of the Proxy Route), backend
-
-**Proxy Route**:
-The Route of the server that sends a target under `/proxy/` to an upstream and relays the reply. It leaves the server when the Reverse Proxy takes over its cache.
-_Avoid_: Reverse Proxy (that name is for `rproxy`)
+_Avoid_: upstream, backend
 
 **ClientHello**:
 The first TLS message of a client. It is plaintext. The Reverse Proxy reads it with `MSG_PEEK` before the TLS handshake.
