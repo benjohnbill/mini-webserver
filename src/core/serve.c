@@ -10,12 +10,16 @@
 #include "mime.h"
 #include "router.h"
 
+/* Two 16-digit hex numbers, a dash, two quotes, and the NUL. */
+#define ETAG_SIZE 40
+
 static int static_file_open(const struct request *request,
                             const struct config *config,
                             struct response_plan *plan);
 static int path_resolve(char *path, size_t size, struct stat *info);
 static int errno_to_status(int error);
 static int path_resolve_index(char *path, size_t size, struct stat *info);
+static bool plan_add_etag(struct response_plan *plan, const struct stat *info);
 
 void serve_request(const struct request *request, const struct config *config,
                    struct response_plan *plan)
@@ -70,6 +74,7 @@ static int static_file_open(const struct request *request,
     }
     plan->file_fd = fd;
     plan->file_size = info.st_size;
+    plan_add_etag(plan, &info);
 
     return 0;
 }
@@ -120,4 +125,17 @@ static int path_resolve_index(char *path, size_t size, struct stat *info)
     }
 
     return 0;
+}
+
+/* "<mtime hex>-<size hex>": nginx uses the same form, and it needs no read
+   of the file. Returns false, and the plan goes out with no ETag, if the
+   header has no room for it. */
+static bool plan_add_etag(struct response_plan *plan, const struct stat *info)
+{
+    char etag[ETAG_SIZE];
+    snprintf(etag, sizeof(etag), "\"%llx-%llx\"",
+             (unsigned long long)info->st_mtime,
+             (unsigned long long)info->st_size);
+
+    return response_plan_add_header(plan, "ETag", etag);
 }

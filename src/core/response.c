@@ -6,6 +6,9 @@
 
 #define ERROR_TEXT_SIZE 64
 #define ALLOW_LINE_SIZE 64
+#define EMPTY_LINE "\r\n\r\n"
+#define EMPTY_LINE_LEN (sizeof(EMPTY_LINE) - 1)
+#define CRLF_LEN 2
 
 struct plan_head {
     int status;
@@ -22,6 +25,9 @@ static bool plan_write_head(struct response_plan *plan,
 static const char *status_get_reason(int status);
 static void plan_write_error(struct response_plan *plan, int status,
                              bool close_after, const char *allowed_method);
+static size_t plan_find_header_end(const struct response_plan *plan);
+static void plan_insert_text(struct response_plan *plan, size_t offset,
+                             const char *text, size_t text_len);
 
 bool response_plan_init(struct response_plan *plan, int status,
                         const char *content_type, off_t content_length,
@@ -64,6 +70,22 @@ void response_plan_init_not_allowed(struct response_plan *plan,
                                     const char *allowed_method)
 {
     plan_write_error(plan, 405, true, allowed_method);
+}
+
+bool response_plan_add_header(struct response_plan *plan, const char *name,
+                              const char *value)
+{
+    char line[RESPONSE_HEADER_MAX];
+    int line_len = snprintf(line, sizeof(line), "%s: %s\r\n", name, value);
+    size_t header_end = plan_find_header_end(plan);
+    /* Keep one byte for the NUL after the header, as snprintf does. */
+    if (line_len < 0 || header_end == 0 ||
+        plan->header_len + (size_t)line_len >= sizeof(plan->header)) {
+        return false;
+    }
+    plan_insert_text(plan, header_end, line, (size_t)line_len);
+
+    return true;
 }
 
 void response_plan_close(struct response_plan *plan)
@@ -160,12 +182,26 @@ static void plan_write_error(struct response_plan *plan, int status,
     plan_write_head(plan, &head);
 }
 
-bool response_plan_add_header(struct response_plan *plan, const char *name,
-                              const char *value)
+/* Returns the offset where the empty line starts, just after the CRLF of
+   the last header line, or 0 if the header has no empty line. */
+static size_t plan_find_header_end(const struct response_plan *plan)
 {
-    (void)plan;
-    (void)name;
-    (void)value;
+    for (size_t i = 0; i + EMPTY_LINE_LEN <= plan->header_len; i++) {
+        if (memcmp(plan->header + i, EMPTY_LINE, EMPTY_LINE_LEN) == 0) {
+            return i + CRLF_LEN;
+        }
+    }
 
-    return false; /* TODO(step 7): tests first, then this body */
+    return 0;
+}
+
+/* Moves the bytes after offset to make room. The caller checked the fit. */
+static void plan_insert_text(struct response_plan *plan, size_t offset,
+                             const char *text, size_t text_len)
+{
+    char *insert_at = plan->header + offset;
+    memmove(insert_at + text_len, insert_at, plan->header_len - offset);
+    memcpy(insert_at, text, text_len);
+    plan->header_len += text_len;
+    plan->header[plan->header_len] = '\0';
 }

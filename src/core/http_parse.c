@@ -37,6 +37,7 @@ static bool is_supported_method(const char *method);
 static int body_framing_check(struct request *request,
                               const struct header_fields *fields);
 static int content_length_parse(const char *value, long *content_length);
+static const char *header_block_next(const char *cursor, const char *end);
 
 int http_parse_request(char *buffer, size_t len, struct request *request)
 {
@@ -206,6 +207,7 @@ static bool is_target_too_long(const char *target)
 static int header_lines_parse(char *line, struct request *request)
 {
     struct header_fields fields = {0};
+    char *first_line = line;
     while (!line_is_empty(line)) {
         char *next_line = end_first_line(line);
         if (next_line == NULL) {
@@ -216,6 +218,10 @@ static int header_lines_parse(char *line, struct request *request)
             return status;
         }
         line = next_line;
+    }
+    if (line > first_line) {
+        request->header_block = first_line;
+        request->header_block_len = (size_t)(line - first_line);
     }
     int status = request_line_check(request);
     if (status != 0) {
@@ -355,10 +361,34 @@ static int content_length_parse(const char *value, long *content_length)
     return 0;
 }
 
+/* The parse left each header line as "name\0", the value with its leading
+   spaces, then one or more NULs (trimmed spaces, CR, LF). */
 const char *http_find_header(const struct request *request, const char *name)
 {
-    (void)request;
-    (void)name;
+    if (request->header_block == NULL) {
+        return NULL;
+    }
+    const char *cursor = request->header_block;
+    const char *end = cursor + request->header_block_len;
+    while (cursor < end) {
+        const char *value = cursor + strlen(cursor) + 1;
+        value += strspn(value, " \t");
+        if (strcasecmp(cursor, name) == 0) {
+            return value;
+        }
+        cursor = header_block_next(value, end);
+    }
 
-    return NULL; /* TODO(step 7): tests first, then this body */
+    return NULL;
+}
+
+/* Skips the value and the NULs after it. Returns the next name, or end. */
+static const char *header_block_next(const char *cursor, const char *end)
+{
+    cursor += strlen(cursor);
+    while (cursor < end && *cursor == '\0') {
+        cursor++;
+    }
+
+    return cursor;
 }

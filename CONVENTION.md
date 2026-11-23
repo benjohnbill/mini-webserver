@@ -42,6 +42,7 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | `take` | Use up one unit of a limited supply. Return 0 if it was there |
    | `decide` | Turn signals into one choice from an enum |
    | `fetch` | Send a request and read the full reply |
+   | `add` | Put one more item into a struct that exists. Return false, and change nothing, if it does not fit |
 
 4. **One concept has one name in all files.** When you add a concept, add a row.
 
