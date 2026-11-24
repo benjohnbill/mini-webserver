@@ -126,6 +126,21 @@ static void a_404_reply_is_counted_and_other_replies_are_not(void)
     behavior_destroy(counters);
 }
 
+static void a_429_reply_is_counted_as_slowed(void)
+{
+    struct behavior *counters = counters_make(4);
+    request_add(counters, "a", "/", 0);
+    CHECK(behavior_add_reply(counters, "a", 429, 0));
+    request_add(counters, "a", "/", 0);
+    CHECK(behavior_add_reply(counters, "a", 200, 0));
+    request_add(counters, "a", "/", 0);
+    CHECK(behavior_add_reply(counters, "a", 429, 0));
+    struct behavior_counts counts = request_add(counters, "a", "/", 1);
+    CHECK_EQ_INT(counts.slowed, 2);
+    CHECK_EQ_INT(counts.not_found, 0);
+    behavior_destroy(counters);
+}
+
 static void a_reply_for_a_key_with_no_request_is_refused(void)
 {
     struct behavior *counters = counters_make(4);
@@ -224,6 +239,7 @@ int main(void)
     a_robots_txt_read_is_counted_with_or_without_a_query();
     a_target_under_the_honeypot_is_a_trap_hit();
     a_404_reply_is_counted_and_other_replies_are_not();
+    a_429_reply_is_counted_as_slowed();
     a_reply_for_a_key_with_no_request_is_refused();
     the_counts_start_again_when_the_window_ends();
     a_reply_after_the_window_ended_is_refused();

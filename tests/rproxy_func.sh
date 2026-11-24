@@ -263,6 +263,24 @@ got="$(fetch "$BASE/")"
 [ "$got" = "200 A" ] && pass "a block table entry expires after --block-time" \
     || fail "a block table entry expires after --block-time: got '$got'"
 
+# A client over the limit after five 429s in the window goes into the
+# block table. --rate 0.01 --burst 1: the 1st request passes, the 2nd to
+# the 7th get 429, and the 7th (five 429s before it) blocks the client.
+start_proxy --origin "$HOST:$ORIGIN_A" --rate 0.01 --burst 1 --block-time 60
+codes=""
+for _ in 1 2 3 4 5 6 7; do
+    codes="$codes $(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' \
+        "$BASE/")"
+done
+curl -sk --max-time 5 -o /dev/null "$BASE/" 2>/dev/null
+code=$?
+[ "$codes" = " 200 429 429 429 429 429 429" ] \
+    && { [ "$code" = "35" ] || [ "$code" = "56" ]; } \
+    && grep -q '^127\.0\.0\.1 [^ ]* drop - - - 0$' "$WORK/rproxy.err" \
+    && pass "a client over the limit after five 429s gets no TLS handshake" \
+    || fail "a client over the limit after five 429s gets no TLS handshake:" \
+        "codes '$codes', curl exit $code"
+
 # Proof of work (SPEC 11 v2, row "Test"). --pow-bits 8: a solution has
 # SHA-256 of "NONCE:COUNTER" with 8 leading zero bits, the hex "00".
 pow_hash() {
@@ -407,7 +425,7 @@ got="$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "$BASE/trap/")"
     && grep -q '^127\.0\.0\.1 [^ ]* tarpit - - - 0$' "$WORK/rproxy.err" \
     && pass "a GET of /trap/ is tarpitted" \
     || fail "a GET of /trap/ is tarpitted: got '$got'"
-grep -q '^behavior 127\.0\.0\.1 requests=2 targets=2 not_found=0 robots=1 trap=1$' \
+grep -q '^behavior 127\.0\.0\.1 requests=2 targets=2 not_found=0 robots=1 trap=1 slowed=0$' \
     "$WORK/rproxy.err" \
     && pass "the behavior counters count the robots.txt read and the trap hit" \
     || fail "the behavior counters count the robots.txt read and the trap hit"
