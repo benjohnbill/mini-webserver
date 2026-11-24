@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -163,6 +164,7 @@ static bool origin_add(struct origin_list *list, const char *text);
 static bool block_key_add(struct rproxy_config *config, const char *key);
 static bool prefix_add(const char **prefixes, int *count, const char *prefix);
 static bool rproxy_start(struct rproxy *rproxy);
+static bool origins_resolve(struct origin_list *list);
 static bool defenses_start(struct rproxy *rproxy);
 static char *file_read_text(const char *path);
 static bool block_list_load(struct rproxy *rproxy);
@@ -450,10 +452,14 @@ static bool prefix_add(const char **prefixes, int *count, const char *prefix)
     return true;
 }
 
-/* Loads the certificate, the block list, and the JA4 table, and makes the
-   block table, the rate limit table, and the cache. */
+/* Resolves the Origins, loads the certificate, the block list, and the
+   JA4 table, and makes the block table, the rate limit table, and the
+   cache. */
 static bool rproxy_start(struct rproxy *rproxy)
 {
+    if (!origins_resolve(&rproxy->list)) {
+        return false;
+    }
     rproxy->context =
         tls_context_create(rproxy->config.cert_file, rproxy->config.key_file);
     if (rproxy->context == NULL) {
@@ -478,6 +484,23 @@ static bool rproxy_start(struct rproxy *rproxy)
         rproxy->cache = cache_create(&rproxy->config.cache_options);
         if (rproxy->cache == NULL) {
             fprintf(stderr, "rproxy: cache_create failed\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* Once at the start, as nginx resolves the names of an upstream when it
+   reads its configuration. An Event loop must not wait for DNS. */
+static bool origins_resolve(struct origin_list *list)
+{
+    for (size_t i = 0; i < list->count; i++) {
+        struct origin *origin = &list->origins[i];
+        int error = origin_resolve(origin);
+        if (error != 0) {
+            fprintf(stderr, "rproxy: cannot resolve %s:%s: %s\n", origin->host,
+                    origin->port, gai_strerror(error));
             return false;
         }
     }

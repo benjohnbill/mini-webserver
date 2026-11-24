@@ -2,7 +2,9 @@
 #define FORWARD_H
 
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <sys/socket.h>
 
 #include "http_parse.h"
 
@@ -15,6 +17,9 @@
 struct origin {
     char host[ORIGIN_HOST_MAX];
     char port[ORIGIN_PORT_MAX];
+    /* Set by origin_resolve, once at the start. */
+    struct sockaddr_storage address;
+    socklen_t address_len;
 };
 
 /* The Origins of --origin, in the order of the command line. next counts
@@ -28,6 +33,19 @@ struct origin_list {
 /* Parses "HOST:PORT" into origin. Returns 0, or -1 if a part is empty,
    too long, or the port is not a number from 1 to 65535. */
 int origin_parse(const char *text, struct origin *origin);
+
+/* Resolves the host and the port of origin into its address, with
+   getaddrinfo. Returns 0, or the getaddrinfo error code. */
+int origin_resolve(struct origin *origin);
+
+/* Starts a non-blocking connect to the address of origin. Returns the
+   socket, which is non-blocking and can still be in the connect, or -1
+   if the connect failed at once. */
+int origin_connect(const struct origin *origin);
+
+/* After a connect in progress makes origin_fd writable: true if the
+   connect worked. */
+bool origin_is_connected(int origin_fd);
 
 /* Returns the index of the Origin for the next request (Round-Robin).
    Safe to call from many Workers. list->count must be at least 1. */

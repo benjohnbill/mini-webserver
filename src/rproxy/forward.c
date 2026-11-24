@@ -31,8 +31,7 @@ static void text_append(struct text_cursor *cursor, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 static void text_append_bytes(struct text_cursor *cursor, const char *bytes,
                               size_t len);
-static int origin_connect(const struct origin *origin, int timeout);
-static int socket_connect(const struct addrinfo *addr, int timeout);
+static int origin_open(const struct origin *origin, int timeout);
 static bool socket_wait_connect(int origin_fd, int timeout);
 static void socket_set_timeouts(int origin_fd, int timeout);
 static int origin_send(int origin_fd, const char *bytes, size_t len);
@@ -56,6 +55,50 @@ int origin_parse(const char *text, struct origin *origin)
     memcpy(origin->port, port, port_len + 1);
 
     return 0;
+}
+
+int origin_resolve(struct origin *origin)
+{
+    struct addrinfo hints = {.ai_family = AF_UNSPEC,
+                             .ai_socktype = SOCK_STREAM};
+    struct addrinfo *found = NULL;
+    int error = getaddrinfo(origin->host, origin->port, &hints, &found);
+    if (error != 0) {
+        return error;
+    }
+    /* The first address only, so that one Origin is one address. */
+    memcpy(&origin->address, found->ai_addr, found->ai_addrlen);
+    origin->address_len = found->ai_addrlen;
+    freeaddrinfo(found);
+
+    return 0;
+}
+
+int origin_connect(const struct origin *origin)
+{
+    const struct sockaddr *address = (const struct sockaddr *)&origin->address;
+    int origin_fd = socket(address->sa_family,
+                           SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (origin_fd < 0) {
+        return -1;
+    }
+    if (connect(origin_fd, address, origin->address_len) != 0 &&
+        errno != EINPROGRESS) {
+        close(origin_fd);
+        return -1;
+    }
+
+    return origin_fd;
+}
+
+bool origin_is_connected(int origin_fd)
+{
+    int error = 0;
+    socklen_t error_len = sizeof(error);
+    int result =
+        getsockopt(origin_fd, SOL_SOCKET, SO_ERROR, &error, &error_len);
+
+    return result == 0 && error == 0;
 }
 
 size_t origin_list_pick(struct origin_list *list)
@@ -98,10 +141,10 @@ int forward_fetch(const struct origin_list *list, size_t first,
 {
     *reply = NULL;
     *reply_len = 0;
-    int origin_fd = origin_connect(&list->origins[first], timeout);
+    int origin_fd = origin_open(&list->origins[first], timeout);
     if (origin_fd < 0 && list->count > 1) {
         origin_fd =
-            origin_connect(&list->origins[(first + 1) % list->count], timeout);
+            origin_open(&list->origins[(first + 1) % list->count], timeout);
     }
     if (origin_fd < 0) {
         return 502;
@@ -164,47 +207,21 @@ static void text_append_bytes(struct text_cursor *cursor, const char *bytes,
     cursor->used += len;
 }
 
-/* Returns a connected socket with SO_RCVTIMEO and SO_SNDTIMEO set, or -1. */
-static int origin_connect(const struct origin *origin, int timeout)
+/* Returns a connected blocking socket with SO_RCVTIMEO and SO_SNDTIMEO
+   set, or -1. The connect ends in timeout seconds. */
+static int origin_open(const struct origin *origin, int timeout)
 {
-    struct addrinfo hints = {.ai_family = AF_UNSPEC,
-                             .ai_socktype = SOCK_STREAM};
-    struct addrinfo *found = NULL;
-    if (getaddrinfo(origin->host, origin->port, &hints, &found) != 0) {
-        return -1;
-    }
-    int origin_fd = -1;
-    for (struct addrinfo *addr = found; addr != NULL && origin_fd < 0;
-         addr = addr->ai_next) {
-        origin_fd = socket_connect(addr, timeout);
-    }
-    freeaddrinfo(found);
-    if (origin_fd >= 0) {
-        socket_set_timeouts(origin_fd, timeout);
-    }
-
-    return origin_fd;
-}
-
-/* A non-blocking connect, so that a connect that hangs ends in timeout
-   seconds. The socket is blocking again on return. */
-static int socket_connect(const struct addrinfo *addr, int timeout)
-{
-    int origin_fd =
-        socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+    int origin_fd = origin_connect(origin);
     if (origin_fd < 0) {
         return -1;
     }
-    int flags = fcntl(origin_fd, F_GETFL, 0);
-    fcntl(origin_fd, F_SETFL, flags | O_NONBLOCK);
-    bool is_connected =
-        connect(origin_fd, addr->ai_addr, addr->ai_addrlen) == 0 ||
-        (errno == EINPROGRESS && socket_wait_connect(origin_fd, timeout));
-    if (!is_connected) {
+    if (!socket_wait_connect(origin_fd, timeout)) {
         close(origin_fd);
         return -1;
     }
-    fcntl(origin_fd, F_SETFL, flags);
+    int flags = fcntl(origin_fd, F_GETFL, 0);
+    fcntl(origin_fd, F_SETFL, flags & ~O_NONBLOCK);
+    socket_set_timeouts(origin_fd, timeout);
 
     return origin_fd;
 }
@@ -213,14 +230,8 @@ static bool socket_wait_connect(int origin_fd, int timeout)
 {
     struct pollfd watch = {.fd = origin_fd, .events = POLLOUT};
     int ready = poll(&watch, 1, timeout * MS_PER_SECOND);
-    if (ready <= 0) {
-        return false;
-    }
-    int error = 0;
-    socklen_t error_len = sizeof(error);
-    getsockopt(origin_fd, SOL_SOCKET, SO_ERROR, &error, &error_len);
 
-    return error == 0;
+    return ready > 0 && origin_is_connected(origin_fd);
 }
 
 static void socket_set_timeouts(int origin_fd, int timeout)
