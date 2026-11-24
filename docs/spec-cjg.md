@@ -562,3 +562,83 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 11. Web Bot Auth and 402. Done (2026-11-24). The flags: `--pay-prefix PATH` and `--bot-key FILE`. A 402 logs the Verdict `pay`. `tests/data/bot_test_key.pem` is a test key for `tests/rproxy_func.sh` only.
 12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes. Done (2026-11-24). Results: [`20261124-arena-layers.md`](measurements/20261124-arena-layers.md). The Scene shows one cost: a tarpit holds an rproxy Worker, so `disguised` starves `human.py`.
 13. Event loops in place of the pool (section "Event loops"). Done (2026-11-24). Results: [`20261124-arena-layers.md`](measurements/20261124-arena-layers.md), section "After step 13". Two rows changed in the build: the handshake deadline is 5 s from its start and does not move, because OpenSSL does not show the progress of a handshake. The drain has 1 s in all, not 1 s for each read. `timer_heap` and its tests first. The flag `--workers` of `rproxy` becomes `--loops`, and `--connections` is new. `tests/rproxy_func.sh` checks that a tarpit and a Stuck connection do not hold another client on one loop. Then the `layers` Scene of `disguised` runs again.
+
+## 12. Back pressure demo (2026-11-25)
+
+The team chose Back pressure as the core feature of the Reverse Proxy. The owner of this branch presents the demo: 2 minutes on 2026-11-26, after 2 minutes of team overview and theory. The demo must be ready by the evening of 2026-11-25. The design came from a grilling session with the owner on 2026-11-25.
+
+### Goal
+
+The demo shows Back pressure as the only hero. All other features of `rproxy` (TLS Verdicts, JA4, rate limit, cache) are off, and the demo does not name them. Owner: "back pressure가 주인공이 되도록 하는게 맞는 것 같아."
+
+Definition (from a teammate, to confirm with the team): `rproxy` reads from the Origin only as fast as the client reads. Each connection has a write buffer with a limit. When the buffer is full, `rproxy` stops reading the Origin socket. When the client takes bytes, `rproxy` reads again. TCP then carries "slow down" back to the Origin.
+
+### Stage and story
+
+The stage is an app update day: many phones on slow networks download one large file at the same time. The real case is 500 phones, 100 MB, 33 minutes. The demo uses the same ratios at a small size and says so. Each Act runs the same load with one Relay mode. The Acts form one chain: each fix leaves a new problem, and the next Act starts from it. Owner: "고민을 많이 했음이 그렇게 스토리와 서사로 드러나면 더 재미있지 않을까."
+
+| Act | Relay mode | Limit | Server | Phones | Bystander `curl` | What the presenter says |
+|---|---|---|---|---|---|---|
+| 1 | `unbounded` | nothing | killed by the OOM killer | all fail | connection refused | "With no limit, this happens." |
+| 2 | `reply-cap` | reply size (4 MiB, the current code) | alive | all get 502 | 200 | "Our code is like this now." |
+| 3 | `conn-cap` | Origin exchanges in progress (20) | alive, CPU idle | 20 finish, the rest get 503 | 503 | "The branch of a teammate is like this." |
+| 4 | `backpressure` | speed: a 64 KB buffer for each connection | alive, flat memory | all finish at their own speed | 200 | "The real cause was speed." |
+| 5 (epilogue, optional) | `backpressure`, Origin `--model pool` | as Act 4 | alive | only 4 move | 200 | "Now slow phones hold the Origin." |
+
+Time plan: stage 0–10 s, Act 1 10–35 s, Act 2 35–50 s, Act 3 50–65 s, Act 4 65–110 s, end 110–120 s. Acts 2 and 3 are short because their ending is the same: the server lives and the users fail. Act 5 goes in only if a rehearsal leaves time.
+
+"We had this" applies only to Acts 2 and 3. Act 2 is the code of `CJG` now (`ORIGIN_REPLY_MAX`). Act 3 is the 503 queue of the branch `hjm`. Act 1 is a build with the limit removed.
+
+The presenter runs the demo live on the laptop of the owner. A recording is the backup only. Owner: "백업이 될 수 있는 걸로."
+
+### Values
+
+All values are options of the demo tool, so a run can change them.
+
+| Value | Demo value | Why |
+|---|---|---|
+| Phones | 200 | |
+| Arrival time | 15 s for all phones (about 13 each second) | All Acts use the same arrival, so the comparison is fair |
+| File size | 8 MB | It must be larger than the 4 MiB limit of Act 2 |
+| Phone speed | 400 KB/s | One phone finishes in 20 s |
+| Memory limit (`systemd-run --user --scope -p MemoryMax`) | 1 GB | Act 1 dies at about 128 phones, about 10 s after the start |
+| Act 3 limit | 20 | |
+| Act 4 buffer | 64 KB | |
+| Origin | `./server --model epoll` in all Acts | A `pool` Origin stalls slow readers (see "Facts") |
+| Cache | off | The cache stores a whole reply |
+
+### Facts that shaped the design (checked 2026-11-25)
+
+- `rproxy` needs TLS (`--cert`, `--key`). So the phones speak TLS, and the memory of Act 4 includes the OpenSSL buffers. Say the measured number, not 13 MB.
+- A connection runs its steps in a line: it reads the whole Origin reply (`origin_read_step`), then it sends (`reply_step`). Act 4 needs a new step that reads the Origin and writes the client in turns.
+- The Origin exchange has one deadline from its start (`--origin-timeout`, default 5 s). In Act 4 the exchange stays open for the whole download. So in `backpressure` the deadline moves at each Origin read: it closes the exchange only after 5 s with no bytes. Owner accepted this on 2026-11-25. nginx `proxy_read_timeout` also measures the time between two reads.
+- The Origin default is `--model pool` with 4 Workers. A slow reader holds a Worker. `bench/demo/slow_origin_probe.py` showed it: with 12 slow readers, 4 got bytes and 8 got none in 6 s with `pool`. With `epoll`, all 12 got bytes. This result is also the epilogue.
+- `--connections N` closes a connection over the limit with no reply. Act 3 needs a visible 503, so `conn-cap` sends a 503 reply.
+- The rate limit is off by default (`--rate 0`). All phones come from 127.0.0.1 and get no 429.
+
+### `rproxy` flags
+
+| Flag | Meaning |
+|---|---|
+| `--relay unbounded` | Read the whole Origin reply into memory, with no size limit |
+| `--relay reply-cap` | The default and the behavior before 2026-11-25: read the whole reply, 502 over `ORIGIN_REPLY_MAX` |
+| `--relay conn-cap` | As `reply-cap`, but with more than `--relay-conns N` (default 20) Origin exchanges in progress in the process, reply 503 |
+| `--relay backpressure` | Read the Origin only when the write buffer of the connection has room (`--relay-buffer BYTES`, default 65536). The Origin deadline moves at each read. It does not start with `--cache on` |
+
+### Demo tool (`bench/demo/`)
+
+| File | What it does |
+|---|---|
+| `demo.sh act N [dry\|rec]` | It starts the Origin once. For each Act it starts `rproxy` with the Relay mode inside a memory-limited scope, waits until it answers, resets the dashboard, and starts the phones. `dry` and `rec` follow the recording flow of the herz hackathon demo |
+| `phones.py` | It opens N TLS connections over the arrival time and reads each at the phone speed. It writes the state of each phone (waiting, receiving, done, 502, 503, cut) and its bytes to a status file |
+| `dashboard.py` | A terminal dashboard (`rich`): the phone grid, the memory line of `rproxy` with the limit, speed bars, CPU, and a counter line |
+| `bystander.sh` | One `curl` of `index.html` through `rproxy`, for the presenter to type in each Act |
+| `slow_origin_probe.py` | The probe that showed the `pool` stall |
+
+The screen is one terminal split in two: commands and `curl` on the left, the dashboard on the right.
+
+### Order of work
+
+1. `rproxy --relay`, with checks in `tests/rproxy_func.sh`. The tools in parallel: `phones.py` and `dashboard.py`, first against the current `rproxy`.
+2. `demo.sh` and a full run of Acts 1, 2, and 4.
+3. Act 3, then the recording, then Act 5. If time is short, cut from the end of this list.

@@ -109,3 +109,21 @@ _Avoid_: bot token, signed agent, verified bot (use it only for a bot whose sign
 **Crawler script**:
 A program in `bench/arena/` that acts as one kind of crawler against the Reverse Proxy. A Scene runs Crawler scripts and counts the Verdicts and the load on the Origin.
 _Avoid_: bot, attacker, attack script
+
+## Back pressure demo
+
+**Back pressure**:
+The Reverse Proxy reads from the Origin only as fast as the client reads from the Reverse Proxy. Each connection has a write buffer with a limit. When the buffer is full, the Reverse Proxy stops reading the Origin socket.
+_Avoid_: flow control (the TCP mechanism under it), throttling, rate limit
+
+**Relay mode**:
+The way the Reverse Proxy moves a reply from the Origin to the client: `unbounded`, `reply-cap`, `conn-cap`, or `backpressure`. The flag `--relay` selects it.
+_Avoid_: buffer mode, proxy mode
+
+**Act**:
+One part of the Back pressure demo. Each Act runs the same load with one Relay mode. The Acts are 1 to 4, and 5 is the epilogue.
+_Avoid_: chapter, scene (a Scene is a measurement)
+
+**Phone**:
+One slow client of the demo load program `bench/demo/phones.py`. It reads at a fixed speed.
+_Avoid_: bot, crawler, user
