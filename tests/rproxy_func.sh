@@ -467,10 +467,15 @@ kill "$stuck_pid" 2>/dev/null; wait "$stuck_pid" 2>/dev/null
 
 # Many clients at once on few loops: each one gets its reply.
 start_proxy --origin "$HOST:$SERVER_PORT" --loops 2
-for i in $(seq 1 40); do
-    curl -sk --max-time 5 -o /dev/null -w '%{http_code}\n' "$BASE/" &
-done > "$WORK/many"
-wait
+# Wait for the curl jobs only: a bare wait also waits for the Origins.
+: > "$WORK/many"
+many_pids=()
+for _ in $(seq 1 40); do
+    curl -sk --max-time 5 -o /dev/null -w '%{http_code}\n' "$BASE/" \
+        >> "$WORK/many" &
+    many_pids+=($!)
+done
+wait "${many_pids[@]}"
 [ "$(grep -c '^200$' "$WORK/many")" = "40" ] \
     && pass "40 clients at once on 2 Event loops all get 200" \
     || fail "40 clients at once on 2 Event loops all get 200: $(sort "$WORK/many" | uniq -c | tr '\n' ' ')"
