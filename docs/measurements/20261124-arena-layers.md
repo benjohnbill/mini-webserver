@@ -39,6 +39,18 @@ A Scene measures. It does not pass or fail.
 - **human.py**: one 401 in each run. It solves the proof of work for `/api/time` once and then sends the solution again inside its window.
 - **disguised: neither client got a reply.** disguised sends a Chrome User-Agent with the JA4 of curl, so each request gets tarpit. A tarpit holds an rproxy Worker for `--tarpit` seconds. disguised opens enough connections to hold every Worker, so human.py waits in the queue for the full 10 s. This is a cost of the tarpit design (SPEC §11: a tarpit holds a Worker). A tarpit that does not hold a Worker (an event loop timer, or a drop) removes it.
 
-## Known limit outside this Scene
+## After step 13: Event loops
+
+Commit: `a1e0984`. Command: `bench/arena/scene.sh disguised layers layers-1loop`. `layers-1loop` is `layers` with `--loops 1`. Full table: `20261124-arena-disguised-v3.md`.
+
+| rproxy | disguised replies | human.py |
+|---|---|---|
+| pool, 4 Workers (before) | 0 | **0 replies** |
+| Event loops, one for each core (22) | 0 | 200=20 401=1 |
+| One Event loop | 0 | 200=25 401=1 |
+
+disguised still gets no reply: each of its requests waits 10 s in the tarpit, and the Scene is 10 s. human.py now gets the same replies as in the other Scenes, also with one Event loop. So the cause was the pool, not the count of threads. A tarpit now costs the server one timer and one socket. The client still waits the full 10 s.
+
+
 
 The Origin answers 404 for a static path with a query string (`/bench/f001.txt?x`). `solver.py` sends no query for this reason.

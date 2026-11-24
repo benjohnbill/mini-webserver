@@ -63,6 +63,7 @@ preset_flags() {
     rate-ja4) echo "--rate 5 --burst 10 --rate-key ja4" ;;
     all) echo "--cache on$CACHE_FLAG --rate 5 --burst 10 --rate-key ja4" ;;
     layers) echo "$LAYERS_FLAGS" ;;
+    layers-1loop) echo "$LAYERS_FLAGS --loops 1" ;;
     *) return 1 ;;
     esac
 }
