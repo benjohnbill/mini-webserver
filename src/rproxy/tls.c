@@ -12,6 +12,9 @@ struct tls_session {
     SSL *ssl;
 };
 
+static enum tls_status session_get_status(struct tls_session *session,
+                                          int result);
+
 struct tls_context *tls_context_create(const char *cert_file,
                                        const char *key_file)
 {
@@ -32,6 +35,11 @@ struct tls_context *tls_context_create(const char *cert_file,
         tls_context_destroy(context);
         return NULL;
     }
+    /* A send can finish part of the bytes, and the caller can send the
+       rest from a buffer that moved (SSL_CTX_set_mode(3)). */
+    SSL_CTX_set_mode(context->ssl_context,
+                     SSL_MODE_ENABLE_PARTIAL_WRITE |
+                         SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
     return context;
 }
@@ -52,52 +60,70 @@ struct tls_session *tls_session_create(struct tls_context *context, int conn_fd)
         return NULL;
     }
     session->ssl = SSL_new(context->ssl_context);
-    if (session->ssl == NULL || SSL_set_fd(session->ssl, conn_fd) != 1 ||
-        SSL_accept(session->ssl) != 1) {
-        /* A failed handshake is the client's fault: drop the errors. */
+    if (session->ssl == NULL || SSL_set_fd(session->ssl, conn_fd) != 1) {
         ERR_clear_error();
         SSL_free(session->ssl);
         free(session);
         return NULL;
     }
+    SSL_set_accept_state(session->ssl);
 
     return session;
 }
 
+/* One SSL_shutdown only: a second call would wait for the close_notify
+   of the client, and rproxy closes the socket after this. */
 void tls_session_destroy(struct tls_session *session)
 {
     if (session == NULL) {
         return;
     }
-    SSL_shutdown(session->ssl);
+    if (SSL_is_init_finished(session->ssl)) {
+        SSL_shutdown(session->ssl);
+    }
     ERR_clear_error();
     SSL_free(session->ssl);
     free(session);
 }
 
-size_t tls_session_read(struct tls_session *session, char *buffer, size_t size)
+enum tls_status tls_session_handshake(struct tls_session *session)
 {
-    size_t count = 0;
-    if (SSL_read_ex(session->ssl, buffer, size, &count) != 1) {
-        ERR_clear_error();
-        return 0;
-    }
-
-    return count;
+    return session_get_status(session, SSL_do_handshake(session->ssl));
 }
 
-bool tls_session_send(struct tls_session *session, const char *bytes,
-                      size_t len)
+enum tls_status tls_session_read(struct tls_session *session, char *buffer,
+                                 size_t size, size_t *count)
 {
-    for (size_t sent = 0; sent < len;) {
-        size_t written = 0;
-        if (SSL_write_ex(session->ssl, bytes + sent, len - sent, &written) !=
-            1) {
-            ERR_clear_error();
-            return false;
-        }
-        sent += written;
-    }
+    *count = 0;
 
-    return true;
+    return session_get_status(session,
+                              SSL_read_ex(session->ssl, buffer, size, count));
+}
+
+enum tls_status tls_session_send(struct tls_session *session, const char *bytes,
+                                 size_t len, size_t *count)
+{
+    *count = 0;
+
+    return session_get_status(session,
+                              SSL_write_ex(session->ssl, bytes, len, count));
+}
+
+/* result is the return value of an SSL call: 1 is success. A failed
+   step is the fault of the client: drop the errors. */
+static enum tls_status session_get_status(struct tls_session *session,
+                                          int result)
+{
+    if (result == 1) {
+        return TLS_DONE;
+    }
+    switch (SSL_get_error(session->ssl, result)) {
+    case SSL_ERROR_WANT_READ:
+        return TLS_WANT_READ;
+    case SSL_ERROR_WANT_WRITE:
+        return TLS_WANT_WRITE;
+    default:
+        ERR_clear_error();
+        return TLS_CLOSED;
+    }
 }

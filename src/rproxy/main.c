@@ -247,6 +247,10 @@ static void client_block(struct rproxy *rproxy,
                          const struct exchange *exchange);
 static void tarpit_hold(int seconds);
 static void connection_drain(int conn_fd);
+static struct tls_session *session_open(struct tls_context *context,
+                                        int conn_fd);
+static bool session_send_all(struct tls_session *session, const char *bytes,
+                             size_t len);
 static void exchange_log(const struct exchange *exchange);
 static void behavior_log(const struct exchange *exchange);
 
@@ -803,7 +807,7 @@ static void connection_serve(struct rproxy *rproxy, int conn_fd)
         return;
     }
 
-    struct tls_session *session = tls_session_create(rproxy->context, conn_fd);
+    struct tls_session *session = session_open(rproxy->context, conn_fd);
     if (session == NULL) {
         exchange.verdict_name = "no-handshake";
         exchange_log(&exchange);
@@ -971,11 +975,13 @@ static bool buffer_reserve(struct request_buffer *buffer, size_t capacity)
 static bool buffer_read_some(struct tls_session *session,
                              struct request_buffer *buffer)
 {
-    size_t count = tls_session_read(session, buffer->data + buffer->used,
-                                    buffer->capacity - buffer->used);
+    size_t count = 0;
+    enum tls_status status =
+        tls_session_read(session, buffer->data + buffer->used,
+                         buffer->capacity - buffer->used, &count);
     buffer->used += count;
 
-    return count > 0;
+    return status == TLS_DONE;
 }
 
 /* A short text reply of rproxy itself. header_lines is NULL, or more
@@ -993,7 +999,7 @@ static void reply_send_status(struct tls_session *session, int status,
                        "Content-Length: %d\r\n%sConnection: close\r\n\r\n%s",
                        status, reason, body_len,
                        header_lines != NULL ? header_lines : "", body);
-    tls_session_send(session, text, (size_t)len);
+    session_send_all(session, text, (size_t)len);
     exchange->status = status;
     exchange->reply_bytes = (size_t)len;
 }
@@ -1244,15 +1250,15 @@ static void reply_send(struct tls_session *session, const char *reply,
     const char *line_end =
         cache_name == NULL ? NULL : memchr(reply, '\n', reply_len);
     if (line_end == NULL) {
-        tls_session_send(session, reply, reply_len);
+        session_send_all(session, reply, reply_len);
         return;
     }
     size_t status_len = (size_t)(line_end - reply) + 1;
     const char *header = strcmp(cache_name, "hit") == 0 ? "X-Cache: HIT\r\n"
                                                         : "X-Cache: MISS\r\n";
-    if (tls_session_send(session, reply, status_len) &&
-        tls_session_send(session, header, strlen(header))) {
-        tls_session_send(session, reply + status_len, reply_len - status_len);
+    if (session_send_all(session, reply, status_len) &&
+        session_send_all(session, header, strlen(header))) {
+        session_send_all(session, reply + status_len, reply_len - status_len);
     }
 }
 
@@ -1299,7 +1305,7 @@ static bool not_modified_send(struct tls_session *session, const char *reply,
     if (len < 0 || (size_t)len >= sizeof(text)) {
         return false;
     }
-    tls_session_send(session, text, (size_t)len);
+    session_send_all(session, text, (size_t)len);
     exchange->status = 304;
     exchange->reply_bytes = is_hit ? (size_t)len : reply_len;
 
@@ -1356,6 +1362,34 @@ static void connection_drain(int conn_fd)
             return;
         }
     }
+}
+
+/* The socket is blocking with timeouts, so a want means a timeout. */
+static struct tls_session *session_open(struct tls_context *context,
+                                        int conn_fd)
+{
+    struct tls_session *session = tls_session_create(context, conn_fd);
+    if (session != NULL && tls_session_handshake(session) != TLS_DONE) {
+        tls_session_destroy(session);
+        return NULL;
+    }
+
+    return session;
+}
+
+static bool session_send_all(struct tls_session *session, const char *bytes,
+                             size_t len)
+{
+    for (size_t sent = 0; sent < len;) {
+        size_t count = 0;
+        if (tls_session_send(session, bytes + sent, len - sent, &count) !=
+            TLS_DONE) {
+            return false;
+        }
+        sent += count;
+    }
+
+    return true;
 }
 
 /* One line for each connection: client IP, JA4, Verdict, cache result,
