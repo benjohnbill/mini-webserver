@@ -79,7 +79,7 @@ The Verdict after the request parse. It is pass, deny (403), slow down (429), ta
 _Avoid_: HTTP Verdict, late Verdict
 
 **Block table**:
-The keys (a client IP or a JA4) that the Reverse Proxy blocks until a time. The connection Verdict reads it. A honeypot hit adds a key.
+The keys (a client IP or a JA4) that the Reverse Proxy blocks until a time. The connection Verdict reads it. A honeypot hit, a scanner, and a client over the rate limit after five 429 replies add a key.
 _Avoid_: ban list, jail, deny list (the block list is the file of CIDR ranges, which does not change at run time)
 
 **Block list**:
@@ -91,7 +91,7 @@ The file that `--ja4-list` names: a JA4 and a label on each line, for example `c
 _Avoid_: fingerprint database, JA4 list (the flag name only)
 
 **Behavior counter**:
-A count for each key of the Reverse Proxy: requests, distinct targets, 404 replies, `robots.txt` reads, and honeypot hits. The key is the client IP. The counts start again at zero when the window of the key ends.
+A count for each key of the Reverse Proxy: requests, distinct targets, 404 replies, 429 replies, `robots.txt` reads, and honeypot hits. The key is the client IP. The counts start again at zero when the window of the key ends.
 _Avoid_: stats, metrics, score
 
 **Honeypot**:
