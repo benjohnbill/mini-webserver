@@ -69,7 +69,8 @@ int origin_resolve(struct origin *origin)
     return 0;
 }
 
-int origin_connect(const struct origin *origin, size_t index)
+int origin_connect(const struct origin *origin, size_t index,
+                   int receive_buffer)
 {
     const struct sockaddr *address =
         (const struct sockaddr *)&origin->addresses[index];
@@ -77,6 +78,10 @@ int origin_connect(const struct origin *origin, size_t index)
                            SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (origin_fd < 0) {
         return -1;
+    }
+    if (receive_buffer > 0) {
+        setsockopt(origin_fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+                   sizeof(receive_buffer));
     }
     if (connect(origin_fd, address, origin->address_lens[index]) != 0 &&
         errno != EINPROGRESS) {

@@ -46,6 +46,12 @@
 /* Anubis DefaultDifficulty is 4 leading zero hex digits: 16 bits. */
 #define DEFAULT_POW_BITS 16
 #define NANOSECONDS_PER_SECOND 1e9
+/* SPEC 12, "Values": the Act 3 limit and the Act 4 buffer. */
+#define DEFAULT_RELAY_CONNS 20
+#define DEFAULT_RELAY_BUFFER 65536
+/* One TLS record body, so that one send has bytes to give. */
+#define RELAY_BUFFER_MIN 16384
+#define RELAY_BUFFER_MAX 67108864
 
 /* One Event loop and the thread that runs it. */
 struct loop_thread {
@@ -61,10 +67,12 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
 static bool number_parse(const char *text, long min, long max, int *number);
 static bool real_parse(const char *text, double min, double *number);
 static bool rate_key_parse(const char *text, enum rate_key *rate_key);
+static bool relay_mode_parse(const char *text, enum relay_mode *relay_mode);
 static bool origin_add(struct origin_list *list, const char *text);
 static bool block_key_add(struct rproxy_config *config, const char *key);
 static bool prefix_add(const char **prefixes, int *count, const char *prefix);
 static bool rproxy_start(struct rproxy *rproxy);
+static bool relay_is_valid(const struct rproxy_config *config);
 static bool origins_resolve(struct origin_list *list);
 static bool defenses_start(struct rproxy *rproxy);
 static double clock_get_seconds(void);
@@ -96,7 +104,9 @@ int main(int argc, char **argv)
                 "[--cache-lock global|striped] [--block-list FILE] "
                 "[--ja4-list FILE] [--block-time S] [--block-key KEY ...] "
                 "[--pow-prefix PATH ...] [--pow-bits N] "
-                "[--pay-prefix PATH ...] [--bot-key FILE]\n");
+                "[--pay-prefix PATH ...] [--bot-key FILE] "
+                "[--relay unbounded|reply-cap|conn-cap|backpressure] "
+                "[--relay-conns N] [--relay-buffer BYTES]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -121,11 +131,14 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
                    .burst = DEFAULT_BURST,
                    .tarpit = DEFAULT_TARPIT,
                    .block_time = DEFAULT_BLOCK_TIME,
-                   .pow_bits = DEFAULT_POW_BITS},
+                   .pow_bits = DEFAULT_POW_BITS,
+                   .relay_conns = DEFAULT_RELAY_CONNS,
+                   .relay_buffer = DEFAULT_RELAY_BUFFER},
     };
     cache_options_init(&rproxy->config.cache_options);
     atomic_init(&rproxy->list.next, 0);
     atomic_init(&rproxy->is_stopping, false);
+    atomic_init(&rproxy->origin_exchanges, 0);
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc || !option_parse(rproxy, argv[i], argv[i + 1])) {
             return false;
@@ -217,6 +230,16 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
         config->bot_key_file = value;
         return true;
     }
+    if (strcmp(name, "--relay") == 0) {
+        return relay_mode_parse(value, &config->relay_mode);
+    }
+    if (strcmp(name, "--relay-conns") == 0) {
+        return number_parse(value, 1, CONNECTIONS_MAX, &config->relay_conns);
+    }
+    if (strcmp(name, "--relay-buffer") == 0) {
+        return number_parse(value, RELAY_BUFFER_MIN, RELAY_BUFFER_MAX,
+                            &config->relay_buffer);
+    }
     return cache_options_parse(&config->cache_options, name, value);
 }
 
@@ -261,6 +284,21 @@ static bool rate_key_parse(const char *text, enum rate_key *rate_key)
     return false;
 }
 
+static bool relay_mode_parse(const char *text, enum relay_mode *relay_mode)
+{
+    /* In the order of enum relay_mode. */
+    static const char *const names[] = {"reply-cap", "unbounded", "conn-cap",
+                                        "backpressure"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(text, names[i]) == 0) {
+            *relay_mode = (enum relay_mode)i;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool origin_add(struct origin_list *list, const char *text)
 {
     if (list->count == ORIGIN_MAX ||
@@ -298,7 +336,7 @@ static bool prefix_add(const char **prefixes, int *count, const char *prefix)
    cache. */
 static bool rproxy_start(struct rproxy *rproxy)
 {
-    if (!origins_resolve(&rproxy->list)) {
+    if (!relay_is_valid(&rproxy->config) || !origins_resolve(&rproxy->list)) {
         return false;
     }
     rproxy->context =
@@ -327,6 +365,20 @@ static bool rproxy_start(struct rproxy *rproxy)
             fprintf(stderr, "rproxy: cache_create failed\n");
             return false;
         }
+    }
+
+    return true;
+}
+
+/* SPEC 12: the cache stores a whole reply, and backpressure never holds
+   one. */
+static bool relay_is_valid(const struct rproxy_config *config)
+{
+    if (config->relay_mode == RELAY_BACKPRESSURE &&
+        config->cache_options.is_on) {
+        fprintf(stderr, "rproxy: --relay backpressure does not work with "
+                        "--cache on\n");
+        return false;
     }
 
     return true;

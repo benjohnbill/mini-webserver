@@ -72,6 +72,7 @@ enum connection_state {
     STATE_ORIGIN_CONNECT,
     STATE_ORIGIN_SEND,
     STATE_ORIGIN_READ,
+    STATE_RELAY, /* backpressure: read the Origin and send in turns */
     STATE_REPLY, /* send the reply to the client */
     STATE_DRAIN, /* read and drop the rest after an error reply */
     STATE_CLOSED /* freed at the end of the loop turn */
@@ -109,6 +110,17 @@ struct request_buffer {
     size_t capacity;
 };
 
+/* RELAY_BACKPRESSURE: the bytes from the Origin that the client did not
+   take yet. data[sent] to data[used] waits for the client, and data[used]
+   to data[capacity] is the room for the Origin. */
+struct relay_buffer {
+    char *data;
+    size_t capacity;
+    size_t used;
+    size_t sent;
+    bool origin_is_done; /* the Origin sent EOF */
+};
+
 struct reply_part {
     const char *bytes;
     size_t len;
@@ -122,6 +134,7 @@ struct connection {
     struct endpoint client_end;
     struct endpoint origin_end;
     uint32_t client_events; /* what conn_fd waits for: EPOLLIN or EPOLLOUT */
+    uint32_t origin_events; /* what origin_fd waits for: 0 is nothing */
     struct timer timer;     /* the deadline of the current state */
     size_t hello_len;       /* the bytes of the last ClientHello peek */
     /* NULL before the handshake, and after the close_notify */
@@ -139,6 +152,8 @@ struct connection {
     char *reply; /* from the Origin or the cache */
     size_t reply_len;
     size_t reply_capacity;
+    struct relay_buffer relay;
+    bool holds_exchange_slot;             /* RELAY_CONN_CAP: until the close */
     char status_text[REPLY_TEXT_MAX * 2]; /* a reply of rproxy itself */
     struct reply_part parts[REPLY_PARTS_MAX];
     int part_count;
@@ -224,14 +239,29 @@ static bool not_modified_plan(struct connection *connection);
 static void reply_plan_parts(struct connection *connection,
                              const char *cache_name);
 static enum step origin_exchange_start(struct connection *connection);
+static int exchange_slot_take(struct connection *connection);
+static void client_send_buffer_cap(struct connection *connection);
 static bool origin_request_format(struct connection *connection);
 static enum step origin_connect_start(struct connection *connection);
+static int origin_get_receive_buffer(const struct rproxy *rproxy);
 static enum step origin_connect_retry(struct connection *connection);
 static void origin_socket_close(struct connection *connection);
 static enum step origin_exchange_end(struct connection *connection, int status);
 static enum step origin_connect_step(struct connection *connection);
 static enum step origin_send_step(struct connection *connection);
+static void connection_watch_origin(struct connection *connection,
+                                    uint32_t events);
+static enum step relay_start(struct connection *connection);
+static enum step relay_step(struct connection *connection);
+static bool relay_read_origin(struct connection *connection, bool *has_moved);
+static void relay_compact(struct relay_buffer *relay);
+static void relay_end_origin(struct connection *connection);
+static enum tls_status relay_send_client(struct connection *connection,
+                                         bool *has_moved);
+static enum step relay_wait(struct connection *connection,
+                            enum tls_status status, bool has_moved);
 static enum step origin_read_step(struct connection *connection);
+static bool reply_is_over_cap(const struct connection *connection);
 static bool reply_reserve(struct connection *connection);
 static enum step reply_step(struct connection *connection);
 static void reply_advance(struct connection *connection, size_t count);
@@ -242,6 +272,8 @@ static void exchange_log(const struct exchange *exchange);
 static void behavior_log(const struct exchange *exchange);
 static void loop_expire_timers(struct event_loop *loop);
 static void connection_expire(struct connection *connection);
+static void relay_expire(struct connection *connection);
+static void exchange_slot_release(struct connection *connection);
 static void loop_free_closed(struct event_loop *loop);
 static void loop_close_all(struct event_loop *loop);
 
@@ -389,7 +421,9 @@ static void loop_dispatch(struct event_loop *loop,
     bool is_at_origin = state == STATE_ORIGIN_CONNECT ||
                         state == STATE_ORIGIN_SEND ||
                         state == STATE_ORIGIN_READ;
-    if (state != STATE_CLOSED && end->is_origin == is_at_origin) {
+    /* A relay waits for both sockets. */
+    if (state == STATE_RELAY ||
+        (state != STATE_CLOSED && end->is_origin == is_at_origin)) {
         connection_advance(connection);
     }
 }
@@ -515,6 +549,8 @@ static enum step connection_step(struct connection *connection)
         return origin_send_step(connection);
     case STATE_ORIGIN_READ:
         return origin_read_step(connection);
+    case STATE_RELAY:
+        return relay_step(connection);
     case STATE_REPLY:
         return reply_step(connection);
     case STATE_DRAIN:
@@ -810,6 +846,8 @@ static const char *status_get_reason(int status)
         return "Request Header Fields Too Large";
     case 502:
         return "Bad Gateway";
+    case 503:
+        return "Service Unavailable";
     case 504:
         return "Gateway Timeout";
     case 505:
@@ -1112,12 +1150,17 @@ static void reply_plan_parts(struct connection *connection,
 }
 
 /* The whole exchange with the Origin, the connects included, must end in
-   --origin-timeout seconds. */
+   --origin-timeout seconds. In backpressure only the connect and the send
+   must: then the deadline moves at each Origin read. */
 static enum step origin_exchange_start(struct connection *connection)
 {
     struct rproxy *rproxy = connection->loop->rproxy;
-    if (!origin_request_format(connection)) {
-        status_reply_plan(connection, 500, NULL);
+    int status = exchange_slot_take(connection);
+    if (status == 0 && !origin_request_format(connection)) {
+        status = 500;
+    }
+    if (status != 0) {
+        status_reply_plan(connection, status, NULL);
         return reply_start(connection);
     }
     connection->origin_index = origin_list_pick(&rproxy->list);
@@ -1125,6 +1168,39 @@ static enum step origin_exchange_start(struct connection *connection)
     connection_set_deadline(connection, rproxy->config.origin_timeout);
 
     return origin_connect_start(connection);
+}
+
+/* RELAY_CONN_CAP (SPEC 12, Act 3): one slot of --relay-conns for each
+   connection that reaches an Origin. It stays taken until the connection
+   closes, so a slow client holds it for its whole download. Returns 0, or
+   503 if no slot is free. */
+static int exchange_slot_take(struct connection *connection)
+{
+    struct rproxy *rproxy = connection->loop->rproxy;
+    if (rproxy->config.relay_mode != RELAY_CONN_CAP) {
+        return 0;
+    }
+    int in_progress = atomic_fetch_add(&rproxy->origin_exchanges, 1);
+    if (in_progress >= rproxy->config.relay_conns) {
+        atomic_fetch_sub(&rproxy->origin_exchanges, 1);
+        return 503;
+    }
+    connection->holds_exchange_slot = true;
+    client_send_buffer_cap(connection);
+
+    return 0;
+}
+
+/* Autotuning grows the kernel send buffer of conn_fd up to tcp_wmem
+   (4 MiB), and that memory is charged to rproxy. In conn-cap a 4 MiB
+   buffer also let rproxy close (and free the slot) about 10 s before a
+   400 KB/s client had its last byte: 29 Phones finished, not 20. So both
+   modes cap it at --relay-buffer. */
+static void client_send_buffer_cap(struct connection *connection)
+{
+    int relay_buffer = connection->loop->rproxy->config.relay_buffer;
+    setsockopt(connection->conn_fd, SOL_SOCKET, SO_SNDBUF, &relay_buffer,
+               sizeof(relay_buffer));
 }
 
 static bool origin_request_format(struct connection *connection)
@@ -1148,7 +1224,8 @@ static enum step origin_connect_start(struct connection *connection)
 {
     const struct origin_list *list = &connection->loop->rproxy->list;
     connection->origin_fd = origin_connect(
-        &list->origins[connection->origin_index], connection->address_index);
+        &list->origins[connection->origin_index], connection->address_index,
+        origin_get_receive_buffer(connection->loop->rproxy));
     if (connection->origin_fd < 0) {
         return origin_connect_retry(connection);
     }
@@ -1158,9 +1235,20 @@ static enum step origin_connect_start(struct connection *connection)
                   connection->origin_fd, &event) != 0) {
         return origin_connect_retry(connection);
     }
+    connection->origin_events = EPOLLOUT;
     connection->state = STATE_ORIGIN_CONNECT;
 
     return STEP_WAIT;
+}
+
+/* Backpressure: while rproxy does not read, the Origin bytes wait in
+   the receive queue of origin_fd, which is memory of rproxy too. Without
+   a cap, 200 slow clients took 126 MiB of socket memory (2026-11-25). */
+static int origin_get_receive_buffer(const struct rproxy *rproxy)
+{
+    return rproxy->config.relay_mode == RELAY_BACKPRESSURE
+               ? rproxy->config.relay_buffer
+               : 0;
 }
 
 /* A failed connect tries the next address of the same Origin, as
@@ -1244,17 +1332,176 @@ static enum step origin_send_step(struct connection *connection)
         }
         connection->origin_request_sent += (size_t)written;
     }
-    struct epoll_event event = {.events = EPOLLIN | EPOLLET,
-                                .data.ptr = &connection->origin_end};
-    epoll_ctl(connection->loop->epoll_fd, EPOLL_CTL_MOD, connection->origin_fd,
-              &event);
+    connection_watch_origin(connection, EPOLLIN);
+    if (connection->loop->rproxy->config.relay_mode == RELAY_BACKPRESSURE) {
+        return relay_start(connection);
+    }
     connection->state = STATE_ORIGIN_READ;
 
     return STEP_NEXT;
 }
 
-/* Reads to EOF (the request has Connection: close). An empty reply or a
-   reply over ORIGIN_REPLY_MAX is 502. */
+/* Edge-triggered, as the client socket. events 0 stops the wake-ups for
+   reads; a MOD back to EPOLLIN reports bytes that wait already. */
+static void connection_watch_origin(struct connection *connection,
+                                    uint32_t events)
+{
+    if (connection->origin_fd < 0 || connection->origin_events == events) {
+        return;
+    }
+    struct epoll_event event = {.events = events | EPOLLET,
+                                .data.ptr = &connection->origin_end};
+    epoll_ctl(connection->loop->epoll_fd, EPOLL_CTL_MOD, connection->origin_fd,
+              &event);
+    connection->origin_events = events;
+}
+
+/* SPEC 12, Act 4: the Origin bytes go through a buffer of --relay-buffer
+   bytes. The reply goes to the client as it is: no X-Cache, no 304. */
+static enum step relay_start(struct connection *connection)
+{
+    struct relay_buffer *relay = &connection->relay;
+    relay->capacity = (size_t)connection->loop->rproxy->config.relay_buffer;
+    relay->data = malloc(relay->capacity);
+    if (relay->data == NULL) {
+        return origin_exchange_end(connection, 502);
+    }
+    /* 200 slow clients took 392 MiB of socket memory without the cap
+       (2026-11-25). */
+    client_send_buffer_cap(connection);
+    connection->state = STATE_RELAY;
+
+    return STEP_NEXT;
+}
+
+/* Turns of "read the Origin into the room" and "send the bytes to the
+   client", until neither moves a byte. Then it waits for the side that
+   holds the relay back. */
+static enum step relay_step(struct connection *connection)
+{
+    struct relay_buffer *relay = &connection->relay;
+    bool has_moved = false;
+    for (;;) {
+        bool is_turn_moved = false;
+        if (!relay_read_origin(connection, &is_turn_moved)) {
+            return origin_exchange_end(connection, 502);
+        }
+        enum tls_status status = relay_send_client(connection, &is_turn_moved);
+        if (status == TLS_CLOSED) {
+            return STEP_CLOSE;
+        }
+        if (relay->origin_is_done && relay->sent == relay->used) {
+            return reply_end(connection);
+        }
+        if (!is_turn_moved) {
+            return relay_wait(connection, status, has_moved);
+        }
+        has_moved = true;
+    }
+}
+
+/* Reads until the room is full, the Origin has no bytes now, or EOF.
+   Returns false for an Origin that fails before its first byte: the
+   client can still get a 502. A later failure ends the reply early. */
+static bool relay_read_origin(struct connection *connection, bool *has_moved)
+{
+    struct relay_buffer *relay = &connection->relay;
+    struct exchange *exchange = &connection->exchange;
+    relay_compact(relay);
+    while (!relay->origin_is_done && relay->used < relay->capacity) {
+        ssize_t length = read(connection->origin_fd, relay->data + relay->used,
+                              relay->capacity - relay->used);
+        if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+        if (length <= 0) {
+            if (exchange->reply_bytes == 0) {
+                return false;
+            }
+            relay_end_origin(connection);
+            break;
+        }
+        relay->used += (size_t)length;
+        exchange->reply_bytes += (size_t)length;
+        *has_moved = true;
+        /* The status line is at the start while no byte moved. */
+        if (exchange->status == 0 && exchange->reply_bytes == relay->used) {
+            exchange->status = reply_get_status(relay->data, relay->used);
+        }
+    }
+
+    return true;
+}
+
+/* Moves the bytes that wait for the client to the start, so that all the
+   rest is room. The TLS session allows a moved buffer
+   (SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER in tls.c). */
+static void relay_compact(struct relay_buffer *relay)
+{
+    if (relay->sent == 0) {
+        return;
+    }
+    memmove(relay->data, relay->data + relay->sent, relay->used - relay->sent);
+    relay->used -= relay->sent;
+    relay->sent = 0;
+}
+
+static void relay_end_origin(struct connection *connection)
+{
+    connection->relay.origin_is_done = true;
+    origin_socket_close(connection);
+    free(connection->origin_request);
+    connection->origin_request = NULL;
+}
+
+/* Sends until the buffer is empty or the TLS session wants the socket.
+   After a want, the same bytes go again (SSL_write(3)). */
+static enum tls_status relay_send_client(struct connection *connection,
+                                         bool *has_moved)
+{
+    struct relay_buffer *relay = &connection->relay;
+    while (relay->sent < relay->used) {
+        size_t count = 0;
+        enum tls_status status =
+            tls_session_send(connection->session, relay->data + relay->sent,
+                             relay->used - relay->sent, &count);
+        if (status != TLS_DONE) {
+            return status;
+        }
+        relay->sent += count;
+        *has_moved = true;
+    }
+
+    return TLS_DONE;
+}
+
+/* Back pressure: with no room, the Origin socket is not watched, so the
+   kernel buffers of the Origin fill and TCP slows the Origin. The deadline
+   moves only when bytes moved. It belongs to the side that the relay
+   waits for: the client while bytes wait for it, else the Origin. */
+static enum step relay_wait(struct connection *connection,
+                            enum tls_status status, bool has_moved)
+{
+    struct relay_buffer *relay = &connection->relay;
+    bool has_room = relay->used < relay->capacity;
+    connection_watch_origin(connection, has_room ? EPOLLIN : 0);
+    if (has_moved) {
+        bool waits_for_client = relay->sent < relay->used;
+        connection_set_deadline(
+            connection, waits_for_client
+                            ? CLIENT_TIMEOUT
+                            : connection->loop->rproxy->config.origin_timeout);
+    }
+    if (status != TLS_DONE) {
+        return connection_wait_tls(connection, status);
+    }
+    connection_watch_client(connection, EPOLLIN);
+
+    return STEP_WAIT;
+}
+
+/* Reads to EOF (the request has Connection: close). An empty reply, or
+   with reply-cap a reply over ORIGIN_REPLY_MAX, is 502. */
 static enum step origin_read_step(struct connection *connection)
 {
     for (;;) {
@@ -1275,10 +1522,18 @@ static enum step origin_read_step(struct connection *connection)
             return origin_exchange_end(connection, 502);
         }
         connection->reply_len += (size_t)length;
-        if (connection->reply_len > ORIGIN_REPLY_MAX) {
+        if (reply_is_over_cap(connection)) {
             return origin_exchange_end(connection, 502);
         }
     }
+}
+
+/* Only reply-cap has a size limit. conn-cap limits the count of the
+   replies instead (SPEC 12, Act 3: 20 phones get the whole file). */
+static bool reply_is_over_cap(const struct connection *connection)
+{
+    return connection->loop->rproxy->config.relay_mode == RELAY_REPLY_CAP &&
+           connection->reply_len > ORIGIN_REPLY_MAX;
 }
 
 /* Keeps room for one more ORIGIN_READ_CHUNK. The room doubles, so a
@@ -1388,6 +1643,7 @@ static void connection_close(struct connection *connection)
                            connection->exchange.status, clock_get_seconds());
     }
     timer_heap_remove(loop->timers, &connection->timer);
+    exchange_slot_release(connection);
     origin_socket_close(connection);
     tls_session_destroy(connection->session);
     connection->session = NULL;
@@ -1405,6 +1661,15 @@ static void connection_close(struct connection *connection)
     connection->state = STATE_CLOSED;
     connection->next = loop->closed;
     loop->closed = connection;
+}
+
+static void exchange_slot_release(struct connection *connection)
+{
+    if (!connection->holds_exchange_slot) {
+        return;
+    }
+    atomic_fetch_sub(&connection->loop->rproxy->origin_exchanges, 1);
+    connection->holds_exchange_slot = false;
 }
 
 /* One line for each connection: client IP, JA4, Verdict, cache result,
@@ -1478,8 +1743,23 @@ static void connection_expire(struct connection *connection)
         origin_exchange_end(connection, 504);
         connection_advance(connection);
         return;
+    case STATE_RELAY:
+        relay_expire(connection);
+        return;
     default:
         break;
+    }
+    connection_close(connection);
+}
+
+/* Before the first Origin byte the client can still get a 504. After it,
+   the reply has started, so the connection only closes. */
+static void relay_expire(struct connection *connection)
+{
+    if (connection->exchange.reply_bytes == 0) {
+        origin_exchange_end(connection, 504);
+        connection_advance(connection);
+        return;
     }
     connection_close(connection);
 }
@@ -1492,6 +1772,7 @@ static void loop_free_closed(struct event_loop *loop)
         free(connection->buffer.data);
         free(connection->origin_request);
         free(connection->reply);
+        free(connection->relay.data);
         free(connection);
     }
 }

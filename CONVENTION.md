@@ -69,6 +69,9 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | An Event loop of the Reverse Proxy | `struct event_loop *loop` | `reactor`, `worker`, `el` |
    | The timers of one Event loop | `struct timer_heap *timers` | `heap`, `pq`, `queue` |
    | One timer, inside its owner | `struct timer *timer` | `t`, `deadline` |
+   | A Relay mode | `enum relay_mode relay_mode` | `mode`, `relay` |
+   | The relay buffer of one connection (backpressure) | `struct relay_buffer *relay` | `buf`, `ring`, `window` |
+   | A conn-cap slot of one connection | `holds_exchange_slot`, `origin_exchanges` | `token`, `ticket`, `queue` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

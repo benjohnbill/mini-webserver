@@ -45,8 +45,11 @@ int origin_resolve(struct origin *origin);
 
 /* Starts a non-blocking connect to address number index of origin.
    Returns the socket, which is non-blocking and can still be in the
-   connect, or -1 if the connect failed at once. */
-int origin_connect(const struct origin *origin, size_t index);
+   connect, or -1 if the connect failed at once. receive_buffer > 0 sets
+   SO_RCVBUF before the connect, so the TCP window starts small; 0 keeps
+   the kernel autotuning. */
+int origin_connect(const struct origin *origin, size_t index,
+                   int receive_buffer);
 
 /* After a connect in progress makes origin_fd writable: true if the
    connect worked. */

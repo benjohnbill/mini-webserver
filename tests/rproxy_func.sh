@@ -11,6 +11,7 @@ RPROXY=${RPROXY:-./rproxy}
 HOST=127.0.0.1
 PROXY_PORT=18443
 SERVER_PORT=18081
+EPOLL_PORT=18083
 ORIGIN_A=18091
 ORIGIN_B=18092
 ORIGIN_SILENT=18093
@@ -551,6 +552,101 @@ if unshare -rm true 2>/dev/null; then
     stop_proxy
 else
     echo "skip an Origin name with two addresses: unshare -rm is not allowed"
+fi
+
+# Relay modes (SPEC 12). The Origin is ./server --model epoll, because a
+# pool Origin stalls slow readers. The file is larger than ORIGIN_REPLY_MAX.
+mkdir -p "$WORK/www"
+head -c 6291456 /dev/urandom > "$WORK/www/big.bin"
+big_sum=$(sha256sum < "$WORK/www/big.bin" | cut -d' ' -f1)
+./server "$EPOLL_PORT" "$WORK/www" --model epoll > /dev/null 2>&1 &
+PIDS+=($!)
+wait_port "$EPOLL_PORT"
+# Prints "STATUS SHA256" of one download of big.bin. $1 is the output file.
+fetch_big() {
+    local out=$1
+    shift
+    local status
+    status=$(curl -sk --max-time 30 -o "$out" -w '%{http_code}' "$@" \
+        "$BASE/big.bin")
+    printf '%s %s' "$status" "$(sha256sum < "$out" | cut -d' ' -f1)"
+}
+
+start_proxy --origin "$HOST:$EPOLL_PORT"
+got="$(fetch_big "$WORK/big_cap" | cut -d' ' -f1)"
+[ "$got" = "502" ] && pass "reply-cap is the default and gives 502 over 4 MiB" \
+    || fail "reply-cap is the default and gives 502 over 4 MiB: got '$got'"
+
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay unbounded
+got="$(fetch_big "$WORK/big_unbounded")"
+[ "$got" = "200 $big_sum" ] \
+    && pass "unbounded serves a 6 MiB file whole" \
+    || fail "unbounded serves a 6 MiB file whole: got '$got'"
+
+# Two slow downloads hold the two slots. The third client gets a 503.
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay conn-cap --relay-conns 2
+slow_pids=()
+for i in 1 2; do
+    fetch_big "$WORK/big_conn$i" --limit-rate 2M > "$WORK/conn$i" &
+    slow_pids+=($!)
+done
+sleep 1
+got="$(fetch "$BASE/big.bin" | cut -d' ' -f1)"
+wait "${slow_pids[@]}"
+[ "$got" = "503" ] && pass "conn-cap gives 503 to client N+1" \
+    || fail "conn-cap gives 503 to client N+1: got '$got'"
+[ "$(cat "$WORK/conn1")" = "200 $big_sum" ] \
+    && [ "$(cat "$WORK/conn2")" = "200 $big_sum" ] \
+    && pass "conn-cap serves the N slow downloads whole" \
+    || fail "conn-cap serves the N slow downloads whole: $(cat "$WORK/conn1"), $(cat "$WORK/conn2")"
+got="$(fetch_big "$WORK/big_conn3")"
+[ "$got" = "200 $big_sum" ] && pass "conn-cap frees a slot when its download ends" \
+    || fail "conn-cap frees a slot when its download ends: got '$got'"
+
+# 6 MiB at 1 MB/s takes about 6 s, longer than --origin-timeout 1.
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay backpressure
+got="$(fetch_big "$WORK/big_slow" --limit-rate 1M)"
+[ "$got" = "200 $big_sum" ] \
+    && pass "backpressure gives a slow client the file whole, past --origin-timeout" \
+    || fail "backpressure gives a slow client the file whole, past --origin-timeout: got '$got'"
+grep -q '^127\.0\.0\.1 [^ ]* pass - 0 200 62915' "$WORK/rproxy.err" \
+    && pass "backpressure logs the status from the first Origin bytes" \
+    || fail "backpressure logs the status from the first Origin bytes"
+
+# 20 slow clients: with whole replies rproxy would hold 20 x 6 MiB.
+slow_pids=()
+for i in $(seq 1 20); do
+    fetch_big "$WORK/big_many$i" --limit-rate 1M > "$WORK/many$i" &
+    slow_pids+=($!)
+done
+peak_rss=0
+while kill -0 "${slow_pids[0]}" 2>/dev/null; do
+    rss=$(awk '/^VmRSS/{print $2}' "/proc/$PROXY_PID/status" 2>/dev/null)
+    [ "${rss:-0}" -gt "$peak_rss" ] && peak_rss=$rss
+    sleep 0.2
+done
+wait "${slow_pids[@]}"
+whole=0
+for i in $(seq 1 20); do
+    [ "$(cat "$WORK/many$i")" = "200 $big_sum" ] && whole=$((whole + 1))
+done
+[ "$whole" = "20" ] && [ "$peak_rss" -lt 40960 ] \
+    && pass "backpressure serves 20 slow clients under 40 MiB RSS (peak $((peak_rss / 1024)) MiB)" \
+    || fail "backpressure serves 20 slow clients under 40 MiB RSS: $whole whole, peak ${peak_rss} KiB"
+
+stop_proxy
+"$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
+    --origin "$HOST:$EPOLL_PORT" --relay backpressure --cache on \
+    2> "$WORK/bad.err" &
+bad_pid=$!
+sleep 0.5
+if kill -0 "$bad_pid" 2>/dev/null; then
+    kill "$bad_pid"; wait "$bad_pid" 2>/dev/null
+    fail "backpressure with --cache on stops rproxy at the start"
+else
+    grep -q 'cache on' "$WORK/bad.err" \
+        && pass "backpressure with --cache on stops rproxy at the start" \
+        || fail "backpressure with --cache on stops rproxy at the start: $(cat "$WORK/bad.err")"
 fi
 
 stop_proxy
