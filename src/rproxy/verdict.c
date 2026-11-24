@@ -19,7 +19,9 @@ struct verdict_rule {
 #define SCANNER_NOT_FOUND_MAX 5
 /* The same maxretry for 429 replies: a client that is over the limit
    again after five 429s in the window goes into the block table, so its
-   next connections drop before the TLS handshake. */
+   next connections drop before the TLS handshake. Only with the IP key:
+   a JA4 limit is shared by all clients of one TLS library, so its 429s
+   are no evidence against one IP. */
 #define LIMIT_SLOWED_MAX 5
 #define BROWSER_LABEL "browser"
 
@@ -128,7 +130,7 @@ static bool request_needs_pow(const struct verdict_signals *signals)
 
 static bool client_keeps_over_limit(const struct verdict_signals *signals)
 {
-    return request_is_over_limit(signals) &&
+    return request_is_over_limit(signals) && signals->limit_is_per_ip &&
            signals->behavior.slowed >= LIMIT_SLOWED_MAX;
 }
 

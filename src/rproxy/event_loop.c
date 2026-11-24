@@ -884,6 +884,7 @@ static struct verdict request_decide(struct rproxy *rproxy,
                               ? exchange->ja4
                               : exchange->client_ip;
         signals.retry_after = rate_limit_take(rproxy->limit, key, now);
+        signals.limit_is_per_ip = rproxy->config.rate_key == RATE_KEY_IP;
     }
     exchange->has_behavior =
         behavior_add_request(rproxy->counters, exchange->client_ip,

@@ -24,6 +24,7 @@ struct verdict_signals {
     const char *user_agent; /* NULL if absent */
     const char *target;     /* the request target */
     int retry_after;        /* from rate_limit_take: 0 if within the limit */
+    bool limit_is_per_ip;   /* the rate limit key is the client IP */
     struct behavior_counts behavior; /* of the client IP, with this request */
     bool is_pow_target;              /* the target is under a --pow-prefix */
     bool pow_ok;        /* X-PoW solves the challenge of the client */
