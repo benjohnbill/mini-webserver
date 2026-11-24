@@ -6,3 +6,5 @@
 /www/bench/
 /rproxy
 /rproxy-asan
+/www/update.bin
+/bench/demo/run/
