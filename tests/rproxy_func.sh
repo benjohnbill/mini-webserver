@@ -489,6 +489,53 @@ grep -q $'^Content-Length: 40000\r$' "$WORK/A.log" \
     && pass "a 40000-byte POST body reaches the Origin with its length" \
     || fail "a 40000-byte POST body reaches the Origin with its length"
 
+# A second rproxy on a port that one already holds stops at the start.
+# SO_REUSEPORT must not let it share the port.
+"$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
+    --origin "$HOST:$ORIGIN_A" 2> "$WORK/second.err" &
+second_pid=$!
+sleep 0.5
+if kill -0 "$second_pid" 2>/dev/null; then
+    kill "$second_pid"; wait "$second_pid" 2>/dev/null
+    fail "a second rproxy on the same port stops at the start"
+else
+    grep -q 'in use' "$WORK/second.err" \
+        && pass "a second rproxy on the same port stops at the start" \
+        || fail "a second rproxy on the same port stops at the start: $(cat "$WORK/second.err")"
+fi
+
+# A stop closes the open connections, and their log line says stop.
+sleep 30 | nc 127.0.0.1 "$PROXY_PORT" > /dev/null 2>&1 &
+stuck_pid=$!
+sleep 0.5
+stop_proxy
+kill "$stuck_pid" 2>/dev/null; wait "$stuck_pid" 2>/dev/null
+grep -q '^127\.0\.0\.1 - stop - - - 0$' "$WORK/rproxy.err" \
+    && pass "a connection that a stop closes logs the Verdict stop" \
+    || fail "a connection that a stop closes logs the Verdict stop"
+
+# An Origin name with two addresses: the first (::1) refuses, because the
+# fake Origin listens on IPv4 only. rproxy tries the second address. A
+# private /etc/hosts needs a user and mount namespace (unshare -rm).
+printf '::1 multi.test\n127.0.0.1 multi.test\n' > "$WORK/hosts"
+if unshare -rm true 2>/dev/null; then
+    stop_proxy
+    unshare -rm sh -c 'mount --bind "$1" /etc/hosts && shift && exec "$@"' \
+        sh "$WORK/hosts" "$RPROXY" --port "$PROXY_PORT" \
+        --cert build/cert.pem --key build/key.pem --origin-timeout 1 \
+        --origin "multi.test:$ORIGIN_A" 2> "$WORK/rproxy.err" &
+    PROXY_PID=$!
+    wait_port "$PROXY_PORT"
+    got="$(fetch "$BASE/multi")"
+    [ "$got" = "200 A" ] \
+        && pass "an Origin name tries its next address when the first refuses" \
+        || fail "an Origin name tries its next address when the first refuses: got '$got'"
+    stop_proxy
+else
+    echo "skip an Origin name with two addresses: unshare -rm is not allowed"
+fi
+
+stop_proxy
 for bad in 0 x; do
     "$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
         --origin "$HOST:$ORIGIN_A" --loops "$bad" 2> /dev/null &
