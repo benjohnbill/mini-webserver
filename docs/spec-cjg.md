@@ -581,7 +581,7 @@ The stage is an app update day: many phones on slow networks download one large 
 |---|---|---|---|---|---|---|
 | 1 | `unbounded` | nothing | killed by the OOM killer | all fail | connection refused | "With no limit, this happens." |
 | 2 | `reply-cap` | reply size (4 MiB, the current code) | alive | all get 502 | 200 | "Our code is like this now." |
-| 3 | `conn-cap` | Origin exchanges in progress (20) | alive, CPU idle | 20 finish, the rest get 503 | 503 | "The branch of a teammate is like this." |
+| 3 | `conn-cap` | connections that hold a reply (20) | alive, CPU idle | 20 finish, the rest get 503 | 503 | "The branch of a teammate is like this." |
 | 4 | `backpressure` | speed: a 64 KB buffer for each connection | alive, flat memory | all finish at their own speed | 200 | "The real cause was speed." |
 | 5 (epilogue, optional) | `backpressure`, Origin `--model pool` | as Act 4 | alive | only 4 move | 200 | "Now slow phones hold the Origin." |
 
@@ -622,8 +622,8 @@ All values are options of the demo tool, so a run can change them.
 |---|---|
 | `--relay unbounded` | Read the whole Origin reply into memory, with no size limit |
 | `--relay reply-cap` | The default and the behavior before 2026-11-25: read the whole reply, 502 over `ORIGIN_REPLY_MAX` |
-| `--relay conn-cap` | As `reply-cap`, but with more than `--relay-conns N` (default 20) Origin exchanges in progress in the process, reply 503 |
-| `--relay backpressure` | Read the Origin only when the write buffer of the connection has room (`--relay-buffer BYTES`, default 65536). The Origin deadline moves at each read. It does not start with `--cache on` |
+| `--relay conn-cap` | Read the whole reply with no size limit, as `unbounded`. A connection holds a slot from the Origin exchange until its reply is fully sent. It also caps `SO_SNDBUF` of the client socket to `--relay-buffer`, or the kernel takes the reply and frees the slot early. With `--relay-conns N` (default 20) slots taken in the process, a new request gets 503. (Changed 2026-11-25 after the first run: with the 4 MiB limit, Act 3 gave only 502, and slots freed at the end of the Origin exchange let 29 Phones finish.) |
+| `--relay backpressure` | Read the Origin only when the write buffer of the connection has room (`--relay-buffer BYTES`, default 65536). The Origin deadline moves at each read. It does not start with `--cache on`. `--relay-buffer` also caps `SO_SNDBUF` of the client socket and `SO_RCVBUF` of the Origin socket (set before `connect`). Without these caps the kernel buffers held most of the memory (peak 419–567 MiB), and the Origin `--timeout` of 5 s cut some transfers |
 
 ### Demo tool (`bench/demo/`)
 
@@ -642,3 +642,5 @@ The screen is one terminal split in two: commands and `curl` on the left, the da
 1. `rproxy --relay`, with checks in `tests/rproxy_func.sh`. The tools in parallel: `phones.py` and `dashboard.py`, first against the current `rproxy`.
 2. `demo.sh` and a full run of Acts 1, 2, and 4.
 3. Act 3, then the recording, then Act 5. If time is short, cut from the end of this list.
+
+Results (2026-11-25): all five Acts run as the story table says. Act 1 dies at about 8 s, Act 4 peaks at about 88 MiB. The runs repeat closely, so the live demo is the main plan. See [`20261125-backpressure-demo.md`](measurements/20261125-backpressure-demo.md). The presenter flow is in [`bench/demo/README.md`](../bench/demo/README.md).
