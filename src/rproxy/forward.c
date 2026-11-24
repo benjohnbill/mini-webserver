@@ -1,22 +1,17 @@
 #include "forward.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <netdb.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #include "config.h"
 
 #define ORIGIN_PORT_MIN 1
-#define MS_PER_SECOND 1000
 
 /* A cursor over the buffer of forward_format_request. */
 struct text_cursor {
@@ -31,11 +26,6 @@ static void text_append(struct text_cursor *cursor, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 static void text_append_bytes(struct text_cursor *cursor, const char *bytes,
                               size_t len);
-static int origin_open(const struct origin *origin, int timeout);
-static bool socket_wait_connect(int origin_fd, int timeout);
-static void socket_set_timeouts(int origin_fd, int timeout);
-static int origin_send(int origin_fd, const char *bytes, size_t len);
-static int origin_read_reply(int origin_fd, char **reply, size_t *reply_len);
 
 int origin_parse(const char *text, struct origin *origin)
 {
@@ -135,34 +125,6 @@ size_t forward_format_request(const struct request *request,
     return cursor.is_full ? 0 : cursor.used;
 }
 
-int forward_fetch(const struct origin_list *list, size_t first,
-                  const char *request_bytes, size_t request_len, int timeout,
-                  char **reply, size_t *reply_len)
-{
-    *reply = NULL;
-    *reply_len = 0;
-    int origin_fd = origin_open(&list->origins[first], timeout);
-    if (origin_fd < 0 && list->count > 1) {
-        origin_fd =
-            origin_open(&list->origins[(first + 1) % list->count], timeout);
-    }
-    if (origin_fd < 0) {
-        return 502;
-    }
-    int status = origin_send(origin_fd, request_bytes, request_len);
-    if (status == 0) {
-        status = origin_read_reply(origin_fd, reply, reply_len);
-    }
-    close(origin_fd);
-    if (status != 0) {
-        free(*reply);
-        *reply = NULL;
-        *reply_len = 0;
-    }
-
-    return status;
-}
-
 static bool port_is_valid(const char *port)
 {
     long number = 0;
@@ -205,81 +167,4 @@ static void text_append_bytes(struct text_cursor *cursor, const char *bytes,
     }
     memcpy(cursor->buffer + cursor->used, bytes, len);
     cursor->used += len;
-}
-
-/* Returns a connected blocking socket with SO_RCVTIMEO and SO_SNDTIMEO
-   set, or -1. The connect ends in timeout seconds. */
-static int origin_open(const struct origin *origin, int timeout)
-{
-    int origin_fd = origin_connect(origin);
-    if (origin_fd < 0) {
-        return -1;
-    }
-    if (!socket_wait_connect(origin_fd, timeout)) {
-        close(origin_fd);
-        return -1;
-    }
-    int flags = fcntl(origin_fd, F_GETFL, 0);
-    fcntl(origin_fd, F_SETFL, flags & ~O_NONBLOCK);
-    socket_set_timeouts(origin_fd, timeout);
-
-    return origin_fd;
-}
-
-static bool socket_wait_connect(int origin_fd, int timeout)
-{
-    struct pollfd watch = {.fd = origin_fd, .events = POLLOUT};
-    int ready = poll(&watch, 1, timeout * MS_PER_SECOND);
-
-    return ready > 0 && origin_is_connected(origin_fd);
-}
-
-static void socket_set_timeouts(int origin_fd, int timeout)
-{
-    struct timeval limit = {.tv_sec = timeout, .tv_usec = 0};
-    setsockopt(origin_fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
-    setsockopt(origin_fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof(limit));
-}
-
-static int origin_send(int origin_fd, const char *bytes, size_t len)
-{
-    for (size_t sent = 0; sent < len;) {
-        ssize_t written = write(origin_fd, bytes + sent, len - sent);
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written < 0) {
-            return errno == EAGAIN || errno == EWOULDBLOCK ? 504 : 502;
-        }
-        sent += (size_t)written;
-    }
-
-    return 0;
-}
-
-/* Reads to EOF. An empty reply is 502. */
-static int origin_read_reply(int origin_fd, char **reply, size_t *reply_len)
-{
-    for (;;) {
-        char *data = realloc(*reply, *reply_len + ORIGIN_READ_CHUNK);
-        if (data == NULL) {
-            return 502;
-        }
-        *reply = data;
-        ssize_t length =
-            read(origin_fd, *reply + *reply_len, ORIGIN_READ_CHUNK);
-        if (length == 0) {
-            return *reply_len > 0 ? 0 : 502;
-        }
-        if (length < 0 && errno == EINTR) {
-            continue;
-        }
-        if (length < 0) {
-            return errno == EAGAIN || errno == EWOULDBLOCK ? 504 : 502;
-        }
-        *reply_len += (size_t)length;
-        if (*reply_len > ORIGIN_REPLY_MAX) {
-            return 502;
-        }
-    }
 }

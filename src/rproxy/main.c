@@ -1,16 +1,11 @@
-#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
-#include <netinet/in.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,26 +16,23 @@
 #include "bot_auth.h"
 #include "cache.h"
 #include "cache_options.h"
-#include "client_hello.h"
 #include "config.h"
-#include "connection_verdict.h"
+#include "event_loop.h"
 #include "forward.h"
-#include "http_parse.h"
 #include "ip_list.h"
-#include "ja4.h"
 #include "ja4_table.h"
 #include "pow.h"
 #include "rate_limit.h"
+#include "rproxy.h"
 #include "tls.h"
-#include "verdict.h"
 
-/* A TLS record header (5 bytes) and the largest record body. */
-#define HELLO_PEEK_MAX (5 + 16384)
-/* Seconds that a client has for each read and write. */
-#define CLIENT_TIMEOUT 5
 #define DEFAULT_ORIGIN_TIMEOUT 5
 #define DEFAULT_BURST 10.0
 #define DEFAULT_TARPIT 10
+/* nginx worker_connections in the nginx.conf that nginx ships. */
+#define DEFAULT_CONNECTIONS 1024
+#define CONNECTIONS_MAX 65536
+#define LOOPS_MAX 256
 #define RATE_LIMIT_KEY_MAX 4096
 /* The same bound as the rate limit table. */
 #define BLOCK_TABLE_KEY_MAX 4096
@@ -51,110 +43,19 @@
 #define BEHAVIOR_WINDOW 600
 /* The same bound as the rate limit table. */
 #define BEHAVIOR_TABLE_KEY_MAX 4096
-/* --block-key can occur this many times. */
-#define BLOCK_KEY_ARG_MAX 16
-/* --pow-prefix and --pay-prefix can each occur this many times. */
-#define PREFIX_ARG_MAX 8
 /* Anubis DefaultDifficulty is 4 leading zero hex digits: 16 bits. */
 #define DEFAULT_POW_BITS 16
-/* The HMAC key of the pow nonce. RFC 2104 section 3: a key as long as
-   the hash output (SHA-256: 32 bytes). */
-#define POW_SECRET_LEN 32
-/* The value of crawler-price in a 402: the example of Cloudflare pay per
-   crawl. rproxy takes no payment. */
-#define PAY_PRICE "USD 0.01"
-/* Room for the headers that rproxy adds to a request for an Origin. */
-#define FORWARD_EXTRA_MAX 512
-#define REPLY_TEXT_MAX 512
-#define HEADER_LINES_MAX 256
-#define STATUS_TEXT_MAX 8
-#define LOG_NUMBER_MAX 16
-#define STATUS_DIGITS 3
-/* "HTTP/1.1 " comes before the status code of a reply. */
-#define STATUS_OFFSET 9
-#define CONN_CLOSED (-2)
 #define NANOSECONDS_PER_SECOND 1e9
 
-/* The key of the rate limit table. */
-enum rate_key { RATE_KEY_IP, RATE_KEY_JA4 };
-
-struct rproxy_config {
-    int port;
-    const char *cert_file;
-    const char *key_file;
-    int origin_timeout;
-    int workers;
-    double rate;
-    double burst;
-    enum rate_key rate_key;
-    int tarpit;
-    const char *block_list_file; /* NULL when there is no block list */
-    const char *ja4_list_file;   /* NULL when there is no JA4 table */
-    int block_time;
-    /* Keys that are in the block table from the start, for block_time. */
-    const char *block_keys[BLOCK_KEY_ARG_MAX];
-    int block_key_count;
-    /* Targets that start with one of these need a Proof of work. */
-    const char *pow_prefixes[PREFIX_ARG_MAX];
-    int pow_prefix_count;
-    int pow_bits;
-    /* Targets that start with one of these make a crawler pay (402). */
-    const char *pay_prefixes[PREFIX_ARG_MAX];
-    int pay_prefix_count;
-    const char *bot_key_file; /* NULL when there is no Web Bot Auth */
-    struct cache_options cache_options;
+/* One Event loop and the thread that runs it. */
+struct loop_thread {
+    struct event_loop *loop;
+    pthread_t thread;
+    int result;
 };
-
-/* What all Workers share. */
-struct rproxy {
-    struct rproxy_config config;
-    struct origin_list list;
-    struct tls_context *context;
-    struct rate_limit *limit;       /* NULL when the rate limit is off */
-    struct cache *cache;            /* NULL when the cache is off */
-    struct ip_list *block_list;     /* NULL without --block-list */
-    struct ja4_table *fingerprints; /* NULL without --ja4-list */
-    struct block_table *blocks;
-    struct behavior *counters;
-    struct bot_key_set *keys; /* NULL without --bot-key */
-    unsigned char pow_secret[POW_SECRET_LEN];
-};
-
-struct pool {
-    int fds[POOL_QUEUE_MAX];
-    int head;
-    int count;
-    bool closed;
-    pthread_mutex_t lock;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-    struct rproxy *rproxy;
-};
-
-/* The facts of one connection, for the log line. */
-struct exchange {
-    char client_ip[INET6_ADDRSTRLEN];
-    char ja4[JA4_LEN + 1];
-    const char *ja4_label; /* from the JA4 table: NULL if not there */
-    const char *verdict_name;
-    const char *cache_name; /* "hit", "miss", or "-" */
-    int origin_index;       /* -1 if no Origin was picked */
-    int status;             /* 0 if no reply was sent */
-    size_t reply_bytes;     /* the reply to the client, without X-Cache */
-    bool needs_drain;
-    bool has_behavior; /* the request stage counted this request */
-    struct behavior_counts behavior;
-};
-
-struct request_buffer {
-    char *data;
-    size_t used;
-    size_t capacity;
-};
-
-static volatile sig_atomic_t stop_requested = 0;
 
 static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv);
+static int loops_get_default(void);
 static bool option_parse(struct rproxy *rproxy, const char *name,
                          const char *value);
 static bool number_parse(const char *text, long min, long max, int *number);
@@ -166,95 +67,19 @@ static bool prefix_add(const char **prefixes, int *count, const char *prefix);
 static bool rproxy_start(struct rproxy *rproxy);
 static bool origins_resolve(struct origin_list *list);
 static bool defenses_start(struct rproxy *rproxy);
+static double clock_get_seconds(void);
 static char *file_read_text(const char *path);
 static bool block_list_load(struct rproxy *rproxy);
 static bool ja4_table_load(struct rproxy *rproxy);
 static bool bot_keys_load(struct rproxy *rproxy);
 static void rproxy_stop(struct rproxy *rproxy);
-static void signals_install(void);
-static void stop_signal_handle(int signal_number);
-static int listen_socket_open(int port);
-static int pool_run(int listen_fd, struct rproxy *rproxy);
-static void pool_start_workers(struct pool *pool, pthread_t *workers,
-                               int count);
-static void pool_push(struct pool *pool, int conn_fd);
-static void pool_close(struct pool *pool);
-static int pool_pop(struct pool *pool);
-static void *worker_main(void *arg);
-static void connection_serve(struct rproxy *rproxy, int conn_fd);
-static void connection_set_timeouts(int conn_fd);
-static void client_ip_get(int conn_fd, char *client_ip, size_t size);
-static enum client_hello_status hello_peek(int conn_fd,
-                                           struct client_hello *hello);
-static bool socket_peek_more(int conn_fd, unsigned char *bytes, size_t *len);
-static const char *ja4_label_find(const struct rproxy *rproxy, const char *ja4);
-static enum connection_verdict
-connection_verdict_get(struct rproxy *rproxy, const struct exchange *exchange);
-static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
-                         struct exchange *exchange);
-static int request_read(struct tls_session *session,
-                        struct request_buffer *buffer, struct request *request);
-static bool buffer_reserve(struct request_buffer *buffer, size_t capacity);
-static bool buffer_read_some(struct tls_session *session,
-                             struct request_buffer *buffer);
-static void reply_send_status(struct tls_session *session, int status,
-                              const char *header_lines,
-                              struct exchange *exchange);
-static const char *status_get_reason(int status);
-static struct verdict request_decide(struct rproxy *rproxy,
-                                     const struct request *request,
-                                     struct exchange *exchange);
-static bool target_has_prefix(const char *target, const char *const *prefixes,
-                              int count);
-static bool request_has_pow(const struct rproxy *rproxy,
-                            const struct request *request,
-                            const struct exchange *exchange);
-static bool request_is_signed(const struct rproxy *rproxy,
-                              const struct request *request);
-static const char *request_find_header(const void *context, const char *name);
-static double clock_get_seconds(void);
-static double wall_clock_get_seconds(void);
-/* The pow nonce and the signature times are wall clock times, so that
-   they mean the same thing to the client. */
-static double wall_clock_get_seconds(void)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-
-    return (double)now.tv_sec + (double)now.tv_nsec / NANOSECONDS_PER_SECOND;
-}
-
-static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
-                          const struct request *request,
-                          const struct verdict *verdict,
-                          struct exchange *exchange);
-static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
-                           const struct request *request,
-                           struct exchange *exchange);
-static bool cache_key_format(const struct request *request, char *key,
-                             size_t size);
-static int origin_fetch(struct rproxy *rproxy, const struct request *request,
-                        struct exchange *exchange, char **reply,
-                        size_t *reply_len);
-static void reply_send(struct tls_session *session, const char *reply,
-                       size_t reply_len, const char *cache_name);
-static int reply_get_status(const char *reply, size_t reply_len);
-static bool reply_is_not_modified(const struct request *request,
-                                  const char *reply, size_t reply_len);
-static bool not_modified_send(struct tls_session *session, const char *reply,
-                              size_t reply_len, struct exchange *exchange);
-static void challenge_send(struct rproxy *rproxy, struct tls_session *session,
-                           struct exchange *exchange);
-static void client_block(struct rproxy *rproxy,
-                         const struct exchange *exchange);
-static void tarpit_hold(int seconds);
-static void connection_drain(int conn_fd);
-static struct tls_session *session_open(struct tls_context *context,
-                                        int conn_fd);
-static bool session_send_all(struct tls_session *session, const char *bytes,
-                             size_t len);
-static void exchange_log(const struct exchange *exchange);
-static void behavior_log(const struct exchange *exchange);
+static void signals_block(sigset_t *stop_signals);
+static int loops_run(struct rproxy *rproxy, const sigset_t *stop_signals);
+static int loops_create(struct rproxy *rproxy, struct loop_thread *threads,
+                        int count);
+static int loops_start(struct loop_thread *threads, int count);
+static void *loop_thread_main(void *arg);
+static int loops_join(struct loop_thread *threads, int count);
 
 int main(int argc, char **argv)
 {
@@ -263,7 +88,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: ./rproxy --port P --cert FILE --key FILE "
                 "--origin HOST:PORT [--origin HOST:PORT ...] "
-                "[--origin-timeout S] [--workers N] [--rate R] [--burst B] "
+                "[--origin-timeout S] [--loops N] [--connections N] "
+                "[--rate R] [--burst B] "
                 "[--rate-key ip|ja4] [--tarpit S] [--cache off|on] "
                 "[--cache-admit all|size|second] [--cache-object-max BYTES] "
                 "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
@@ -274,15 +100,13 @@ int main(int argc, char **argv)
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
-    signals_install();
+    sigset_t stop_signals;
+    signals_block(&stop_signals);
     if (!rproxy_start(&rproxy)) {
         rproxy_stop(&rproxy);
         return 1;
     }
-
-    int listen_fd = listen_socket_open(rproxy.config.port);
-    int result = pool_run(listen_fd, &rproxy);
-    close(listen_fd);
+    int result = loops_run(&rproxy, &stop_signals);
     rproxy_stop(&rproxy);
 
     return result == 0 ? 0 : 1;
@@ -292,7 +116,8 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
 {
     *rproxy = (struct rproxy){
         .config = {.origin_timeout = DEFAULT_ORIGIN_TIMEOUT,
-                   .workers = DEFAULT_WORKERS,
+                   .loops = loops_get_default(),
+                   .connections = DEFAULT_CONNECTIONS,
                    .burst = DEFAULT_BURST,
                    .tarpit = DEFAULT_TARPIT,
                    .block_time = DEFAULT_BLOCK_TIME,
@@ -300,6 +125,7 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
     };
     cache_options_init(&rproxy->config.cache_options);
     atomic_init(&rproxy->list.next, 0);
+    atomic_init(&rproxy->is_stopping, false);
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc || !option_parse(rproxy, argv[i], argv[i + 1])) {
             return false;
@@ -309,6 +135,18 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
 
     return config->port > 0 && config->cert_file != NULL &&
            config->key_file != NULL && rproxy->list.count > 0;
+}
+
+/* One Event loop for each online CPU core, as nginx worker_processes
+   auto and the Envoy --concurrency default. */
+static int loops_get_default(void)
+{
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) {
+        return 1;
+    }
+
+    return cores > LOOPS_MAX ? LOOPS_MAX : (int)cores;
 }
 
 static bool option_parse(struct rproxy *rproxy, const char *name,
@@ -332,8 +170,11 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     if (strcmp(name, "--origin-timeout") == 0) {
         return number_parse(value, 1, TIMEOUT_MAX, &config->origin_timeout);
     }
-    if (strcmp(name, "--workers") == 0) {
-        return number_parse(value, 1, WORKERS_MAX, &config->workers);
+    if (strcmp(name, "--loops") == 0) {
+        return number_parse(value, 1, LOOPS_MAX, &config->loops);
+    }
+    if (strcmp(name, "--connections") == 0) {
+        return number_parse(value, 1, CONNECTIONS_MAX, &config->connections);
     }
     if (strcmp(name, "--rate") == 0) {
         return real_parse(value, 0, &config->rate);
@@ -548,6 +389,14 @@ static bool defenses_start(struct rproxy *rproxy)
     return true;
 }
 
+static double clock_get_seconds(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    return (double)now.tv_sec + (double)now.tv_nsec / NANOSECONDS_PER_SECOND;
+}
+
 /* Returns the whole file as a malloc string, or NULL. */
 static char *file_read_text(const char *path)
 {
@@ -658,797 +507,100 @@ static void rproxy_stop(struct rproxy *rproxy)
     tls_context_destroy(rproxy->context);
 }
 
-/* No SA_RESTART, so accept returns EINTR and the loop sees the flag. */
-static void signals_install(void)
+/* The main thread takes SIGINT and SIGTERM with sigwait, so no signal
+   handler runs. The loop threads inherit the mask. A write to a closed
+   socket returns EPIPE instead of a SIGPIPE. */
+static void signals_block(sigset_t *stop_signals)
 {
+    sigemptyset(stop_signals);
+    sigaddset(stop_signals, SIGINT);
+    sigaddset(stop_signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, stop_signals, NULL);
+
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     sigemptyset(&action.sa_mask);
-    action.sa_handler = stop_signal_handle;
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-
     action.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &action, NULL);
 }
 
-static void stop_signal_handle(int signal_number)
+/* Each loop thread serves its own connections. The main thread only waits
+   for a stop signal, sets the flag, and waits for the loops to end. */
+static int loops_run(struct rproxy *rproxy, const sigset_t *stop_signals)
 {
-    (void)signal_number;
-    stop_requested = 1;
-}
-
-static int listen_socket_open(int port)
-{
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int reuse = 1;
-    struct sockaddr_in addr = {.sin_family = AF_INET,
-                               .sin_addr.s_addr = htonl(INADDR_ANY),
-                               .sin_port = htons((uint16_t)port)};
-    if (listen_fd < 0 ||
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
-            0 ||
-        bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(listen_fd, SOMAXCONN) < 0) {
-        perror("rproxy: listen socket");
-        exit(EXIT_FAILURE);
-    }
-    printf("listening on port %d\n", port);
-
-    return listen_fd;
-}
-
-/* The pool Concurrency model, as in src/model_pool.c. */
-static int pool_run(int listen_fd, struct rproxy *rproxy)
-{
-    struct pool pool = {.rproxy = rproxy};
-    pthread_mutex_init(&pool.lock, NULL);
-    pthread_cond_init(&pool.not_empty, NULL);
-    pthread_cond_init(&pool.not_full, NULL);
-    int count = rproxy->config.workers;
-    pthread_t *workers = calloc((size_t)count, sizeof(*workers));
-    if (workers == NULL) {
+    int count = rproxy->config.loops;
+    struct loop_thread *threads = calloc((size_t)count, sizeof(*threads));
+    if (threads == NULL) {
         return -1;
     }
-    pool_start_workers(&pool, workers, count);
+    int created = loops_create(rproxy, threads, count);
+    int started = created == count ? loops_start(threads, count) : 0;
+    if (started == count) {
+        printf("listening on port %d\n", rproxy->config.port);
+        int signal_number = 0;
+        sigwait(stop_signals, &signal_number);
+    }
+    atomic_store(&rproxy->is_stopping, true);
+    int result = loops_join(threads, started);
+    for (int i = 0; i < created; i++) {
+        event_loop_destroy(threads[i].loop);
+    }
+    free(threads);
 
-    int result = 0;
-    while (!stop_requested) {
-        int conn_fd = accept(listen_fd, NULL, NULL);
-        if (conn_fd >= 0) {
-            pool_push(&pool, conn_fd);
-        } else if (errno != EINTR) {
-            result = -1;
-            break;
+    return started == count ? result : -1;
+}
+
+/* Returns the count of loops made. All listen sockets exist before the
+   first loop runs. */
+static int loops_create(struct rproxy *rproxy, struct loop_thread *threads,
+                        int count)
+{
+    for (int i = 0; i < count; i++) {
+        threads[i].loop = event_loop_create(rproxy);
+        if (threads[i].loop == NULL) {
+            return i;
         }
     }
-    pool_close(&pool);
+
+    return count;
+}
+
+/* Returns the count of threads started. */
+static int loops_start(struct loop_thread *threads, int count)
+{
     for (int i = 0; i < count; i++) {
-        pthread_join(workers[i], NULL);
+        if (pthread_create(&threads[i].thread, NULL, loop_thread_main,
+                           &threads[i]) != 0) {
+            return i;
+        }
     }
-    free(workers);
+
+    return count;
+}
+
+/* A loop that fails stops the process: the signal wakes sigwait in the
+   main thread. */
+static void *loop_thread_main(void *arg)
+{
+    struct loop_thread *thread = arg;
+    thread->result = event_loop_run(thread->loop);
+    if (thread->result != 0) {
+        kill(getpid(), SIGTERM);
+    }
+
+    return NULL;
+}
+
+/* Returns 0, or -1 if a loop failed. */
+static int loops_join(struct loop_thread *threads, int count)
+{
+    int result = 0;
+    for (int i = 0; i < count; i++) {
+        pthread_join(threads[i].thread, NULL);
+        if (threads[i].result != 0) {
+            result = -1;
+        }
+    }
 
     return result;
-}
-
-/* Workers inherit the mask, so only the main thread gets the signals. */
-static void pool_start_workers(struct pool *pool, pthread_t *workers, int count)
-{
-    sigset_t blocked;
-    sigset_t old;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGINT);
-    sigaddset(&blocked, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &blocked, &old);
-    for (int i = 0; i < count; i++) {
-        pthread_create(&workers[i], NULL, worker_main, pool);
-    }
-    pthread_sigmask(SIG_SETMASK, &old, NULL);
-}
-
-static void pool_push(struct pool *pool, int conn_fd)
-{
-    pthread_mutex_lock(&pool->lock);
-    while (pool->count == POOL_QUEUE_MAX) {
-        pthread_cond_wait(&pool->not_full, &pool->lock);
-    }
-    pool->fds[(pool->head + pool->count) % POOL_QUEUE_MAX] = conn_fd;
-    pool->count++;
-    pthread_cond_signal(&pool->not_empty);
-    pthread_mutex_unlock(&pool->lock);
-}
-
-static void pool_close(struct pool *pool)
-{
-    pthread_mutex_lock(&pool->lock);
-    pool->closed = true;
-    pthread_cond_broadcast(&pool->not_empty);
-    pthread_mutex_unlock(&pool->lock);
-}
-
-/* Returns -1 when the pool is closed and the queue is empty. */
-static int pool_pop(struct pool *pool)
-{
-    pthread_mutex_lock(&pool->lock);
-    while (pool->count == 0 && !pool->closed) {
-        pthread_cond_wait(&pool->not_empty, &pool->lock);
-    }
-    int conn_fd = -1;
-    if (pool->count > 0) {
-        conn_fd = pool->fds[pool->head];
-        pool->head = (pool->head + 1) % POOL_QUEUE_MAX;
-        pool->count--;
-        pthread_cond_signal(&pool->not_full);
-    }
-    pthread_mutex_unlock(&pool->lock);
-
-    return conn_fd;
-}
-
-static void *worker_main(void *arg)
-{
-    struct pool *pool = arg;
-    for (;;) {
-        int conn_fd = pool_pop(pool);
-        if (conn_fd < 0) {
-            return NULL;
-        }
-        connection_serve(pool->rproxy, conn_fd);
-        close(conn_fd);
-    }
-}
-
-/* SPEC 11: ClientHello and JA4, connection Verdict, TLS handshake,
-   request, rate limit, request Verdict, cache, Origin. One request for each
-   connection. A drop returns with the ClientHello unread, so close() sends
-   RST and no byte of TLS. */
-static void connection_serve(struct rproxy *rproxy, int conn_fd)
-{
-    struct exchange exchange = {
-        .verdict_name = "-", .cache_name = "-", .origin_index = -1};
-    struct client_hello hello;
-    connection_set_timeouts(conn_fd);
-    client_ip_get(conn_fd, exchange.client_ip, sizeof(exchange.client_ip));
-    if (hello_peek(conn_fd, &hello) != CLIENT_HELLO_OK) {
-        exchange.verdict_name = "no-tls";
-        exchange_log(&exchange);
-        return;
-    }
-    ja4_format(&hello, exchange.ja4);
-    exchange.ja4_label = ja4_label_find(rproxy, exchange.ja4);
-    switch (connection_verdict_get(rproxy, &exchange)) {
-    case CONN_PASS:
-        break;
-    case CONN_DROP:
-        exchange.verdict_name = "drop";
-        exchange_log(&exchange);
-        return;
-    case CONN_TARPIT:
-        exchange.verdict_name = "tarpit";
-        tarpit_hold(rproxy->config.tarpit);
-        exchange_log(&exchange);
-        return;
-    }
-
-    struct tls_session *session = session_open(rproxy->context, conn_fd);
-    if (session == NULL) {
-        exchange.verdict_name = "no-handshake";
-        exchange_log(&exchange);
-        return;
-    }
-    exchange_run(rproxy, session, &exchange);
-    tls_session_destroy(session);
-    if (exchange.needs_drain) {
-        connection_drain(conn_fd);
-    }
-    exchange_log(&exchange);
-}
-
-static void connection_set_timeouts(int conn_fd)
-{
-    struct timeval limit = {.tv_sec = CLIENT_TIMEOUT, .tv_usec = 0};
-    setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
-    setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof(limit));
-}
-
-static void client_ip_get(int conn_fd, char *client_ip, size_t size)
-{
-    struct sockaddr_storage addr;
-    socklen_t addr_len = sizeof(addr);
-    const void *host = NULL;
-    snprintf(client_ip, size, "-");
-    if (getpeername(conn_fd, (struct sockaddr *)&addr, &addr_len) != 0) {
-        return;
-    }
-    if (addr.ss_family == AF_INET) {
-        host = &((struct sockaddr_in *)&addr)->sin_addr;
-    } else if (addr.ss_family == AF_INET6) {
-        host = &((struct sockaddr_in6 *)&addr)->sin6_addr;
-    }
-    if (host != NULL) {
-        inet_ntop(addr.ss_family, host, client_ip, (socklen_t)size);
-    }
-}
-
-/* Reads the ClientHello with MSG_PEEK, so that OpenSSL still reads it
-   for the handshake. */
-static enum client_hello_status hello_peek(int conn_fd,
-                                           struct client_hello *hello)
-{
-    unsigned char bytes[HELLO_PEEK_MAX];
-    size_t len = 0;
-    enum client_hello_status status = CLIENT_HELLO_INCOMPLETE;
-    while (status == CLIENT_HELLO_INCOMPLETE) {
-        if (!socket_peek_more(conn_fd, bytes, &len)) {
-            return CLIENT_HELLO_INVALID;
-        }
-        status = client_hello_parse(bytes, len, hello);
-    }
-
-    return status;
-}
-
-/* A peek returns at once while the bytes that are there stay. So wait
-   until at least len + 1 bytes are there (MSG_WAITALL), then peek all of
-   them. Returns false on the end, a timeout, or a full buffer. */
-static bool socket_peek_more(int conn_fd, unsigned char *bytes, size_t *len)
-{
-    if (*len >= HELLO_PEEK_MAX) {
-        return false;
-    }
-    ssize_t count = recv(conn_fd, bytes, *len + 1, MSG_PEEK | MSG_WAITALL);
-    if (count < (ssize_t)(*len + 1)) {
-        return false;
-    }
-    count = recv(conn_fd, bytes, HELLO_PEEK_MAX, MSG_PEEK);
-    if (count <= (ssize_t)*len) {
-        return false;
-    }
-    *len = (size_t)count;
-
-    return true;
-}
-
-/* An empty JA4 (no ClientHello fingerprint) has no label. */
-static const char *ja4_label_find(const struct rproxy *rproxy, const char *ja4)
-{
-    if (rproxy->fingerprints == NULL || ja4[0] == '\0') {
-        return NULL;
-    }
-
-    return ja4_table_find(rproxy->fingerprints, ja4);
-}
-
-/* The block table has two kinds of keys: client IPs and JA4s. An empty
-   JA4 (no ClientHello fingerprint) is never a key. */
-static enum connection_verdict
-connection_verdict_get(struct rproxy *rproxy, const struct exchange *exchange)
-{
-    double now = clock_get_seconds();
-    const char *ja4 = exchange->ja4;
-    struct connection_signals signals = {
-        .is_listed =
-            rproxy->block_list != NULL &&
-            ip_list_has_address(rproxy->block_list, exchange->client_ip),
-        .is_blocked =
-            block_table_has_key(rproxy->blocks, exchange->client_ip, now) ||
-            (ja4[0] != '\0' && block_table_has_key(rproxy->blocks, ja4, now)),
-        .ja4_label = exchange->ja4_label,
-    };
-
-    return connection_decide(&signals);
-}
-
-static void exchange_run(struct rproxy *rproxy, struct tls_session *session,
-                         struct exchange *exchange)
-{
-    struct request_buffer buffer = {0};
-    struct request request;
-    int status = request_read(session, &buffer, &request);
-    if (status == 0) {
-        struct verdict verdict = request_decide(rproxy, &request, exchange);
-        verdict_apply(rproxy, session, &request, &verdict, exchange);
-        behavior_add_reply(rproxy->counters, exchange->client_ip,
-                           exchange->status, clock_get_seconds());
-    } else if (status != CONN_CLOSED) {
-        reply_send_status(session, status, NULL, exchange);
-        exchange->needs_drain = true;
-    }
-    free(buffer.data);
-}
-
-/* Returns 0 with request set, a status code of the Shared core, or
-   CONN_CLOSED (the end, a timeout, or an error). */
-static int request_read(struct tls_session *session,
-                        struct request_buffer *buffer, struct request *request)
-{
-    long frame = HTTP_INCOMPLETE;
-    while (frame == HTTP_INCOMPLETE || buffer->used < (size_t)frame) {
-        size_t want = frame == HTTP_INCOMPLETE ? HEADER_MAX : (size_t)frame;
-        if (!buffer_reserve(buffer, want)) {
-            return 500;
-        }
-        if (!buffer_read_some(session, buffer)) {
-            return CONN_CLOSED;
-        }
-        frame = http_frame_measure(buffer->data, buffer->used);
-        if (frame < HTTP_INCOMPLETE) {
-            return (int)-frame;
-        }
-    }
-
-    return http_parse_request(buffer->data, (size_t)frame, request);
-}
-
-static bool buffer_reserve(struct request_buffer *buffer, size_t capacity)
-{
-    if (buffer->capacity >= capacity) {
-        return true;
-    }
-    char *data = realloc(buffer->data, capacity);
-    if (data == NULL) {
-        return false;
-    }
-    buffer->data = data;
-    buffer->capacity = capacity;
-
-    return true;
-}
-
-static bool buffer_read_some(struct tls_session *session,
-                             struct request_buffer *buffer)
-{
-    size_t count = 0;
-    enum tls_status status =
-        tls_session_read(session, buffer->data + buffer->used,
-                         buffer->capacity - buffer->used, &count);
-    buffer->used += count;
-
-    return status == TLS_DONE;
-}
-
-/* A short text reply of rproxy itself. header_lines is NULL, or more
-   header lines, each with its CRLF. */
-static void reply_send_status(struct tls_session *session, int status,
-                              const char *header_lines,
-                              struct exchange *exchange)
-{
-    char body[REPLY_TEXT_MAX];
-    char text[REPLY_TEXT_MAX * 2];
-    const char *reason = status_get_reason(status);
-    int body_len = snprintf(body, sizeof(body), "%d %s\n", status, reason);
-    int len = snprintf(text, sizeof(text),
-                       "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\n"
-                       "Content-Length: %d\r\n%sConnection: close\r\n\r\n%s",
-                       status, reason, body_len,
-                       header_lines != NULL ? header_lines : "", body);
-    session_send_all(session, text, (size_t)len);
-    exchange->status = status;
-    exchange->reply_bytes = (size_t)len;
-}
-
-static const char *status_get_reason(int status)
-{
-    switch (status) {
-    case 400:
-        return "Bad Request";
-    case 401:
-        return "Unauthorized";
-    case 402:
-        return "Payment Required";
-    case 403:
-        return "Forbidden";
-    case 405:
-        return "Method Not Allowed";
-    case 411:
-        return "Length Required";
-    case 413:
-        return "Content Too Large";
-    case 414:
-        return "URI Too Long";
-    case 429:
-        return "Too Many Requests";
-    case 431:
-        return "Request Header Fields Too Large";
-    case 502:
-        return "Bad Gateway";
-    case 504:
-        return "Gateway Timeout";
-    case 505:
-        return "HTTP Version Not Supported";
-    default:
-        return "Internal Server Error";
-    }
-}
-
-/* The behavior counters count each request of a client IP, this one
-   too, before the Verdict. exchange keeps them for the log. The pow and
-   the signature are checked only when a flag turns them on. */
-static struct verdict request_decide(struct rproxy *rproxy,
-                                     const struct request *request,
-                                     struct exchange *exchange)
-{
-    double now = clock_get_seconds();
-    struct verdict_signals signals = {.ja4_label = exchange->ja4_label,
-                                      .user_agent = request->user_agent,
-                                      .target = request->target};
-    if (rproxy->limit != NULL) {
-        const char *key = rproxy->config.rate_key == RATE_KEY_JA4
-                              ? exchange->ja4
-                              : exchange->client_ip;
-        signals.retry_after = rate_limit_take(rproxy->limit, key, now);
-    }
-    exchange->has_behavior =
-        behavior_add_request(rproxy->counters, exchange->client_ip,
-                             request->target, now, &exchange->behavior);
-    signals.behavior = exchange->behavior;
-    const struct rproxy_config *config = &rproxy->config;
-    signals.is_pow_target = target_has_prefix(
-        request->target, config->pow_prefixes, config->pow_prefix_count);
-    signals.pow_ok =
-        signals.is_pow_target && request_has_pow(rproxy, request, exchange);
-    signals.is_pay_target = target_has_prefix(
-        request->target, config->pay_prefixes, config->pay_prefix_count);
-    signals.bot_verified = request_is_signed(rproxy, request);
-
-    return verdict_decide(&signals);
-}
-
-/* A plain prefix of the target, as an nginx "location /data/" prefix. */
-static bool target_has_prefix(const char *target, const char *const *prefixes,
-                              int count)
-{
-    for (int i = 0; i < count; i++) {
-        if (strncmp(target, prefixes[i], strlen(prefixes[i])) == 0) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool request_has_pow(const struct rproxy *rproxy,
-                            const struct request *request,
-                            const struct exchange *exchange)
-{
-    return pow_is_solved(http_find_header(request, "X-PoW"),
-                         exchange->client_ip, wall_clock_get_seconds(),
-                         rproxy->pow_secret, POW_SECRET_LEN,
-                         rproxy->config.pow_bits);
-}
-
-/* The signature covers @authority, so a request with no Host cannot
-   be verified. */
-static bool request_is_signed(const struct rproxy *rproxy,
-                              const struct request *request)
-{
-    if (rproxy->keys == NULL || request->host == NULL) {
-        return false;
-    }
-    struct bot_auth_message message = {.method = request->method,
-                                       .authority = request->host,
-                                       .target = request->target,
-                                       .find_header = request_find_header,
-                                       .context = request};
-
-    return bot_auth_decide(&message, rproxy->keys, wall_clock_get_seconds(),
-                           NULL) == BOT_AUTH_VERIFIED;
-}
-
-static const char *request_find_header(const void *context, const char *name)
-{
-    return http_find_header(context, name);
-}
-
-static double clock_get_seconds(void)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    return (double)now.tv_sec + (double)now.tv_nsec / NANOSECONDS_PER_SECOND;
-}
-
-static void verdict_apply(struct rproxy *rproxy, struct tls_session *session,
-                          const struct request *request,
-                          const struct verdict *verdict,
-                          struct exchange *exchange)
-{
-    if (verdict->blocks_client) {
-        client_block(rproxy, exchange);
-    }
-    switch (verdict->kind) {
-    case VERDICT_PASS:
-        exchange->verdict_name = "pass";
-        origin_forward(rproxy, session, request, exchange);
-        break;
-    case VERDICT_DENY:
-        exchange->verdict_name = "deny";
-        reply_send_status(session, 403, NULL, exchange);
-        break;
-    case VERDICT_SLOW: {
-        char retry_line[HEADER_LINES_MAX];
-        snprintf(retry_line, sizeof(retry_line), "Retry-After: %d\r\n",
-                 verdict->retry_after);
-        exchange->verdict_name = "slow";
-        reply_send_status(session, 429, retry_line, exchange);
-        break;
-    }
-    case VERDICT_TARPIT:
-        exchange->verdict_name = "tarpit";
-        tarpit_hold(rproxy->config.tarpit);
-        break;
-    case VERDICT_CHALLENGE:
-        exchange->verdict_name = "challenge";
-        challenge_send(rproxy, session, exchange);
-        break;
-    case VERDICT_PAY:
-        exchange->verdict_name = "pay";
-        reply_send_status(session, 402, "crawler-price: " PAY_PRICE "\r\n",
-                          exchange);
-        break;
-    }
-}
-
-/* Only a PASS reaches here, so a denied request never reaches the cache.
-   A hit does not reach an Origin. With the cache on, the reply gets
-   X-Cache. */
-static void origin_forward(struct rproxy *rproxy, struct tls_session *session,
-                           const struct request *request,
-                           struct exchange *exchange)
-{
-    char key[CACHE_KEY_MAX];
-    bool has_key =
-        rproxy->cache != NULL && cache_key_format(request, key, sizeof(key));
-    char *reply = NULL;
-    size_t reply_len = 0;
-    if (has_key &&
-        cache_find(rproxy->cache, key, time(NULL), &reply, &reply_len)) {
-        exchange->cache_name = "hit";
-    } else {
-        int status =
-            origin_fetch(rproxy, request, exchange, &reply, &reply_len);
-        if (status != 0) {
-            reply_send_status(session, status, NULL, exchange);
-            return;
-        }
-        if (has_key) {
-            cache_store(rproxy->cache, key, reply, reply_len, time(NULL));
-        }
-        exchange->cache_name = rproxy->cache != NULL ? "miss" : "-";
-    }
-    /* With the cache on, a matching If-None-Match gets a 304. */
-    bool is_sent = rproxy->cache != NULL &&
-                   reply_is_not_modified(request, reply, reply_len) &&
-                   not_modified_send(session, reply, reply_len, exchange);
-    if (!is_sent) {
-        reply_send(session, reply, reply_len,
-                   rproxy->cache != NULL ? exchange->cache_name : NULL);
-        exchange->status = reply_get_status(reply, reply_len);
-        exchange->reply_bytes = reply_len;
-    }
-    free(reply);
-}
-
-/* The key is the method, the path, and the query.
-   Returns false if the key does not fit. */
-static bool cache_key_format(const struct request *request, char *key,
-                             size_t size)
-{
-    int key_len =
-        snprintf(key, size, "%s %s", request->method, request->target);
-
-    return key_len >= 0 && (size_t)key_len < size;
-}
-
-/* Returns 0 with *reply set to a malloc reply, or a status code. */
-static int origin_fetch(struct rproxy *rproxy, const struct request *request,
-                        struct exchange *exchange, char **reply,
-                        size_t *reply_len)
-{
-    size_t size = HEADER_MAX + FORWARD_EXTRA_MAX + request->body_len;
-    char *request_bytes = malloc(size);
-    size_t request_len =
-        request_bytes == NULL
-            ? 0
-            : forward_format_request(request, exchange->client_ip,
-                                     exchange->ja4, request_bytes, size);
-    if (request_len == 0) {
-        free(request_bytes);
-        return 500;
-    }
-    size_t first = origin_list_pick(&rproxy->list);
-    exchange->origin_index = (int)first;
-    int status = forward_fetch(&rproxy->list, first, request_bytes, request_len,
-                               rproxy->config.origin_timeout, reply, reply_len);
-    free(request_bytes);
-
-    return status;
-}
-
-/* cache_name NULL sends the reply as it is. Otherwise "X-Cache: HIT" or
-   "MISS" goes after the status line. */
-static void reply_send(struct tls_session *session, const char *reply,
-                       size_t reply_len, const char *cache_name)
-{
-    const char *line_end =
-        cache_name == NULL ? NULL : memchr(reply, '\n', reply_len);
-    if (line_end == NULL) {
-        session_send_all(session, reply, reply_len);
-        return;
-    }
-    size_t status_len = (size_t)(line_end - reply) + 1;
-    const char *header = strcmp(cache_name, "hit") == 0 ? "X-Cache: HIT\r\n"
-                                                        : "X-Cache: MISS\r\n";
-    if (session_send_all(session, reply, status_len) &&
-        session_send_all(session, header, strlen(header))) {
-        session_send_all(session, reply + status_len, reply_len - status_len);
-    }
-}
-
-/* Returns the status code of an HTTP reply, or 0 if it has none. */
-static int reply_get_status(const char *reply, size_t reply_len)
-{
-    if (reply_len < STATUS_OFFSET + STATUS_DIGITS ||
-        strncmp(reply, "HTTP/", strlen("HTTP/")) != 0) {
-        return 0;
-    }
-    char text[STATUS_TEXT_MAX] = "";
-    memcpy(text, reply + STATUS_OFFSET, STATUS_DIGITS);
-
-    return atoi(text);
-}
-
-/* A GET whose If-None-Match names the ETag of a 200 reply (RFC 9110
-   section 13.1.2). The Origin never sees If-None-Match (forward.c). */
-static bool reply_is_not_modified(const struct request *request,
-                                  const char *reply, size_t reply_len)
-{
-    const char *if_none_match = http_find_header(request, "If-None-Match");
-
-    return if_none_match != NULL && strcmp(request->method, "GET") == 0 &&
-           reply_get_status(reply, reply_len) == 200 &&
-           cache_is_not_modified(reply, reply_len, if_none_match);
-}
-
-/* Sends a 304 with the ETag and X-Cache, and no body. Returns false, and
-   sends nothing, if the ETag does not fit. On a miss the log keeps the
-   reply bytes from the Origin, for the Scene; on a hit it gets the 304
-   bytes. */
-static bool not_modified_send(struct tls_session *session, const char *reply,
-                              size_t reply_len, struct exchange *exchange)
-{
-    char text[REPLY_TEXT_MAX];
-    size_t etag_len = 0;
-    const char *etag = cache_find_etag(reply, reply_len, &etag_len);
-    bool is_hit = strcmp(exchange->cache_name, "hit") == 0;
-    int len = snprintf(text, sizeof(text),
-                       "HTTP/1.1 304 Not Modified\r\nX-Cache: %s\r\n"
-                       "ETag: %.*s\r\nConnection: close\r\n\r\n",
-                       is_hit ? "HIT" : "MISS", (int)etag_len, etag);
-    if (len < 0 || (size_t)len >= sizeof(text)) {
-        return false;
-    }
-    session_send_all(session, text, (size_t)len);
-    exchange->status = 304;
-    exchange->reply_bytes = is_hit ? (size_t)len : reply_len;
-
-    return true;
-}
-
-/* A 401 with the challenge for the client IP in the current window. RFC
-   9110 section 15.5.2: a 401 has WWW-Authenticate. The scheme follows
-   PrivateToken of RFC 9577: the challenge is an auth-param. */
-static void challenge_send(struct rproxy *rproxy, struct tls_session *session,
-                           struct exchange *exchange)
-{
-    char challenge[POW_CHALLENGE_MAX + 1];
-    char lines[HEADER_LINES_MAX];
-    pow_format_challenge(exchange->client_ip, wall_clock_get_seconds(),
-                         rproxy->pow_secret, POW_SECRET_LEN,
-                         rproxy->config.pow_bits, challenge);
-    snprintf(lines, sizeof(lines),
-             "X-PoW-Challenge: %s\r\n"
-             "WWW-Authenticate: PoW challenge=\"%s\"\r\n",
-             challenge, challenge);
-    reply_send_status(session, 401, lines, exchange);
-}
-
-/* The next connection of the client IP drops at the connection Verdict,
-   until --block-time ends. The block comes before a tarpit, so that the
-   other connections of the client drop while this one is held. */
-static void client_block(struct rproxy *rproxy, const struct exchange *exchange)
-{
-    double now = clock_get_seconds();
-    block_table_add(rproxy->blocks, exchange->client_ip,
-                    now + rproxy->config.block_time, now);
-}
-
-/* Holds the Worker one second at a time, so that a stop does not wait. */
-static void tarpit_hold(int seconds)
-{
-    for (int i = 0; i < seconds && !stop_requested; i++) {
-        sleep(1);
-    }
-}
-
-/* After an error reply, unread request bytes make close() send RST, and
-   the client can lose the reply. Stop writing, then read and drop the
-   rest for a short time, so that close() sends FIN. */
-static void connection_drain(int conn_fd)
-{
-    char scrap[DRAIN_CHUNK_SIZE];
-    struct pollfd watch = {.fd = conn_fd, .events = POLLIN};
-    shutdown(conn_fd, SHUT_WR);
-    for (int i = 0; i < DRAIN_READS_MAX; i++) {
-        if (poll(&watch, 1, DRAIN_WAIT_MS) <= 0 ||
-            read(conn_fd, scrap, sizeof(scrap)) <= 0) {
-            return;
-        }
-    }
-}
-
-/* The socket is blocking with timeouts, so a want means a timeout. */
-static struct tls_session *session_open(struct tls_context *context,
-                                        int conn_fd)
-{
-    struct tls_session *session = tls_session_create(context, conn_fd);
-    if (session != NULL && tls_session_handshake(session) != TLS_DONE) {
-        tls_session_destroy(session);
-        return NULL;
-    }
-
-    return session;
-}
-
-static bool session_send_all(struct tls_session *session, const char *bytes,
-                             size_t len)
-{
-    for (size_t sent = 0; sent < len;) {
-        size_t count = 0;
-        if (tls_session_send(session, bytes + sent, len - sent, &count) !=
-            TLS_DONE) {
-            return false;
-        }
-        sent += count;
-    }
-
-    return true;
-}
-
-/* One line for each connection: client IP, JA4, Verdict, cache result,
-   Origin index, status, reply bytes. "-" marks a value that the connection
-   did not reach. On a cache miss or with the cache off, the reply bytes are
-   the bytes that came from the Origin. */
-static void exchange_log(const struct exchange *exchange)
-{
-    char origin_text[LOG_NUMBER_MAX] = "-";
-    char status_text[LOG_NUMBER_MAX] = "-";
-    if (exchange->origin_index >= 0) {
-        snprintf(origin_text, sizeof(origin_text), "%d",
-                 exchange->origin_index);
-    }
-    if (exchange->status > 0) {
-        snprintf(status_text, sizeof(status_text), "%d", exchange->status);
-    }
-    fprintf(stderr, "%s %s %s %s %s %s %zu\n", exchange->client_ip,
-            exchange->ja4[0] != '\0' ? exchange->ja4 : "-",
-            exchange->verdict_name, exchange->cache_name, origin_text,
-            status_text, exchange->reply_bytes);
-    behavior_log(exchange);
-}
-
-/* A second line after a request Verdict: the behavior counters of the
-   client IP with this request, before its reply. It starts with
-   "behavior", so a reader of the 7-field line can skip it. */
-static void behavior_log(const struct exchange *exchange)
-{
-    if (!exchange->has_behavior) {
-        return;
-    }
-    const struct behavior_counts *counts = &exchange->behavior;
-    fprintf(stderr,
-            "behavior %s requests=%u targets=%u not_found=%u robots=%u "
-            "trap=%u\n",
-            exchange->client_ip, counts->requests, counts->targets,
-            counts->not_found, counts->robots_reads, counts->trap_hits);
 }

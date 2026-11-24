@@ -1,0 +1,78 @@
+#ifndef RPROXY_H
+#define RPROXY_H
+
+#include <stdatomic.h>
+#include <stdbool.h>
+
+#include "config.h"
+#include "forward.h"
+
+/* What all Event loops of the Reverse Proxy share: the settings and the
+   decision tables. main.c makes it at the start and frees it after the
+   loops end. */
+
+/* --block-key can occur this many times. */
+#define BLOCK_KEY_ARG_MAX 16
+/* --pow-prefix and --pay-prefix can each occur this many times. */
+#define PREFIX_ARG_MAX 8
+/* The HMAC key of the pow nonce. RFC 2104 section 3: a key as long as
+   the hash output (SHA-256: 32 bytes). */
+#define POW_SECRET_LEN 32
+
+/* The key of the rate limit table. */
+enum rate_key { RATE_KEY_IP, RATE_KEY_JA4 };
+
+struct rproxy_config {
+    int port;
+    const char *cert_file;
+    const char *key_file;
+    int origin_timeout;
+    int loops;       /* Event loops, one thread each */
+    int connections; /* open connections for each Event loop */
+    double rate;
+    double burst;
+    enum rate_key rate_key;
+    int tarpit;
+    const char *block_list_file; /* NULL when there is no block list */
+    const char *ja4_list_file;   /* NULL when there is no JA4 table */
+    int block_time;
+    /* Keys that are in the block table from the start, for block_time. */
+    const char *block_keys[BLOCK_KEY_ARG_MAX];
+    int block_key_count;
+    /* Targets that start with one of these need a Proof of work. */
+    const char *pow_prefixes[PREFIX_ARG_MAX];
+    int pow_prefix_count;
+    int pow_bits;
+    /* Targets that start with one of these make a crawler pay (402). */
+    const char *pay_prefixes[PREFIX_ARG_MAX];
+    int pay_prefix_count;
+    const char *bot_key_file; /* NULL when there is no Web Bot Auth */
+    struct cache_options cache_options;
+};
+
+struct tls_context;
+struct rate_limit;
+struct ip_list;
+struct ja4_table;
+struct block_table;
+struct behavior;
+struct bot_key_set;
+
+struct rproxy {
+    struct rproxy_config config;
+    struct origin_list list;
+    struct tls_context *context;
+    struct rate_limit *limit;       /* NULL when the rate limit is off */
+    struct cache *cache;            /* NULL when the cache is off */
+    struct ip_list *block_list;     /* NULL without --block-list */
+    struct ja4_table *fingerprints; /* NULL without --ja4-list */
+    struct block_table *blocks;
+    struct behavior *counters;
+    struct bot_key_set *keys; /* NULL without --bot-key */
+    unsigned char pow_secret[POW_SECRET_LEN];
+    /* main sets it after SIGTERM or SIGINT. Each loop reads it at least
+       once a second. */
+    atomic_bool is_stopping;
+};
+
+#endif
