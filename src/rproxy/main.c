@@ -533,6 +533,11 @@ static int loops_run(struct rproxy *rproxy, const sigset_t *stop_signals)
     if (threads == NULL) {
         return -1;
     }
+    if (!event_loop_is_port_free(rproxy->config.port)) {
+        fprintf(stderr, "rproxy: port %d is in use\n", rproxy->config.port);
+        free(threads);
+        return -1;
+    }
     int created = loops_create(rproxy, threads, count);
     int started = created == count ? loops_start(threads, count) : 0;
     if (started == count) {

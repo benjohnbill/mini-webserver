@@ -536,15 +536,15 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 |---|---|---|
 | Event loops | One thread for each online CPU core (`sysconf(_SC_NPROCESSORS_ONLN)`). `--loops N` (1 to 256) changes the count | nginx `worker_processes auto`; Envoy `--concurrency` (default: the hardware threads) |
 | Threads, not processes | The loops are threads of one process, so the decision tables and the cache stay one copy with their mutexes | Envoy and HAProxy: worker threads. nginx needs shared memory zones (`limit_req_zone`) for the same tables |
-| Spread of new connections | Each loop has its own listen socket with `SO_REUSEPORT`. The kernel picks the loop | nginx `listen ... reuseport`; Envoy listeners on Linux |
+| Spread of new connections | Each loop has its own listen socket with `SO_REUSEPORT`. The kernel picks the loop. Before the loops open their sockets, a plain bind checks the port. If another socket holds it, `rproxy` prints `port N is in use` and stops, so a second `rproxy` cannot share the port | nginx `listen ... reuseport`; Envoy listeners on Linux |
 | Connections for each loop | `--connections N` (default 1024). A new connection over the limit is closed at once and logs the Verdict `full` | nginx `worker_connections 1024` (the `nginx.conf` that nginx ships) |
 | Timers | One binary min-heap of deadlines for each loop (`timer_heap`). `epoll_wait` waits until the first deadline, at most 1 s, so a stop does not wait | libuv timers (a min-heap); nginx keeps its timers in a red-black tree |
 | Client timeout | 5 s for each step that waits for the client: the ClientHello, the handshake, the request, each send. The deadline moves when bytes move | The value of the pool (`CLIENT_TIMEOUT`); nginx `client_header_timeout` and `send_timeout` reset on each read or write |
 | Tarpit | A timer of `--tarpit` seconds. The connection stays open and the loop does not read it. At the deadline, the connection closes. No thread waits | Our design: the tarpit must cost the server less than the client (`20261124-arena-layers.md`) |
-| Origin addresses | Resolved once at the start (`getaddrinfo`). A name that does not resolve stops the start | nginx resolves `upstream` server names when it reads the configuration |
+| Origin addresses | Resolved once at the start (`getaddrinfo`), up to 4 addresses for each name, in the order of `getaddrinfo`. A failed connect tries the next address of the same Origin first. A name that does not resolve stops the start | nginx resolves `upstream` server names when it reads the configuration |
 | Origin exchange | A non-blocking `connect`, then the request, then the reply to EOF, inside `--origin-timeout`. A failed connect tries the next Origin once, as the pool did | The behavior of the pool (`forward_fetch`); nginx `proxy_next_upstream error` |
 | TLS | OpenSSL on a non-blocking socket. `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE` set the epoll events of the connection. `SSL_MODE_ENABLE_PARTIAL_WRITE` and `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` are on | OpenSSL `SSL_get_error(3)`: the way nginx and HAProxy drive OpenSSL |
-| Stop | `SIGTERM` or `SIGINT` sets a flag. Each loop sees it within 1 s, closes its connections, and ends. Then `main` prints the cache line and frees the tables | The stop of the pool. nginx graceful shutdown waits for the open requests; `rproxy` does not |
+| Stop | `SIGTERM` or `SIGINT` sets a flag. Each loop sees it within 1 s, closes its connections, and ends. A connection with no Verdict yet logs the Verdict `stop`. Then `main` prints the cache line and frees the tables | The stop of the pool. nginx graceful shutdown waits for the open requests; `rproxy` does not |
 
 ### Order of work
 

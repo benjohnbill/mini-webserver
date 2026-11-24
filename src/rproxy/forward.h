@@ -13,13 +13,17 @@
 #define ORIGIN_MAX 8
 #define ORIGIN_HOST_MAX 64
 #define ORIGIN_PORT_MAX 8
+/* getaddrinfo can give more than one address for a name (IPv6 and IPv4). */
+#define ORIGIN_ADDRESS_MAX 4
 
 struct origin {
     char host[ORIGIN_HOST_MAX];
     char port[ORIGIN_PORT_MAX];
-    /* Set by origin_resolve, once at the start. */
-    struct sockaddr_storage address;
-    socklen_t address_len;
+    /* Set by origin_resolve, once at the start, in the order of
+       getaddrinfo. */
+    struct sockaddr_storage addresses[ORIGIN_ADDRESS_MAX];
+    socklen_t address_lens[ORIGIN_ADDRESS_MAX];
+    size_t address_count;
 };
 
 /* The Origins of --origin, in the order of the command line. next counts
@@ -34,14 +38,15 @@ struct origin_list {
    too long, or the port is not a number from 1 to 65535. */
 int origin_parse(const char *text, struct origin *origin);
 
-/* Resolves the host and the port of origin into its address, with
-   getaddrinfo. Returns 0, or the getaddrinfo error code. */
+/* Resolves the host and the port of origin into up to
+   ORIGIN_ADDRESS_MAX addresses, with getaddrinfo. Returns 0, or the
+   getaddrinfo error code. */
 int origin_resolve(struct origin *origin);
 
-/* Starts a non-blocking connect to the address of origin. Returns the
-   socket, which is non-blocking and can still be in the connect, or -1
-   if the connect failed at once. */
-int origin_connect(const struct origin *origin);
+/* Starts a non-blocking connect to address number index of origin.
+   Returns the socket, which is non-blocking and can still be in the
+   connect, or -1 if the connect failed at once. */
+int origin_connect(const struct origin *origin, size_t index);
 
 /* After a connect in progress makes origin_fd writable: true if the
    connect worked. */

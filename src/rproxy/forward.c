@@ -22,6 +22,8 @@ struct text_cursor {
 };
 
 static bool port_is_valid(const char *port);
+static void origin_address_add(struct origin *origin,
+                               const struct addrinfo *addr);
 static void text_append(struct text_cursor *cursor, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 static void text_append_bytes(struct text_cursor *cursor, const char *bytes,
@@ -56,23 +58,27 @@ int origin_resolve(struct origin *origin)
     if (error != 0) {
         return error;
     }
-    /* The first address only, so that one Origin is one address. */
-    memcpy(&origin->address, found->ai_addr, found->ai_addrlen);
-    origin->address_len = found->ai_addrlen;
+    origin->address_count = 0;
+    for (struct addrinfo *addr = found;
+         addr != NULL && origin->address_count < ORIGIN_ADDRESS_MAX;
+         addr = addr->ai_next) {
+        origin_address_add(origin, addr);
+    }
     freeaddrinfo(found);
 
     return 0;
 }
 
-int origin_connect(const struct origin *origin)
+int origin_connect(const struct origin *origin, size_t index)
 {
-    const struct sockaddr *address = (const struct sockaddr *)&origin->address;
+    const struct sockaddr *address =
+        (const struct sockaddr *)&origin->addresses[index];
     int origin_fd = socket(address->sa_family,
                            SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (origin_fd < 0) {
         return -1;
     }
-    if (connect(origin_fd, address, origin->address_len) != 0 &&
+    if (connect(origin_fd, address, origin->address_lens[index]) != 0 &&
         errno != EINPROGRESS) {
         close(origin_fd);
         return -1;
@@ -136,6 +142,15 @@ static bool port_is_valid(const char *port)
     }
 
     return number >= ORIGIN_PORT_MIN && number <= PORT_MAX;
+}
+
+static void origin_address_add(struct origin *origin,
+                               const struct addrinfo *addr)
+{
+    size_t index = origin->address_count;
+    memcpy(&origin->addresses[index], addr->ai_addr, addr->ai_addrlen);
+    origin->address_lens[index] = addr->ai_addrlen;
+    origin->address_count++;
 }
 
 static void text_append(struct text_cursor *cursor, const char *format, ...)

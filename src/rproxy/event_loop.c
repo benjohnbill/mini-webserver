@@ -133,7 +133,8 @@ struct connection {
     char *origin_request; /* the bytes for the Origin */
     size_t origin_request_len;
     size_t origin_request_sent;
-    size_t origin_index; /* the Origin of the current connect */
+    size_t origin_index;  /* the Origin of the current connect */
+    size_t address_index; /* its address of the current connect */
     bool has_tried_next;
     char *reply; /* from the Origin or the cache */
     size_t reply_len;
@@ -305,6 +306,23 @@ int event_loop_run(struct event_loop *loop)
     loop_close_all(loop);
 
     return result;
+}
+
+bool event_loop_is_port_free(int port)
+{
+    int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe_fd < 0) {
+        return false;
+    }
+    int reuse = 1;
+    struct sockaddr_in addr = {.sin_family = AF_INET,
+                               .sin_addr.s_addr = htonl(INADDR_ANY),
+                               .sin_port = htons((uint16_t)port)};
+    setsockopt(probe_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    bool is_free = bind(probe_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(probe_fd);
+
+    return is_free;
 }
 
 /* SO_REUSEPORT: each loop has its own listen socket on the same port, and
@@ -1128,8 +1146,8 @@ static bool origin_request_format(struct connection *connection)
 static enum step origin_connect_start(struct connection *connection)
 {
     const struct origin_list *list = &connection->loop->rproxy->list;
-    connection->origin_fd =
-        origin_connect(&list->origins[connection->origin_index]);
+    connection->origin_fd = origin_connect(
+        &list->origins[connection->origin_index], connection->address_index);
     if (connection->origin_fd < 0) {
         return origin_connect_retry(connection);
     }
@@ -1144,17 +1162,25 @@ static enum step origin_connect_start(struct connection *connection)
     return STEP_WAIT;
 }
 
-/* A failed connect tries the next Origin once, as nginx
-   proxy_next_upstream error. Then the client gets 502. */
+/* A failed connect tries the next address of the same Origin, as
+   forward_fetch tried each getaddrinfo result. When the addresses end, it
+   tries the next Origin once, as nginx proxy_next_upstream error. Then the
+   client gets 502. */
 static enum step origin_connect_retry(struct connection *connection)
 {
-    size_t count = connection->loop->rproxy->list.count;
+    const struct origin_list *list = &connection->loop->rproxy->list;
+    const struct origin *origin = &list->origins[connection->origin_index];
     origin_socket_close(connection);
-    if (connection->has_tried_next || count < 2) {
+    if (connection->address_index + 1 < origin->address_count) {
+        connection->address_index++;
+        return origin_connect_start(connection);
+    }
+    if (connection->has_tried_next || list->count < 2) {
         return origin_exchange_end(connection, 502);
     }
     connection->has_tried_next = true;
-    connection->origin_index = (connection->origin_index + 1) % count;
+    connection->origin_index = (connection->origin_index + 1) % list->count;
+    connection->address_index = 0;
 
     return origin_connect_start(connection);
 }
@@ -1468,10 +1494,15 @@ static void loop_free_closed(struct event_loop *loop)
     }
 }
 
-/* At a stop: rproxy does not wait for the open requests. */
+/* At a stop: rproxy does not wait for the open requests. A connection
+   with no Verdict yet logs the Verdict stop. */
 static void loop_close_all(struct event_loop *loop)
 {
     while (loop->connections != NULL) {
+        struct exchange *exchange = &loop->connections->exchange;
+        if (strcmp(exchange->verdict_name, "-") == 0) {
+            exchange->verdict_name = "stop";
+        }
         connection_close(loop->connections);
     }
     loop_free_closed(loop);
