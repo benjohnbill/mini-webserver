@@ -44,12 +44,14 @@ static struct verdict decide_with_not_found(unsigned not_found)
     return verdict_decide(&signals);
 }
 
-static struct verdict decide_with_slowed(unsigned slowed, int retry_after)
+static struct verdict decide_with_slowed(unsigned slowed, int retry_after,
+                                         bool limit_is_per_ip)
 {
     struct verdict_signals signals = {
         .user_agent = "curl/8.18.0",
         .target = "/",
         .retry_after = retry_after,
+        .limit_is_per_ip = limit_is_per_ip,
         .behavior = {.requests = slowed + 1, .slowed = slowed}};
 
     return verdict_decide(&signals);
@@ -202,7 +204,7 @@ static void a_denied_crawler_and_a_slowed_client_are_not_blocked(void)
 
 static void a_client_over_the_limit_after_five_429s_is_slowed_and_blocked(void)
 {
-    struct verdict verdict = decide_with_slowed(5, 7);
+    struct verdict verdict = decide_with_slowed(5, 7, true);
     CHECK_EQ_INT(verdict.kind, VERDICT_SLOW);
     CHECK_EQ_INT(verdict.retry_after, 7);
     CHECK(verdict.blocks_client);
@@ -210,15 +212,22 @@ static void a_client_over_the_limit_after_five_429s_is_slowed_and_blocked(void)
 
 static void a_client_over_the_limit_after_four_429s_is_not_blocked(void)
 {
-    struct verdict verdict = decide_with_slowed(4, 7);
+    struct verdict verdict = decide_with_slowed(4, 7, true);
     CHECK_EQ_INT(verdict.kind, VERDICT_SLOW);
     CHECK(!verdict.blocks_client);
 }
 
 static void a_client_within_the_limit_after_five_429s_passes(void)
 {
-    struct verdict verdict = decide_with_slowed(5, 0);
+    struct verdict verdict = decide_with_slowed(5, 0, true);
     CHECK_EQ_INT(verdict.kind, VERDICT_PASS);
+    CHECK(!verdict.blocks_client);
+}
+
+static void a_client_over_a_ja4_limit_after_five_429s_is_not_blocked(void)
+{
+    struct verdict verdict = decide_with_slowed(5, 7, false);
+    CHECK_EQ_INT(verdict.kind, VERDICT_SLOW);
     CHECK(!verdict.blocks_client);
 }
 
@@ -357,6 +366,7 @@ int main(void)
     a_client_over_the_limit_after_five_429s_is_slowed_and_blocked();
     a_client_over_the_limit_after_four_429s_is_not_blocked();
     a_client_within_the_limit_after_five_429s_passes();
+    a_client_over_a_ja4_limit_after_five_429s_is_not_blocked();
     a_pow_target_without_a_solution_gets_the_challenge();
     a_pow_target_with_a_solution_passes();
     a_target_outside_the_pow_prefix_passes_with_no_solution();
