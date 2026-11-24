@@ -29,7 +29,9 @@ DATE=$(date +%Y%m%d)
 # than the dataset (16.7 MiB) shows the long tail: rare pages miss.
 CACHE_BYTES=${CACHE_BYTES:-}
 CACHE_FLAG=${CACHE_BYTES:+ --cache-bytes $CACHE_BYTES}
-OUT=docs/measurements/$DATE-arena-$CRAWLER${CACHE_BYTES:+-cache$CACHE_BYTES}.md
+# RUN numbers repeated Scenes: each run writes its own file, -r<RUN>.
+RUN=${RUN:-}
+OUT=docs/measurements/$DATE-arena-$CRAWLER${CACHE_BYTES:+-cache$CACHE_BYTES}${RUN:+-r$RUN}.md
 BASE=https://$HOST:$PX_PORT
 WORK=$(mktemp -d)
 ORIGIN_PID=
@@ -117,6 +119,13 @@ programs_start() {
     port_wait "$PX_PID" "$PX_PORT" || { echo "rproxy did not start"; exit 1; }
 }
 
+# cpu_seconds <pid>: the user and system CPU time of the process and all
+# its threads, from /proc/<pid>/stat fields 14 and 15 (clock ticks).
+cpu_seconds() {
+    awk -v hz="$(getconf CLK_TCK)" '{ printf "%.2f", ($14 + $15) / hz }' \
+        "/proc/$1/stat" 2>/dev/null || echo -
+}
+
 programs_stop() {
     for pid in $PX_PID $ORIGIN_PID; do
         kill -TERM "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
@@ -174,18 +183,22 @@ preset_run() {
     bench/arena/human.py "$BASE" "$DURATION" >"$WORK/human.out" &
     local human_pid=$!
     wait "$crawler_pid" "$human_pid"
+    local px_cpu origin_cpu
+    px_cpu=$(cpu_seconds "$PX_PID")
+    origin_cpu=$(cpu_seconds "$ORIGIN_PID")
     programs_stop
     local kind summary
     for kind in crawler human; do
         summary=$(cat "$WORK/$kind.out")
         echo "   $summary"
-        printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$preset" \
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' "$preset" \
             "$([ "$kind" = human ] && echo human || echo "$CRAWLER")" \
             "$(client_view "$summary" sent)" \
             "$(client_view "$summary" statuses)" \
             "$(client_view "$summary" mean_ms)" \
+            "$(client_view "$summary" p95_ms)" \
             "$(client_view "$summary" pow_cpu_s)" \
-            "$(log_count "$kind")" >>"$WORK/rows"
+            "$(log_count "$kind")" "$px_cpu" "$origin_cpu" >>"$WORK/rows"
     done
 }
 
@@ -209,11 +222,12 @@ EOF
 
 Columns:
 
-- Sent, Statuses, and Mean ms are the view of the client: the requests that ended before the stop, their status codes (000: no reply), and their mean time. PoW CPU s is the CPU time that the client spent on proof of work solutions (Python clients only).
+- Sent, Statuses, Mean ms, and P95 ms are the view of the client: the requests that ended before the stop, their status codes (000: no reply), their mean time, and their 95th percentile time. A request that is still in flight at the stop is in none of them. PoW CPU s is the CPU time that the client spent on proof of work solutions (Python clients only).
 - The other columns count the rproxy log lines of the client. Pass, Deny, Slow, Tarpit, Drop, Challenge, and Pay are the Verdicts. Drop is the connection Verdict: no TLS byte goes out. To Origin counts the requests that rproxy sent to the Origin. MiB from Origin is the sum of the reply bytes of those requests.
+- rproxy CPU s and Origin CPU s are the CPU time (user and system, all threads) of each program for the whole preset. Both client rows of a preset show the same two values.
 
-| Preset | Client | Sent | Statuses | Mean ms | PoW CPU s | Log lines | Pass | Deny | Slow | Tarpit | Drop | Challenge | Pay | Cache hits | To Origin | MiB from Origin |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Preset | Client | Sent | Statuses | Mean ms | P95 ms | PoW CPU s | Log lines | Pass | Deny | Slow | Tarpit | Drop | Challenge | Pay | Cache hits | To Origin | MiB from Origin | rproxy CPU s | Origin CPU s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 EOF
     cat "$WORK/rows" >>"$OUT"
 }

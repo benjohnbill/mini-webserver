@@ -2,7 +2,7 @@
 #   bench/arena/<name>.sh BASE_URL DURATION
 # and sources this file. It starts its loops with loop_start, then calls
 # arena_finish. arena_finish waits DURATION seconds, stops the loops, and
-# prints one line: "<name> sent=N mean_ms=M <status>=<count> ...".
+# prints one line: "<name> sent=N mean_ms=M p95_ms=P <status>=<count> ...".
 # A status of 000 is a request with no reply (a tarpit, a reset, or a
 # timeout). A request that is in flight at the end is not counted.
 set -u
@@ -70,10 +70,14 @@ arena_finish() {
     wait 2>/dev/null
     LOOP_PIDS=()
     cat "$ARENA_WORK"/loop.* 2>/dev/null | awk -v name="$name" '
-        NF == 2 { sent++; time += $2; count[$1]++ }
+        NF == 2 { sent++; time += $2; times[sent] = $2; count[$1]++ }
         END {
-            printf "%s sent=%d mean_ms=%.0f", name, sent,
-                sent ? time * 1000 / sent : 0
+            # p95 by the nearest-rank method, as arena.py
+            asort(times)
+            rank = int(sent * 0.95)
+            if (rank < sent * 0.95) rank++
+            printf "%s sent=%d mean_ms=%.0f p95_ms=%.0f", name, sent,
+                sent ? time * 1000 / sent : 0, sent ? times[rank] * 1000 : 0
             n = asorti(count, codes)
             for (i = 1; i <= n; i++) printf " %s=%d", codes[i], count[codes[i]]
             printf "\n"

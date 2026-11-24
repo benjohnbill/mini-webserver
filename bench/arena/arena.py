@@ -3,7 +3,7 @@
 It is lib.sh for Python, with the standard library only. Each script runs as
     bench/arena/<name>.py BASE_URL DURATION
 and prints one line at the end, as lib.sh does:
-    "<name> sent=N mean_ms=M pow_cpu_s=S <status>=<count> ..."
+    "<name> sent=N mean_ms=M p95_ms=P pow_cpu_s=S <status>=<count> ..."
 A status of 000 is a request with no reply (a tarpit, a reset, or a
 timeout). A request that is in flight at the end is not counted.
 pow_cpu_s is the CPU time that the proof of work solutions took.
@@ -12,6 +12,7 @@ pow_cpu_s is the CPU time that the proof of work solutions took.
 import functools
 import hashlib
 import http.client
+import math
 import os
 import ssl
 import sys
@@ -139,6 +140,15 @@ class Client:
         return status if status == '000' else int(status), reply_headers
 
 
+def p95_ms(times):
+    """The 95th percentile of times, in ms, by the nearest-rank method. A
+    request that is still in flight at the stop is not in times."""
+    if not times:
+        return 0
+    ordered = sorted(times)
+    return ordered[math.ceil(len(ordered) * 0.95) - 1] * 1000
+
+
 class Run:
     """The loops of one script and their results, as lib.sh."""
 
@@ -149,6 +159,7 @@ class Run:
         self.counts = {}
         self.sent = 0
         self.seconds = 0.0
+        self.times = []
         self.pow_seconds = 0.0
 
     def is_running(self):
@@ -162,6 +173,7 @@ class Run:
         with self.lock:
             self.sent += 1
             self.seconds += seconds
+            self.times.append(seconds)
             self.counts[key] = self.counts.get(key, 0) + 1
 
     def pow_add(self, cpu_seconds):
@@ -181,6 +193,7 @@ class Run:
         with self.lock:
             mean_ms = self.seconds * 1000 / self.sent if self.sent else 0
             line = (f'{self.name} sent={self.sent} mean_ms={mean_ms:.0f} '
+                    f'p95_ms={p95_ms(self.times):.0f} '
                     f'pow_cpu_s={self.pow_seconds:.2f}')
             for status in sorted(self.counts):
                 line += f' {status}={self.counts[status]}'
