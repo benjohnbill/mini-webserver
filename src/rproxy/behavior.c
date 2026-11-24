@@ -13,6 +13,7 @@
    can be low. It is never high. */
 
 #define NOT_FOUND 404
+#define TOO_MANY_REQUESTS 429
 #define BITS_PER_WORD 64
 #define TARGET_WORDS (BEHAVIOR_TARGET_BITS / BITS_PER_WORD)
 #define FNV_OFFSET_BASIS 2166136261U
@@ -113,6 +114,9 @@ bool behavior_add_reply(struct behavior *counters, const char *key, int status,
                       !entry_is_expired(entry, counters->options.window, now);
     if (is_counted && status == NOT_FOUND) {
         entry->counts.not_found++;
+    }
+    if (is_counted && status == TOO_MANY_REQUESTS) {
+        entry->counts.slowed++;
     }
     pthread_mutex_unlock(&counters->lock);
 

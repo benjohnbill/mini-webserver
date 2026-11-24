@@ -17,6 +17,10 @@ struct verdict_rule {
 /* fail2ban maxretry: 5 failures in the window (findtime) ban the client.
    The window is the window of the behavior counters. */
 #define SCANNER_NOT_FOUND_MAX 5
+/* The same maxretry for 429 replies: a client that is over the limit
+   again after five 429s in the window goes into the block table, so its
+   next connections drop before the TLS handshake. */
+#define LIMIT_SLOWED_MAX 5
 #define BROWSER_LABEL "browser"
 
 /* User-Agent tokens of AI and SEO crawlers that name themselves. */
@@ -31,6 +35,7 @@ static bool crawler_must_pay(const struct verdict_signals *signals);
 static bool agent_is_crawler(const struct verdict_signals *signals);
 static bool agent_lies_about_chrome(const struct verdict_signals *signals);
 static bool request_needs_pow(const struct verdict_signals *signals);
+static bool client_keeps_over_limit(const struct verdict_signals *signals);
 static bool request_is_over_limit(const struct verdict_signals *signals);
 
 /* The two rules that block come first: they are the strongest evidence,
@@ -46,6 +51,7 @@ static const struct verdict_rule rules[] = {
     {agent_is_crawler, VERDICT_DENY, false},
     {agent_lies_about_chrome, VERDICT_TARPIT, false},
     {request_needs_pow, VERDICT_CHALLENGE, false},
+    {client_keeps_over_limit, VERDICT_SLOW, true},
     {request_is_over_limit, VERDICT_SLOW, false},
 };
 
@@ -118,6 +124,12 @@ static bool agent_lies_about_chrome(const struct verdict_signals *signals)
 static bool request_needs_pow(const struct verdict_signals *signals)
 {
     return signals->is_pow_target && !signals->pow_ok;
+}
+
+static bool client_keeps_over_limit(const struct verdict_signals *signals)
+{
+    return request_is_over_limit(signals) &&
+           signals->behavior.slowed >= LIMIT_SLOWED_MAX;
 }
 
 static bool request_is_over_limit(const struct verdict_signals *signals)

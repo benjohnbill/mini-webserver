@@ -1439,9 +1439,10 @@ static void behavior_log(const struct exchange *exchange)
     const struct behavior_counts *counts = &exchange->behavior;
     fprintf(stderr,
             "behavior %s requests=%u targets=%u not_found=%u robots=%u "
-            "trap=%u\n",
+            "trap=%u slowed=%u\n",
             exchange->client_ip, counts->requests, counts->targets,
-            counts->not_found, counts->robots_reads, counts->trap_hits);
+            counts->not_found, counts->robots_reads, counts->trap_hits,
+            counts->slowed);
 }
 
 static void loop_expire_timers(struct event_loop *loop)

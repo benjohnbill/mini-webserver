@@ -31,6 +31,7 @@ struct behavior_counts {
     unsigned not_found; /* 404 replies */
     unsigned robots_reads;
     unsigned trap_hits;
+    unsigned slowed; /* 429 replies */
 };
 
 /* Returns NULL if key_max is 0, or if memory or the lock cannot be set
@@ -47,7 +48,7 @@ bool behavior_add_request(struct behavior *counters, const char *key,
                           struct behavior_counts *counts);
 
 /* Adds the status of the reply to the request that behavior_add_request
-   added last for key. Only 404 changes a count. Returns false, and changes
+   added last for key. Only 404 and 429 change a count. Returns false, and changes
    nothing, if key is not in the table or its window ended at now. */
 bool behavior_add_reply(struct behavior *counters, const char *key, int status,
                         double now);
