@@ -438,6 +438,65 @@ code=$?
     && pass "after five 404 replies the client IP gets no TLS handshake" \
     || fail "after five 404 replies the client IP gets no TLS handshake: curl exit $code"
 
+# Event loops (docs/adr/reverse-proxy-runs-one-event-loop-per-core.md):
+# with one loop, a held connection does not hold the other clients.
+start_proxy --origin "$HOST:$SERVER_PORT" --loops 1 --tarpit 3 --block-time 60
+curl -sk --max-time 6 --interface 127.0.0.4 -o /dev/null "$BASE/trap/" &
+trap_pid=$!
+sleep 0.5
+got="$(curl -sk --max-time 2 --interface 127.0.0.5 -o /dev/null \
+    -w '%{http_code}' "$BASE/")"
+[ "$got" = "200" ] \
+    && pass "with one Event loop, a tarpit does not hold another client" \
+    || fail "with one Event loop, a tarpit does not hold another client: got '$got'"
+wait "$trap_pid" 2>/dev/null
+grep -q '^127\.0\.0\.4 [^ ]* tarpit - - - 0$' "$WORK/rproxy.err" \
+    && pass "the tarpit ends after --tarpit seconds and is logged" \
+    || fail "the tarpit ends after --tarpit seconds and is logged"
+
+# A Stuck connection: it sends no ClientHello.
+sleep 30 | nc 127.0.0.1 "$PROXY_PORT" > /dev/null 2>&1 &
+stuck_pid=$!
+sleep 0.5
+got="$(curl -sk --max-time 2 --interface 127.0.0.6 -o /dev/null \
+    -w '%{http_code}' "$BASE/")"
+[ "$got" = "200" ] \
+    && pass "with one Event loop, a Stuck connection does not hold another client" \
+    || fail "with one Event loop, a Stuck connection does not hold another client: got '$got'"
+kill "$stuck_pid" 2>/dev/null; wait "$stuck_pid" 2>/dev/null
+
+# Many clients at once on few loops: each one gets its reply.
+start_proxy --origin "$HOST:$SERVER_PORT" --loops 2
+for i in $(seq 1 40); do
+    curl -sk --max-time 5 -o /dev/null -w '%{http_code}\n' "$BASE/" &
+done > "$WORK/many"
+wait
+[ "$(grep -c '^200$' "$WORK/many")" = "40" ] \
+    && pass "40 clients at once on 2 Event loops all get 200" \
+    || fail "40 clients at once on 2 Event loops all get 200: $(sort "$WORK/many" | uniq -c | tr '\n' ' ')"
+
+# A POST body larger than one TLS record reaches the Origin whole.
+head -c 40000 /dev/zero | tr '\0' 'a' > "$WORK/big_body"
+start_proxy --origin "$HOST:$ORIGIN_A"
+: > "$WORK/A.log"
+curl -sk --max-time 5 -o /dev/null --data-binary @"$WORK/big_body" "$BASE/echo"
+grep -q $'^Content-Length: 40000\r$' "$WORK/A.log" \
+    && pass "a 40000-byte POST body reaches the Origin with its length" \
+    || fail "a 40000-byte POST body reaches the Origin with its length"
+
+for bad in 0 x; do
+    "$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
+        --origin "$HOST:$ORIGIN_A" --loops "$bad" 2> /dev/null &
+    bad_pid=$!
+    sleep 0.5
+    if kill -0 "$bad_pid" 2>/dev/null; then
+        kill "$bad_pid"; wait "$bad_pid" 2>/dev/null
+        fail "--loops $bad stops rproxy at the start"
+    else
+        pass "--loops $bad stops rproxy at the start"
+    fi
+done
+
 if [ "$FAILS" -gt 0 ]; then
     echo "--- rproxy stderr ---"
     cat "$WORK/rproxy.err"

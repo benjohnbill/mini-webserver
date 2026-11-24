@@ -22,6 +22,10 @@ _Avoid_: mode, strategy, dispatcher (the code may use `dispatch` as a verb only)
 An execution unit (a thread or a process) that serves one connection at a time. In `iter`, the main loop is the only worker. In `fork`, each child process is a worker. In `pool`, each thread of the pool is a worker. `epoll` has no worker.
 _Avoid_: thread (when you mean a worker of any model), handler
 
+**Event loop**:
+A thread of `rproxy` that waits on one epoll instance and serves many connections at the same time. A connection that waits (a tarpit, a slow client) holds no thread. `rproxy` has one Event loop for each CPU core. The `server` program calls its own single loop the `epoll` Concurrency model.
+_Avoid_: worker (in `rproxy`), reactor, event thread
+
 **Scene**:
 One experiment that we run with the same commands on each Concurrency model, to compare the models. The Scenes are S1 to S4.
 _Avoid_: scenario, benchmark (a Scene can also have no measurement)

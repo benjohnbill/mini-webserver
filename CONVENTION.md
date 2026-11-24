@@ -43,6 +43,7 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | `decide` | Turn signals into one choice from an enum |
    | `fetch` | Send a request and read the full reply |
    | `add` | Put one more item into a struct that exists. Return false, and change nothing, if it does not fit |
+   | `remove` | Take an item out of a struct. Do nothing, or return `NULL`, if it is not there |
 
 4. **One concept has one name in all files.** When you add a concept, add a row.
 
@@ -65,6 +66,9 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | The block table | `struct block_table *blocks` | `table`, `bans`, `jail` |
    | The Behavior counter table | `struct behavior *counters` | `table`, `stats`, `tracker` |
    | The Web Bot Auth keys | `struct bot_key_set *keys` | `bots`, `key_set`, `bot_keys` |
+   | An Event loop of the Reverse Proxy | `struct event_loop *loop` | `reactor`, `worker`, `el` |
+   | The timers of one Event loop | `struct timer_heap *timers` | `heap`, `pq`, `queue` |
+   | One timer, inside its owner | `struct timer *timer` | `t`, `deadline` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

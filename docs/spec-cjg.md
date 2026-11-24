@@ -519,6 +519,24 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 | Clock of the pow and the signature | The wall clock (`CLOCK_REALTIME`). The rate limit and the counters keep the monotonic clock | RFC 9421 `created` and `expires` are wall clock times |
 | `--bot-key FILE` | Read once at the start, as `--ja4-list`. A bad line prints the file and the line number, and stops the start | nginx `-t` |
 
+#### Event loops (step 13)
+
+[ADR: one Event loop for each core](adr/reverse-proxy-runs-one-event-loop-per-core.md). The owner asked for the structure of a real edge proxy and left the details to the generator (2026-11-24). Each row is a value that the generator chose. The owner can change each row.
+
+| Choice | Value | Source |
+|---|---|---|
+| Event loops | One thread for each online CPU core (`sysconf(_SC_NPROCESSORS_ONLN)`). `--loops N` (1 to 256) changes the count | nginx `worker_processes auto`; Envoy `--concurrency` (default: the hardware threads) |
+| Threads, not processes | The loops are threads of one process, so the decision tables and the cache stay one copy with their mutexes | Envoy and HAProxy: worker threads. nginx needs shared memory zones (`limit_req_zone`) for the same tables |
+| Spread of new connections | Each loop has its own listen socket with `SO_REUSEPORT`. The kernel picks the loop | nginx `listen ... reuseport`; Envoy listeners on Linux |
+| Connections for each loop | `--connections N` (default 1024). A new connection over the limit is closed at once and logs the Verdict `full` | nginx `worker_connections 1024` (the `nginx.conf` that nginx ships) |
+| Timers | One binary min-heap of deadlines for each loop (`timer_heap`). `epoll_wait` waits until the first deadline, at most 1 s, so a stop does not wait | libuv timers (a min-heap); nginx keeps its timers in a red-black tree |
+| Client timeout | 5 s for each step that waits for the client: the ClientHello, the handshake, the request, each send. The deadline moves when bytes move | The value of the pool (`CLIENT_TIMEOUT`); nginx `client_header_timeout` and `send_timeout` reset on each read or write |
+| Tarpit | A timer of `--tarpit` seconds. The connection stays open and the loop does not read it. At the deadline, the connection closes. No thread waits | Our design: the tarpit must cost the server less than the client (`20261124-arena-layers.md`) |
+| Origin addresses | Resolved once at the start (`getaddrinfo`). A name that does not resolve stops the start | nginx resolves `upstream` server names when it reads the configuration |
+| Origin exchange | A non-blocking `connect`, then the request, then the reply to EOF, inside `--origin-timeout`. A failed connect tries the next Origin once, as the pool did | The behavior of the pool (`forward_fetch`); nginx `proxy_next_upstream error` |
+| TLS | OpenSSL on a non-blocking socket. `SSL_ERROR_WANT_READ` and `SSL_ERROR_WANT_WRITE` set the epoll events of the connection. `SSL_MODE_ENABLE_PARTIAL_WRITE` and `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER` are on | OpenSSL `SSL_get_error(3)`: the way nginx and HAProxy drive OpenSSL |
+| Stop | `SIGTERM` or `SIGINT` sets a flag. Each loop sees it within 1 s, closes its connections, and ends. Then `main` prints the cache line and frees the tables | The stop of the pool. nginx graceful shutdown waits for the open requests; `rproxy` does not |
+
 ### Order of work
 
 1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand.
@@ -533,3 +551,4 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 10. Proof of work. Done (2026-11-24). The flags: `--pow-prefix PATH` and `--pow-bits N`. A challenge logs the Verdict `challenge`.
 11. Web Bot Auth and 402. Done (2026-11-24). The flags: `--pay-prefix PATH` and `--bot-key FILE`. A 402 logs the Verdict `pay`. `tests/data/bot_test_key.pem` is a test key for `tests/rproxy_func.sh` only.
 12. `human.sh` in Python, the new Crawler scripts, the `layers` preset, and the Scenes. Done (2026-11-24). Results: [`20261124-arena-layers.md`](measurements/20261124-arena-layers.md). The Scene shows one cost: a tarpit holds an rproxy Worker, so `disguised` starves `human.py`.
+13. Event loops in place of the pool (section "Event loops"). `timer_heap` and its tests first. The flag `--workers` of `rproxy` becomes `--loops`, and `--connections` is new. `tests/rproxy_func.sh` checks that a tarpit and a Stuck connection do not hold another client on one loop. Then the `layers` Scene of `disguised` runs again.
