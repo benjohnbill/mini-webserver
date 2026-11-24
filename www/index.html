@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mini-webserver</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header>
+    <img src="/img/logo.png" alt="logo" width="32" height="32">
+    <h1>mini-webserver</h1>
+  </header>
+
+  <main>
+    <section>
+      <h2>Static files</h2>
+      <p>This page, its stylesheet, script and logo are served from the static root.</p>
+    </section>
+
+    <section>
+      <h2>Dynamic requests</h2>
+      <ul>
+        <li><a href="/echo?x=1">/echo?x=1</a> &mdash; built-in echo handler</li>
+        <li><a href="/cgi-bin/hello.sh?name=jungle">/cgi-bin/hello.sh</a> &mdash; shell CGI</li>
+      </ul>
+
+      <form method="post" action="/cgi-bin/form.py">
+        <label>Name <input name="name" value="jungle"></label>
+        <label>Message <input name="msg" value="hello &amp; welcome"></label>
+        <button type="submit">POST to /cgi-bin/form.py</button>
+      </form>
+    </section>
+
+    <section>
+      <h2>Fetch from JavaScript</h2>
+      <button id="echo-btn" type="button">POST /echo</button>
+      <pre id="echo-out">(click the button)</pre>
+    </section>
+  </main>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
