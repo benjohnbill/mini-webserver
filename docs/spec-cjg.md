@@ -325,11 +325,19 @@ The four decision modules do not use sockets or OpenSSL I/O. Unit tests call the
 
 ```text
 src/rproxy/
-  main.c            arguments, listen socket, pool, one connection:
-                    peek, Verdict, TLS, forward
-  tls.c/h           OpenSSL context and handshake (I/O)
-  forward.c/h       one request to the Origin, with X-Forwarded-For and
-                    X-JA4 (I/O)
+  main.c            arguments, start, one thread for each Event loop,
+                    stop (step 13, code done)
+  rproxy.h          the settings and the tables that all loops share
+  event_loop.c/h    one Event loop: epoll, listen socket, timers, and the
+                    state machine of one connection: peek, Verdict, TLS,
+                    request, Verdict, cache or Origin, reply, close (I/O)
+                    (step 13, code done)
+  timer_heap.c/h    the timers of one loop, time is an argument     test
+                    (step 13, code done)
+  tls.c/h           OpenSSL context, and non-blocking handshake, read,
+                    and send steps (I/O)
+  forward.c/h       the Origins: resolve, non-blocking connect, and the
+                    request with X-Forwarded-For and X-JA4 (I/O)
   client_hello.c/h  ClientHello bytes -> struct client_hello        test
   ja4.c/h           struct client_hello -> JA4 string             test
   rate_limit.c/h    token bucket for each key, time is an argument test
@@ -338,6 +346,7 @@ src/rproxy/
                                                                   test
 tests/
   test_client_hello.c  test_ja4.c  test_rate_limit.c  test_verdict.c
+  test_timer_heap.c
   rproxy_func.sh    curl -k through rproxy to a running server
 bench/arena/        Crawler scripts
 ```

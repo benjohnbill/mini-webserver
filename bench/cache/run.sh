@@ -7,7 +7,7 @@
 #
 # Each run: an Origin (./server --model fork --delay DELAY_MS, so the
 # delay does not serialize the Origin) and ./rproxy in front of it, over
-# TLS. rproxy has only the pool model.
+# TLS. rproxy runs Event loops (--loops).
 # wrk warms up for WARMUP s, then measures for DURATION s with zipf.lua.
 # mem.sh samples the Pss of rproxy 2 s before the end. SIGTERM stops
 # rproxy, and the script reads the "cache ..." line of its stderr.
@@ -249,12 +249,12 @@ phase_p3_ttl() {
 
 phase_p3_lock() {
     local table
-    table=$(table_start P3-lock "lock global and striped, pool with 4 and 16 Workers")
-    for workers in 4 16; do
+    table=$(table_start P3-lock "lock global and striped, 4 and 16 Event loops")
+    for loops in 4 16; do
         for lock in global striped; do
-            run_variant "$table" "lock $lock, workers $workers" \
+            run_variant "$table" "lock $lock, loops $loops" \
                 "${LOCK_RUNS:-3}" \
-                --cache on --cache-lock "$lock" --workers "$workers"
+                --cache on --cache-lock "$lock" --loops "$loops"
         done
     done
 }
