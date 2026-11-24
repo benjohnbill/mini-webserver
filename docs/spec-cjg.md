@@ -548,13 +548,13 @@ The owner asked the generator to fill steps 8 to 12 by common practice (2026-11-
 
 ### Order of work
 
-1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand.
-2. `ja4` tests (they fail), and the slot. The expected values come from the FoxIO JA4 document (`technical_details/JA4.md`), checked with `sha256sum`.
-3. `tls`, `forward`, `main`, and `tests/rproxy_func.sh`.
-4. `rate_limit` and `verdict`: tests first, then the slots.
+1. `client_hello` and its tests. Test data: ClientHello bytes that `openssl s_client` and curl sent, and records made by hand. Done (2026-11-24).
+2. `ja4` tests (they fail), and the slot. The expected values come from the FoxIO JA4 document (`technical_details/JA4.md`), checked with `sha256sum`. Done (2026-11-24).
+3. `tls`, `forward`, `main`, and `tests/rproxy_func.sh`. Done (2026-11-24).
+4. `rate_limit` and `verdict`: tests first, then the slots. Done (2026-11-24).
 5. Done (2026-11-24). The cache moves to `rproxy`. The cache Scenes of 2026-11-23 run again. Then the Proxy Route leaves the server. Parity: [`20261124-rproxy-cache-parity.md`](measurements/20261124-rproxy-cache-parity.md).
-6. Crawler scripts and the Scenes of the arena (section "Arena").
-7. Shared core: `http_find_header`, and `ETag` with 304 for static files. Tests first.
+6. Crawler scripts and the Scenes of the arena (section "Arena"). Done (2026-11-24).
+7. Shared core: `http_find_header`, and `ETag` with 304 for static files. Tests first. Done (2026-11-24).
 8. Two Verdict stages: `connection_decide` (slot, row 4) with its tests, `ip_list`, `block_table`, and the JA4 table. Done (2026-11-24). The owner chose that the generator writes row 4 by practice. The files: `ip_list`, `ja4_table`, `block_table`, and `connection_verdict` (it holds `connection_decide`). The flags: `--block-list FILE`, `--ja4-list FILE`, `--block-time S`, `--block-key KEY`. A dropped connection logs the Verdict `drop`.
 9. `robots.txt`, the honeypot link and `/trap/`, and the behavior counters. Done (2026-11-24). The generator chose the rules by practice ("Defaults taken from practice"). `struct verdict_signals` now has the JA4 label and the Behavior counters, and `struct verdict` has `blocks_client`.
 10. Proof of work. Done (2026-11-24). The flags: `--pow-prefix PATH` and `--pow-bits N`. A challenge logs the Verdict `challenge`.
