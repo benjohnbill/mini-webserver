@@ -1351,8 +1351,12 @@ static void connection_continue(struct connection *connection, enum step step)
 }
 
 /* RELAY_MEMORY_CAP (SPEC 12, Phase 2-A): when the replies that rproxy
-   holds reach --relay-memory MiB, a new exchange gets 502. An exchange that
-   already started reads its whole reply. Returns 0 or 502. */
+   holds reach --relay-memory MiB, an exchange that still reads the Origin
+   gets 502: at its start, and at each read. A reply that rproxy has read
+   whole goes to its client. A check at the start only was not enough:
+   with a slow Origin, thousands of exchanges started before their bytes
+   came, and rproxy held 3.9 GiB with a 1.5 GiB cap (2026-11-26). Returns 0
+   or 502. */
 static int reply_memory_check(struct connection *connection)
 {
     const struct rproxy *rproxy = connection->loop->rproxy;
@@ -1705,6 +1709,9 @@ static enum step origin_read_step(struct connection *connection)
         }
         connection->reply_len += (size_t)length;
         reply_memory_count(connection, (size_t)length);
+        if (reply_memory_check(connection) != 0) {
+            return origin_exchange_end(connection, 502);
+        }
         if (reply_is_over_cap(connection)) {
             connection->exchange.cause = "reply-cap";
             return origin_exchange_end(connection, 502);
@@ -1970,8 +1977,8 @@ static void loop_publish_stats(struct event_loop *loop)
         return;
     }
     bool is_written =
-        fprintf(file,
-                "# client_port origin_port pending capacity paused slot\n") > 0;
+        fprintf(file, "# client_port origin_port pending capacity paused slot "
+                      "queued\n") > 0;
     for (const struct connection *connection = loop->connections;
          connection != NULL && is_written; connection = connection->next) {
         is_written = relay_stats_format(connection, file);
@@ -1992,10 +1999,11 @@ static bool relay_stats_format(const struct connection *connection, FILE *file)
     bool is_paused = relay->capacity > 0 && !relay->origin_is_done &&
                      relay->used >= relay->capacity;
 
-    return fprintf(file, "%d %d %zu %zu %d %d\n", connection->client_port,
+    return fprintf(file, "%d %d %zu %zu %d %d %d\n", connection->client_port,
                    connection->origin_port, relay_get_pending(connection),
                    relay->capacity, is_paused ? 1 : 0,
-                   connection->holds_exchange_slot ? 1 : 0) > 0;
+                   connection->holds_exchange_slot ? 1 : 0,
+                   connection->state == STATE_QUEUED ? 1 : 0) > 0;
 }
 
 /* The reply bytes that rproxy holds in its own memory for this client.

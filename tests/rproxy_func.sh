@@ -629,9 +629,10 @@ wait "$slow_pid"
     && pass "conn-cap gives 503 queue-timeout after --relay-queue seconds" \
     || fail "conn-cap gives 503 queue-timeout after --relay-queue seconds: got '$got'"
 
-# One slow download holds 6 MiB of reply, over the 5 MiB limit. A new
-# exchange gets a 502. The exchange that started first reads its file whole.
-start_proxy --origin "$HOST:$EPOLL_PORT" --relay memory-cap --relay-memory 5
+# One slow download holds 6 MiB of reply, under the 7 MiB limit. A new
+# exchange reads past the limit and gets a 502. The exchange that read its
+# file first sends it whole.
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay memory-cap --relay-memory 7
 fetch_big "$WORK/big_mem1" --limit-rate 2M > "$WORK/mem1" &
 slow_pid=$!
 sleep 1
