@@ -68,6 +68,9 @@
 /* --relay-stats: each loop writes its file this often. The demo
    dashboard redraws at the same rate. */
 #define RELAY_STATS_PERIOD_MS 200
+/* While a request waits for a conn-cap slot, the loop looks for a free
+   slot at least this often. A slot can be freed in another loop. */
+#define QUEUE_POLL_MS 20
 
 /* The steps of one connection, in their order. One request for each
    connection (SPEC 11 "Two Verdict stages"). */
@@ -76,6 +79,7 @@ enum connection_state {
     STATE_TARPIT,    /* hold the socket and read nothing until the timer */
     STATE_HANDSHAKE, /* TLS */
     STATE_REQUEST,   /* read the request, then the request Verdict */
+    STATE_QUEUED,    /* conn-cap with --relay-queue: wait for a free slot */
     STATE_ORIGIN_CONNECT,
     STATE_ORIGIN_SEND,
     STATE_ORIGIN_READ,
@@ -149,6 +153,9 @@ struct connection {
     uint32_t client_events; /* what conn_fd waits for: EPOLLIN or EPOLLOUT */
     uint32_t origin_events; /* what origin_fd waits for: 0 is nothing */
     struct timer timer;     /* the deadline of the current state */
+    /* STATE_QUEUED: the neighbours in the queue of the loop */
+    struct connection *queue_prev;
+    struct connection *queue_next;
     /* SIOCOUTQ of conn_fd at the last reply deadline. LONG_MAX after a
        write, so the first deadline after a write always moves once. */
     long send_queue;
@@ -190,6 +197,9 @@ struct event_loop {
     struct connection *connections; /* the open connections */
     struct connection *closed;      /* freed at the end of the loop turn */
     int connection_count;
+    /* conn-cap: the requests that wait for a slot, oldest first */
+    struct connection *queue_head;
+    struct connection *queue_tail;
     int index;        /* 0 to loops - 1 */
     double stats_due; /* --relay-stats: the next write, monotonic */
     unsigned char scratch[HELLO_PEEK_MAX]; /* for the peek and the drain */
@@ -260,6 +270,12 @@ static void reply_plan_parts(struct connection *connection,
                              const char *cache_name);
 static enum step origin_exchange_start(struct connection *connection);
 static int exchange_slot_take(struct connection *connection);
+static enum step origin_exchange_begin(struct connection *connection);
+static enum step queue_add(struct connection *connection);
+static void queue_remove(struct connection *connection);
+static void loop_admit_queued(struct event_loop *loop);
+static void queue_expire(struct connection *connection);
+static void connection_continue(struct connection *connection, enum step step);
 static int reply_memory_check(struct connection *connection);
 static void reply_memory_count(struct connection *connection, size_t length);
 static void reply_memory_release(struct connection *connection);
@@ -364,6 +380,7 @@ int event_loop_run(struct event_loop *loop)
             loop_dispatch(loop, &events[i]);
         }
         loop_expire_timers(loop);
+        loop_admit_queued(loop);
         loop_publish_stats(loop);
         loop_free_closed(loop);
     }
@@ -422,6 +439,9 @@ static int loop_get_wait_ms(const struct event_loop *loop)
     int wait_max = loop->rproxy->config.relay_stats_dir != NULL
                        ? RELAY_STATS_PERIOD_MS
                        : EPOLL_WAIT_MS;
+    if (loop->queue_head != NULL) {
+        wait_max = QUEUE_POLL_MS;
+    }
     const struct timer *first = timer_heap_find_first(loop->timers);
     if (first == NULL) {
         return wait_max;
@@ -602,6 +622,7 @@ static enum step connection_step(struct connection *connection)
     case STATE_DRAIN:
         return drain_step(connection);
     case STATE_TARPIT:
+    case STATE_QUEUED:
     case STATE_CLOSED:
         break;
     }
@@ -1200,11 +1221,23 @@ static void reply_plan_parts(struct connection *connection,
    must: then the deadline moves at each Origin read. */
 static enum step origin_exchange_start(struct connection *connection)
 {
-    struct rproxy *rproxy = connection->loop->rproxy;
     int status = exchange_slot_take(connection);
-    if (status == 0) {
-        status = reply_memory_check(connection);
+    if (status == 503 && connection->loop->rproxy->config.relay_queue > 0) {
+        return queue_add(connection);
     }
+    if (status != 0) {
+        status_reply_plan(connection, status, NULL);
+        return reply_start(connection);
+    }
+
+    return origin_exchange_begin(connection);
+}
+
+/* After the conn-cap slot, if the mode has one. */
+static enum step origin_exchange_begin(struct connection *connection)
+{
+    struct rproxy *rproxy = connection->loop->rproxy;
+    int status = reply_memory_check(connection);
     if (status == 0 && !origin_request_format(connection)) {
         status = 500;
     }
@@ -1239,6 +1272,75 @@ static int exchange_slot_take(struct connection *connection)
     connection->holds_exchange_slot = true;
 
     return 0;
+}
+
+/* --relay-queue (SPEC 12, Phase 2-B): with no free slot, the request
+   waits in the queue of its loop. The loop gives a freed slot to its
+   oldest request. After --relay-queue seconds the request gets 503. */
+static enum step queue_add(struct connection *connection)
+{
+    struct event_loop *loop = connection->loop;
+    connection->exchange.cause = NULL;
+    connection->state = STATE_QUEUED;
+    connection->queue_prev = loop->queue_tail;
+    connection->queue_next = NULL;
+    if (loop->queue_tail != NULL) {
+        loop->queue_tail->queue_next = connection;
+    } else {
+        loop->queue_head = connection;
+    }
+    loop->queue_tail = connection;
+    connection_set_deadline(connection, loop->rproxy->config.relay_queue);
+
+    return STEP_WAIT;
+}
+
+static void queue_remove(struct connection *connection)
+{
+    struct event_loop *loop = connection->loop;
+    if (connection->queue_prev != NULL) {
+        connection->queue_prev->queue_next = connection->queue_next;
+    } else {
+        loop->queue_head = connection->queue_next;
+    }
+    if (connection->queue_next != NULL) {
+        connection->queue_next->queue_prev = connection->queue_prev;
+    } else {
+        loop->queue_tail = connection->queue_prev;
+    }
+    connection->queue_prev = NULL;
+    connection->queue_next = NULL;
+}
+
+static void loop_admit_queued(struct event_loop *loop)
+{
+    while (loop->queue_head != NULL &&
+           exchange_slot_take(loop->queue_head) == 0) {
+        struct connection *connection = loop->queue_head;
+        queue_remove(connection);
+        connection_continue(connection, origin_exchange_begin(connection));
+    }
+    if (loop->queue_head != NULL) {
+        loop->queue_head->exchange.cause = NULL; /* it still waits */
+    }
+}
+
+static void queue_expire(struct connection *connection)
+{
+    queue_remove(connection);
+    connection->exchange.cause = "queue-timeout";
+    status_reply_plan(connection, 503, NULL);
+    connection_continue(connection, reply_start(connection));
+}
+
+/* Runs a step that a loop function started, as connection_advance does. */
+static void connection_continue(struct connection *connection, enum step step)
+{
+    if (step == STEP_NEXT) {
+        connection_advance(connection);
+    } else if (step == STEP_CLOSE) {
+        connection_close(connection);
+    }
 }
 
 /* RELAY_MEMORY_CAP (SPEC 12, Phase 2-A): when the replies that rproxy
@@ -1719,6 +1821,9 @@ static void connection_close(struct connection *connection)
                            connection->exchange.status, clock_get_seconds());
     }
     timer_heap_remove(loop->timers, &connection->timer);
+    if (connection->state == STATE_QUEUED) {
+        queue_remove(connection);
+    }
     exchange_slot_release(connection);
     origin_socket_close(connection);
     tls_session_destroy(connection->session);
@@ -1951,6 +2056,9 @@ static void connection_expire(struct connection *connection)
         return;
     case STATE_RELAY:
         relay_expire(connection);
+        return;
+    case STATE_QUEUED:
+        queue_expire(connection);
         return;
     case STATE_REPLY:
         if (send_queue_has_drained(connection)) {

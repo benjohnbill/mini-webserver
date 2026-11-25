@@ -50,6 +50,7 @@
 #define DEFAULT_RELAY_CONNS 20
 #define DEFAULT_RELAY_BUFFER 65536
 #define DEFAULT_RELAY_MEMORY 1024 /* MiB */
+#define RELAY_QUEUE_MAX 3600      /* seconds */
 #define RELAY_MEMORY_MAX 1048576  /* MiB */
 /* One TLS record body, so that one send has bytes to give. */
 #define RELAY_BUFFER_MIN 16384
@@ -109,7 +110,8 @@ int main(int argc, char **argv)
             "[--pow-prefix PATH ...] [--pow-bits N] "
             "[--pay-prefix PATH ...] [--bot-key FILE] "
             "[--relay unbounded|reply-cap|conn-cap|backpressure|memory-cap] "
-            "[--relay-conns N] [--relay-buffer BYTES] [--relay-memory MIB] "
+            "[--relay-conns N] [--relay-queue S] [--relay-buffer BYTES] "
+            "[--relay-memory MIB] "
             "[--relay-stats DIR]\n");
         return 2;
     }
@@ -245,6 +247,9 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     if (strcmp(name, "--relay-buffer") == 0) {
         return number_parse(value, RELAY_BUFFER_MIN, RELAY_BUFFER_MAX,
                             &config->relay_buffer);
+    }
+    if (strcmp(name, "--relay-queue") == 0) {
+        return number_parse(value, 0, RELAY_QUEUE_MAX, &config->relay_queue);
     }
     if (strcmp(name, "--relay-memory") == 0) {
         return number_parse(value, 1, RELAY_MEMORY_MAX, &config->relay_memory);

@@ -603,6 +603,32 @@ got="$(fetch_big "$WORK/big_conn3")"
 [ "$got" = "200 $big_sum" ] && pass "conn-cap frees a slot when its download ends" \
     || fail "conn-cap frees a slot when its download ends: got '$got'"
 
+# With --relay-queue, the client N+1 waits for the slot instead of a 503.
+# The slow download holds the slot for about 3 s.
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay conn-cap --relay-conns 1 \
+    --relay-queue 10
+fetch_big "$WORK/big_q1" --limit-rate 2M > "$WORK/q1" &
+slow_pid=$!
+sleep 0.5
+start_s=$(date +%s.%N)
+got="$(fetch_big "$WORK/big_q2")"
+waited=$(echo "$(date +%s.%N) - $start_s" | bc)
+wait "$slow_pid"
+[ "$got" = "200 $big_sum" ] && [ "$(echo "$waited > 1.5" | bc)" = 1 ] \
+    && pass "conn-cap with --relay-queue makes client N+1 wait, then serves it" \
+    || fail "conn-cap with --relay-queue makes client N+1 wait, then serves it: got '$got' after $waited s"
+
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay conn-cap --relay-conns 1 \
+    --relay-queue 1
+fetch_big "$WORK/big_q3" --limit-rate 2M > "$WORK/q3" &
+slow_pid=$!
+sleep 0.5
+got="$(fetch "$BASE/big.bin" | cut -d' ' -f1)"
+wait "$slow_pid"
+[ "$got" = "503" ] && grep -q ' 503 queue-timeout$' "$WORK/rproxy.err" \
+    && pass "conn-cap gives 503 queue-timeout after --relay-queue seconds" \
+    || fail "conn-cap gives 503 queue-timeout after --relay-queue seconds: got '$got'"
+
 # One slow download holds 6 MiB of reply, over the 5 MiB limit. A new
 # exchange gets a 502. The exchange that started first reads its file whole.
 start_proxy --origin "$HOST:$EPOLL_PORT" --relay memory-cap --relay-memory 5

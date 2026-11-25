@@ -60,6 +60,7 @@ struct rproxy_config {
     struct cache_options cache_options;
     enum relay_mode relay_mode;
     int relay_conns;  /* RELAY_CONN_CAP: Origin exchanges in the process */
+    int relay_queue;  /* RELAY_CONN_CAP: seconds to wait for a slot, 0: 503 */
     int relay_buffer; /* RELAY_BACKPRESSURE: bytes for each connection */
     int relay_memory; /* RELAY_MEMORY_CAP: MiB of replies in the process */
     /* Each loop writes loop-<N>.txt here: NULL when the stats are off. */
