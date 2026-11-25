@@ -38,7 +38,10 @@ pane() { # runs inside the container
             cat <<'EOF'
 == client: try these (backend/dash panes show the effect)
   mini-web backend new             new backend on the lowest free port; the front routes there too
+  mini-web backend new --weight 3  same, with weight 3 (1..4);  mini-web weight b2 3  changes b2's
   mini-web backend rm b4           take b4 out again;  mini-web <cmd> = scripts/lb.sh <cmd>
+  mini-web client new 20           20 steady clients (2 req/s each, --rps R);  client rm 5 / ls / stop
+  mini-web sim --remove b2         offline: how mod / ring1 / ring10 / ketama / hrw move b2's keys
   scripts/lb.sh keys 20            which backend each source IP sticks to
   scripts/lb.sh pause b2           freeze b2, then:  scripts/lb.sh resume b2
   scripts/lb.sh slow b2 500        b2 answers after 500 ms;  lb.sh start b2 restores it

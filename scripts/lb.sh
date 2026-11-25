@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Load-balancer demo: one Ketama front (:8080) and backends bN on :8000+N (default b1..b3).
 #   scripts/lb.sh up | down | add | remove bN | start NAME | stop NAME | pause bN | resume bN
-#                 | slow bN MS | status | keys [N]
-# NAME is front or a member backend. The member list is .lb/backends, the front reads its /echo backends
-# from .lb/front.route (add/remove rewrite it and send SIGHUP); pid files and logs live in .lb/.
-# Front options come from env: LB_CAP (-B) LB_WAIT (-W) LB_TIMEOUT (-T) LB_THREADS (-t) LB_STRATEGY LB_BACKENDS.
+#                 | slow bN MS | status | keys [N] | weight bN W | client new N [--rps R] | client rm N
+#                 | client ls | client stop
+# NAME is front or a member backend. The member list is .lb/backends, weights other than 1 are in
+# .lb/weights ("bN W"), the front reads its /echo backends from .lb/front.route (add/remove/weight
+# rewrite it and send SIGHUP); pid files and logs live in .lb/.
+# Front options come from env: LB_CAP (-B) LB_WAIT (-W) LB_TIMEOUT (-T) LB_THREADS (-t) LB_STRATEGY
+# LB_BACKENDS LB_WEIGHTS.
 set -u
 cd "$(dirname "$0")/.."
 DIR=.lb
@@ -19,25 +22,73 @@ LB_THREADS=${LB_THREADS:-8} LB_STRATEGY=${LB_STRATEGY:-ketama}
 
 # BACKENDS is "b1 b2 b3 " (sorted, trailing space): from .lb/backends, else b1..b$LB_BACKENDS.
 sorted() { tr ' ' '\n' | grep . | sort -V | tr '\n' ' '; }
+# Weights are 1..4, like the front's *N. A bad one is refused before any file or the front changes.
+valid_weight() { case ${1:-} in [1-4]) ;; *) echo "weight must be 1..4 (got '${1:-}')" >&2; return 1 ;; esac; }
+split_commas() { awk -F, '{for (i = 1; i <= NF; i++) print $i}' <<<"$1"; }
+# The setup a fresh up takes from LB_BACKENDS / LB_WEIGHTS; both must be one line (no newline, no empty item).
 defaults() {
-    local n=${LB_BACKENDS:-3}
-    case $n in ''|*[!0-9]*) n=0 ;; esac
+    local n=${LB_BACKENDS:-} c
+    [[ -z $n || $n =~ ^[0-9]{1,2}$ ]] || { echo "LB_BACKENDS must be 1..$MAXN (got '$n')" >&2; exit 1; }
+    if [ -n "${LB_WEIGHTS:-}" ]; then
+        [[ $LB_WEIGHTS =~ ^[1-4](,[1-4])*$ ]] ||
+            { echo "LB_WEIGHTS must be one line of weights 1..4 such as 1,3,1 (got '$LB_WEIGHTS')" >&2; exit 1; }
+        c=$(split_commas "$LB_WEIGHTS" | wc -l)
+        n=${n:-$c}
+        [ "$((10#$n))" = "$c" ] ||
+            { echo "LB_WEIGHTS has $c values but LB_BACKENDS is $n" >&2; exit 1; }
+    fi
+    n=${n:-3}
     [ "$((10#$n))" -ge 1 ] && [ "$((10#$n))" -le "$MAXN" ] ||
-        { echo "LB_BACKENDS must be 1..$MAXN (got '${LB_BACKENDS:-}')" >&2; exit 1; }
+        { echo "LB_BACKENDS must be 1..$MAXN (got '$n')" >&2; exit 1; }
     seq "$((10#$n))" | sed 's/^/b/' | sorted
 }
-# defaults exits only its $(...) subshell, so every caller checks it.
-if [ -s "$MEMBERS" ]; then BACKENDS=$(sorted <"$MEMBERS"); else BACKENDS=$(defaults) || exit 1; fi
+# Options a newly started front gets (same ranges as src/config.c), checked before an old front is stopped.
+front_opts_ok() {
+    local spec name lo hi
+    for spec in "LB_CAP 0 1024" "LB_WAIT 0 600000" "LB_TIMEOUT 1 600000" "LB_THREADS 1 256"; do
+        read -r name lo hi <<<"$spec"
+        [[ ${!name} =~ ^[0-9]{1,6}$ ]] && [ "$((10#${!name}))" -ge "$lo" ] && [ "$((10#${!name}))" -le "$hi" ] ||
+            { echo "$name must be $lo..$hi (got '${!name}')"; return 1; }
+    done
+    case $LB_STRATEGY in ketama|rr) ;; *) echo "LB_STRATEGY must be ketama or rr (got '$LB_STRATEGY')"; return 1 ;; esac
+}
+# "b2:3 b5:2": members whose weight is not 1 (.lb/weights holds the same as "bN W" lines).
+default_weights() {
+    [ -n "${LB_WEIGHTS:-}" ] || return 0
+    split_commas "$LB_WEIGHTS" | awk '$1 != 1 {printf "b%d:%s ", NR, $1}'
+}
+weight_of() { local e; for e in $WEIGHTS; do [ "${e%%:*}" = "$1" ] && { echo "${e#*:}"; return; }; done; echo 1; }
+set_weight() { # NAME W (W 1 drops the entry)
+    local e out=
+    for e in $WEIGHTS; do [ "${e%%:*}" = "$1" ] || out+="$e "; done
+    [ "$2" = 1 ] || out+="$1:$2 "
+    WEIGHTS=$out
+}
+weight_list() { local b out=; for b in $BACKENDS; do out+="${out:+,}$(weight_of "$b")"; done; echo "$out"; }
+# defaults exits only its $(...) subshell, so every caller checks it. Here a bad LB_BACKENDS/LB_WEIGHTS
+# must not block down, stop or client: only a fresh up (below) insists on them.
+if [ -s "$MEMBERS" ]; then BACKENDS=$(sorted <"$MEMBERS")
+else BACKENDS=$(defaults 2>/dev/null) || BACKENDS=$(LB_BACKENDS='' LB_WEIGHTS='' defaults); fi
+WFILE=$DIR/weights
+WEIGHTS=$( [ -f "$WFILE" ] && awk '$2 ~ /^[1-4]$/ && $2 != 1 {printf "%s:%s ", $1, $2}' "$WFILE")
 NAMES="${BACKENDS}front"
-ROUTE=$DIR/front.route   # the front's /echo backend list, one host:port per line; re-read on SIGHUP
+ROUTE=$DIR/front.route   # the front's /echo backend list, one host:port[*W] per line; re-read on SIGHUP
 save_members() {
     NAMES="${BACKENDS}front"
-    write_route && echo "$BACKENDS" >"$MEMBERS" ||
-        { echo "could not write $ROUTE or $MEMBERS"; return 1; }
+    route_lines | put "$ROUTE" && weight_lines | put "$WFILE" && echo "$BACKENDS" | put "$MEMBERS" ||
+        { echo "could not write $ROUTE, $WFILE or $MEMBERS"; return 1; }
 }
 addrs() { for b in $BACKENDS; do echo "127.0.0.1:$(port "$b")"; done; }
-# tmp + mv: the front never reads a half-written file.
-write_route() { addrs >"$ROUTE.tmp" && mv -f "$ROUTE.tmp" "$ROUTE"; }
+route_lines() { local b w; for b in $BACKENDS; do w=$(weight_of "$b"); echo "127.0.0.1:$(port "$b")$([ "$w" = 1 ] || echo "*$w")"; done; }
+weight_lines() { local b w; for b in $BACKENDS; do w=$(weight_of "$b"); [ "$w" = 1 ] || echo "$b $w"; done; }
+# put FILE: stdin into FILE by tmp + mv, so the front never reads a half-written file. A file that already
+# holds that text is left alone, so a rollback only has to rewrite what the failed change actually wrote.
+put() {
+    local text
+    text=$(cat)
+    [ -f "$1" ] && [ "$(cat "$1")" = "$text" ] && return 0
+    { [ -z "$text" ] || printf '%s\n' "$text"; } >"$1.tmp" && mv -f "$1.tmp" "$1"
+}
 now_ms() { date +%s%3N; }
 
 usage() {
@@ -45,9 +96,14 @@ usage() {
 usage: scripts/lb.sh COMMAND
   up              start front :8080 (/echo) and backends b1..bN (:8001..:800N)
   down            stop everything and forget added backends
-  add             start a backend on the lowest free bN (:8000+N) and reload
-                  the front's backend list (SIGHUP) so it routes there too
+  add [--weight W]
+                  start a backend on the lowest free bN (:8000+N) and reload
+                  the front's backend list (SIGHUP) so it routes there too (weight W 1..4, default 1)
   remove bN       drop bN from the front's route (SIGHUP reload), then stop bN
+  weight bN W     set bN's weight (1..4) and reload the front
+  client new N [--rps R] | client rm N | client ls | client stop
+                  N more / fewer steady clients (tools/clientd.py, source IPs 127.0.0.2.., at most 250),
+                  each sending one /echo at a time, R per second (default 2)
   start NAME      start one of: front, a member backend (a slow bN is replaced by the webserver)
   stop NAME       stop one of: front, a member backend (it stays in the route, shown DOWN)
   pause bN        freeze one backend
@@ -59,8 +115,9 @@ usage: scripts/lb.sh COMMAND
 front options from env (read by up and start front):
   LB_CAP=2 LB_WAIT=2000 LB_TIMEOUT=1000 LB_THREADS=8 LB_STRATEGY=ketama|rr
   LB_CAP=0 LB_WAIT=0 turns back-pressure off
-  LB_BACKENDS=3   backends that up starts (1..ROUTE_MAX_BACKENDS, 8) when the front isn't running yet;
-                  after that use add / remove
+  LB_BACKENDS=3   backends that up starts (1..ROUTE_MAX_BACKENDS, 8) when there is no member list yet
+                  (first up, or after down); otherwise up keeps .lb/backends and its weights: use add / remove
+  LB_WEIGHTS=1,3,1  their weights (1..4 each); without LB_BACKENDS the count is the number of weights
 EOF
     exit 1
 }
@@ -80,7 +137,7 @@ args() {
 off() { if [ "$1" = 0 ]; then echo off; else echo "$1${2:-}"; fi; }
 
 save_opts() {
-    echo "cap $(off "$LB_CAP")  wait $(off "$LB_WAIT" ms)  timeout ${LB_TIMEOUT}ms  threads $LB_THREADS  $LB_STRATEGY  backends $(echo $BACKENDS | wc -w)" \
+    echo "cap $(off "$LB_CAP")  wait $(off "$LB_WAIT" ms)  timeout ${LB_TIMEOUT}ms  threads $LB_THREADS  $LB_STRATEGY  backends $(echo $BACKENDS | wc -w)  weights $(weight_list)" \
         >"$DIR/front.opts"
 }
 
@@ -122,7 +179,7 @@ start() { # NAME [MS]: with MS, run tools/slow_backend.py instead of the webserv
         pid=$!
         echo "$2" >"$DIR/$1.slow"
     else
-        [ "$1" = front ] && { save_opts; write_route; }
+        [ "$1" = front ] && { save_opts; route_lines | put "$ROUTE"; }
         # shellcheck disable=SC2046  # args are intentionally word-split
         nohup ./webserver $(args "$1") >"$DIR/$1.log" 2>&1 &
         pid=$!
@@ -161,7 +218,7 @@ freeze() {
 }
 
 keys() {
-    local n=${1:-20} i key name prev moved=0 cmp=0 cur
+    local n=${1:-20} i key name prev moved=0 cmp=0 cur hits= b k total
     case $n in ''|*[!0-9]*) usage ;; esac
     [ "$n" -ge 1 ] && [ "$n" -le 254 ] || { echo "N must be 1..254"; exit 1; }
     cur=$(mktemp)
@@ -178,6 +235,7 @@ keys() {
             continue
         fi
         echo "$key $name" >>"$cur"
+        hits+="$name "
         if [ -z "$prev" ]; then
             printf '%-12s %s\n' "$key" "$name"
         else
@@ -188,6 +246,12 @@ keys() {
     done
     if [ "$cmp" -eq 0 ]; then echo "no keys to compare"
     else echo "moved $moved/$cmp ($((moved * 100 / cmp))%)"; fi
+    # Per member: how many of this run's answered keys it took, next to its weight.
+    total=$(echo $hits | wc -w)
+    for b in $BACKENDS; do
+        k=$(tr ' ' '\n' <<<"$hits" | grep -cx "$b")
+        printf '%s  weight %s  keys %s (%s%%)\n' "$b" "$(weight_of "$b")" "$k" "$((total ? k * 100 / total : 0))"
+    done
     mv "$cur" "$DIR/keys.prev"
 }
 
@@ -197,39 +261,59 @@ backend() { case " $BACKENDS " in *" ${1:-} "*) ;; *) echo "${1:-?} is not a bac
 # Old way: a front started with the list inline (or an old binary) only knows its start-up route.
 refront() {
     pid_of front >/dev/null || return 0
+    # Refuse before stopping the old front: a new one that cannot start would leave no front at all.
+    front_opts_ok || return 1
     stop front >/dev/null
     start front
 }
 
+# shows_list: /_lb/status lists BACKENDS with their weights (address and WEIGHT column) within 2 s.
+shows_list() {
+    local want end left
+    want=$(for b in $BACKENDS; do echo "127.0.0.1:$(port "$b") $(weight_of "$b")"; done)
+    end=$(( $(now_ms) + 2000 ))
+    while left=$(( end - $(now_ms) )); [ "$left" -gt 0 ]; do
+        # Every status request gets only the time left, so the whole wait stays within 2 s.
+        [ "$(curl -s -m "$(printf '%d.%03d' $((left / 1000)) $((left % 1000)))" "$FRONT/_lb/status" |
+             awk '$1 ~ /^127\.0\.0\.1:/ {print $1, $3}')" = "$want" ] && return 0
+        [ "$left" -gt 100 ] && sleep 0.1
+    done
+    return 1
+}
+
 # The route file is already rewritten; tell the front to re-read it and wait until /_lb/status shows it.
 reload() {
-    local pid want
+    local pid
     pid=$(pid_of front) || return 0
     # An old front dies on SIGHUP; only a front started on the file (-R ...=@file) gets one.
     tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q '=@' || { refront; return; }
     kill -HUP "$pid" || { echo "could not send SIGHUP to the front (pid $pid)"; return 1; }
-    want=$(addrs)
-    local end=$(( $(now_ms) + 2000 )) left
-    while left=$(( end - $(now_ms) )); [ "$left" -gt 0 ]; do
-        # Every status request gets only the time left, so the whole wait stays within 2 s.
-        [ "$(curl -s -m "$(printf '%d.%03d' $((left / 1000)) $((left % 1000)))" "$FRONT/_lb/status" |
-             awk '$1 ~ /^127\.0\.0\.1:/ {print $1}')" = "$want" ] &&
-            { echo "front reloaded (pid $pid, :8080, webserver)"
-              # Only the count changed: keep the options the running front was started with.
-              [ -f "$DIR/front.opts" ] && sed -i "s/backends [0-9]*$/backends $(echo $BACKENDS | wc -w)/" "$DIR/front.opts"
-              return 0; }
-        [ "$left" -gt 100 ] && sleep 0.1
-    done
-    echo "front did not show the new backend list in 2 s, see $DIR/front.log"; return 1
+    shows_list || { echo "front did not show the new backend list in 2 s, see $DIR/front.log"; return 1; }
+    echo "front reloaded (pid $pid, :8080, webserver)"
+    # Only the members changed: keep the options the running front was started with.
+    [ -f "$DIR/front.opts" ] &&
+        sed -i "s/backends [0-9]*.*$/backends $(echo $BACKENDS | wc -w)  weights $(weight_list)/" "$DIR/front.opts"
+    return 0
 }
 
-# BACKENDS is already the new list. Write it and reload; on any failure put OLD ($1) back
-# in both files and in the front, so nothing changed and the command can be retried.
+# BACKENDS/WEIGHTS are already the new ones. Write them and reload; on any failure put the OLD
+# ones ($1, $2) back in the files and in the front, so nothing changed and the command can be retried.
+# The rollback itself is checked: if the front ran before, it must run and show the old list again.
 apply() {
+    local was_up=
+    pid_of front >/dev/null && was_up=1
     save_members && reload && return 0
-    BACKENDS=$1
-    save_members >/dev/null && reload >/dev/null
-    echo "member change not applied; backends stay: $BACKENDS"
+    BACKENDS=$1 WEIGHTS=$2
+    save_members >/dev/null ||
+        { echo "rollback failed: could not write the old list back to $ROUTE, $WFILE or $MEMBERS"; return 1; }
+    reload >/dev/null
+    if [ -n "$was_up" ]; then
+        pid_of front >/dev/null ||
+            { echo "rollback failed: the front is not running (files hold backends $BACKENDS, weights $(weight_list)); start it with: lb.sh start front"; return 1; }
+        shows_list ||
+            { echo "rollback failed: the front does not show the old list in 2 s (files hold backends $BACKENDS, weights $(weight_list)), see $DIR/front.log"; return 1; }
+    fi
+    echo "member change not applied; backends stay: $BACKENDS (weights $(weight_list))"
     return 1
 }
 
@@ -244,8 +328,8 @@ drain() {
     sleep "$(printf '%d.%03d' $((ms / 1000)) $((ms % 1000)))"
 }
 
-add() {
-    local n name
+add() { # [W]
+    local n name w=${1:-1}
     [ "$(echo $BACKENDS | wc -w)" -lt "$MAXN" ] ||
         { echo "the front takes at most $MAXN backends (ROUTE_MAX_BACKENDS); remove one first"; return 1; }
     for n in $(seq $MAXB); do
@@ -253,9 +337,10 @@ add() {
         case " $BACKENDS " in *" $name "*) continue ;; esac
         accepts "$name" && continue          # someone else already listens on :800N
         start "$name" || return 1
-        local old=$BACKENDS
+        local old=$BACKENDS oldw=$WEIGHTS
         BACKENDS=$(echo "$BACKENDS $name" | sorted)
-        apply "$old" || { stop "$name"; return 1; }
+        set_weight "$name" "$w"
+        apply "$old" "$oldw" || { stop "$name"; return 1; }
         echo "backends: $BACKENDS"
         return 0
     done
@@ -265,31 +350,135 @@ add() {
 remove() {
     backend "$1"
     [ "$(echo $BACKENDS | wc -w)" -gt 1 ] || { echo "$1 is the last backend; use down instead"; return 1; }
-    local old=$BACKENDS
+    local old=$BACKENDS oldw=$WEIGHTS
     BACKENDS=$(for b in $BACKENDS; do [ "$b" = "$1" ] || echo "$b"; done | sorted)
+    set_weight "$1" 1
     # Out of the route first, so the front sends it nothing new; stop only once that took effect.
-    apply "$old" || return 1
+    apply "$old" "$oldw" || return 1
     drain "$1"
     stop "$1"
     echo "backends: $BACKENDS"
 }
 
+weight() { # bN W, already validated
+    local oldw=$WEIGHTS
+    set_weight "$1" "$2"
+    apply "$BACKENDS" "$oldw" || return 1
+    echo "weights: $(for b in $BACKENDS; do printf '%s=%s ' "$b" "$(weight_of "$b")"; done)"
+}
+
+# Steady clients: one tools/clientd.py daemon; .lb/clients holds "count N" and "rps R", re-read by it.
+CSTATE=$DIR/clients CSTATS=$DIR/clients.stats CMAX=250
+cstate() { [ -f "$CSTATE" ] && awk -v k="$1" '$1 == k {print $2}' "$CSTATE"; }
+valid_rps() { awk -v r="$1" 'BEGIN {exit !(r ~ /^[0-9]+(\.[0-9]+)?$/ && r + 0 >= 0.1 && r + 0 <= 20)}' ||
+    { echo "rps must be 0.1..20 (got '$1')"; return 1; }; }
+client() {
+    local n count rps pid
+    count=$(cstate count) rps=$(cstate rps)
+    count=${count:-0} rps=${rps:-2}
+    case ${1:-} in
+        new|rm)
+            n=${2:-}
+            case $n in ''|*[!0-9]*) echo "usage: lb.sh client new N [--rps R] | client rm N"; return 1 ;; esac
+            # Size first: a 20-digit N would wrap around in shell arithmetic. Past 4 digits, new is
+            # over the limit anyway and rm takes everything away.
+            n=${n#"${n%%[1-9]*}"}
+            if [ "${#n}" -gt 4 ]; then n=99999; else n=$((10#${n:-0})); fi
+            # No daemon (never started, or it died behind our back): no clients run, so count from 0.
+            pid_of clients >/dev/null || count=0
+            if [ "$1" = new ]; then
+                case ${3:-} in
+                    '') ;;
+                    --rps) valid_rps "${4:-}" || return 1; rps=${4} ;;
+                    *) echo "usage: lb.sh client new N [--rps R]"; return 1 ;;
+                esac
+                [ $((count + n)) -le "$CMAX" ] ||
+                    { echo "at most $CMAX clients (source IPs 127.0.0.2..251); now $count, asked for $2 more"; return 1; }
+                count=$((count + n))
+            else
+                [ $# -le 2 ] || { echo "usage: lb.sh client rm N"; return 1; }
+                count=$((count > n ? count - n : 0))
+            fi
+            local prev
+            prev=$(cat "$CSTATE" 2>/dev/null)
+            printf 'count %s\nrps %s\n' "$count" "$rps" >"$CSTATE.tmp" && mv -f "$CSTATE.tmp" "$CSTATE" ||
+                { echo "could not write $CSTATE"; return 1; }
+            if [ "$1" = new ] && ! pid_of clients >/dev/null; then
+                rm -f "$CSTATS" "$CSTATS.tmp"         # stale ones would pass for the new daemon's
+                # 9>&-: the daemon must not inherit the clients.lock descriptor and hold the lock forever.
+                nohup python3 tools/clientd.py --state "$CSTATE" --stats "$CSTATS" >"$DIR/clients.log" 2>&1 9>&- &
+                pid=$!
+                echo "$pid" >"$DIR/clients.pid"
+                # Up means its first stats file appeared; give it 1 s, and a daemon that died meanwhile fails.
+                for _ in $(seq 10); do alive "$pid" || break; [ -f "$CSTATS" ] && break; sleep 0.1; done
+                if ! alive "$pid"; then
+                    # No daemon took the new count: put the state back as it was.
+                    rm -f "$DIR/clients.pid"
+                    if [ -n "$prev" ]; then printf '%s\n' "$prev" >"$CSTATE"; else rm -f "$CSTATE"; fi
+                    echo "client daemon failed to start, see $DIR/clients.log"
+                    return 1
+                fi
+            fi
+            echo "clients: $count (rps $rps)"
+            awk -v c="$count" -v r="$rps" 'BEGIN {if (c * r > 200) printf "warning: %d clients x %s rps = %.0f req/s may saturate the front\n", c, r, c * r}' ;;
+        ls)
+            [ $# -eq 1 ] || { echo "usage: lb.sh client ls"; return 1; }
+            if ! pid_of clients >/dev/null; then echo "no clients running"; return 0; fi
+            cat "$CSTATS" 2>/dev/null || echo "clients: $count (rps $rps), no stats yet" ;;
+        stop)
+            [ $# -eq 1 ] || { echo "usage: lb.sh client stop"; return 1; }
+            stop clients
+            rm -f "$CSTATE" "$CSTATE.tmp" "$CSTATS" "$CSTATS.tmp" ;;
+        *)  echo "usage: lb.sh client new N [--rps R] | rm N | ls | stop"; return 1 ;;
+    esac
+}
+
+# One client command at a time (state read + write, daemon start/stop), also against down.
+client_locked() { ( flock 9 || { echo "could not lock $DIR/clients.lock"; exit 1; }; client "$@" ) 9>"$DIR/clients.lock"; }
+# Is the front running? Unlike pid_of, leaves a stale pid file alone (up decides before any side effect).
+front_running() { [ -f "$DIR/front.pid" ] && alive "$(cat "$DIR/front.pid")"; }
+
 [ $# -ge 1 ] || usage
-case $LB_STRATEGY in ketama|rr) ;; *) echo "LB_STRATEGY must be ketama or rr (got '$LB_STRATEGY')"; exit 1 ;; esac
 mkdir -p "$DIR"
 case $1 in
-    up)     make -s all || exit 1
-            # A fresh setup takes LB_BACKENDS; a running one keeps its members (added ones too).
-            pid_of front >/dev/null || { BACKENDS=$(defaults) || exit 1; save_members || exit 1; }
-            for n in $NAMES; do start "$n" || exit 1; done ;;
-    # down stops every bN with a pid file, members or not, and forgets the member list.
-    down)   stop front
+    up)     # No member list (first up, or after down): a fresh setup from LB_BACKENDS / LB_WEIGHTS,
+            # checked before make or any file changes. A member list (front running or only stopped,
+            # e.g. a restarted lab container) keeps its members and weights (added ones too).
+            fresh=
+            if [ ! -s "$MEMBERS" ]; then
+                BACKENDS=$(defaults) || exit 1
+                WEIGHTS=$(default_weights)
+                fresh=1
+            elif [ -n "${LB_BACKENDS:-}${LB_WEIGHTS:-}" ]; then
+                echo "keeping members from .lb/backends (lb.sh down to reset)" >&2
+            fi
+            was_up=
+            if front_running; then was_up=1; else front_opts_ok || exit 1; fi
+            make -s all || exit 1
+            [ -z "$fresh" ] || save_members || exit 1
+            for n in $NAMES; do start "$n" || exit 1; done
+            # A front already running (down, then only start front) still has its old route: reload it
+            # onto the fresh list once the backends are up.
+            [ -z "$fresh" ] || [ -z "$was_up" ] || reload || exit 1 ;;
+    # down stops the clients, then every bN with a pid file, members or not, and forgets the member list.
+    down)   client_locked stop >/dev/null
+            stop front
             for f in "$DIR"/b*.pid; do [ -e "$f" ] && stop "$(basename "$f" .pid)"; done
-            rm -f "$DIR"/*.pid "$DIR"/*.slow "$MEMBERS" "$ROUTE" ;;
-    add)    make -s all || exit 1; add ;;
+            # Not clients.pid: that one belongs to client_locked, and a client new may have started since.
+            rm -f "$DIR"/front.pid "$DIR"/b*.pid "$DIR"/*.slow "$MEMBERS" "$ROUTE" "$WFILE" ;;
+    add)    w=1
+            case ${2:-} in
+                '') [ $# -eq 1 ] || usage ;;
+                --weight) [ $# -eq 3 ] || usage; valid_weight "$3" || exit 1; w=$3 ;;
+                *) usage ;;
+            esac
+            make -s all || exit 1; add "$w" ;;
+    weight) backend "${2:-}"; [ $# -eq 3 ] || usage; valid_weight "$3" || exit 1
+            make -s all || exit 1; weight "$2" "$3" ;;
+    client) shift; client_locked "$@" ;;
     # Build first: an old front is restarted (refront) on the new binary, which knows -R ...=@file.
     remove) backend "${2:-}"; make -s all || exit 1; remove "$2" ;;
-    start)  valid "${2:-}"; make -s all || exit 1; start "$2" ;;
+    start)  valid "${2:-}"; [ "$2" != front ] || front_opts_ok || exit 1; make -s all || exit 1; start "$2" ;;
     stop)   valid "${2:-}"; stop "$2" ;;
     pause|resume)
             backend "${2:-}"; freeze "$1" "$2" ;;

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Back-pressure comparison: the same load and the same b2 failure, run once per
+# Back-pressure comparison: the same load and the same failure of one target backend, run once per
 # back-pressure cap, with a fresh lb.sh up before every run.
-#   scripts/bp_demo.sh [--scenarios hung,slow,normal] [--caps 0,2,1] [--duration 10]
-#                      [--clients 40] [--delay 500] [--timeline]
-# hung = b2 paused, slow = b2 answers after --delay ms, normal = no failure.
+#   scripts/bp_demo.sh [--scenarios hung,slow,normal] [--caps 0,2,1] [--duration 10] [--clients 40]
+#                      [--delay 500] [--backends 3] [--target b2] [--weights 1,1,1] [--timeline]
+# hung = target paused, slow = target answers after --delay ms, normal = no failure.
+# --backends N (1..8) and --weights (one 1..4 per backend) go to lb.sh up as LB_BACKENDS / LB_WEIGHTS.
 # cap 0 also sets LB_WAIT=0 (back-pressure fully off). Front proxy timeout is 3 s (LB_TIMEOUT=3000);
 # a static probe slower than 1 s (STATIC_SLO) counts as static err. Results: .lb/run-<scenario>-<cap>.json
 # moved = clients that later hit a backend other than the one in their first named response.
-# In hung, b2 is paused before load starts, so moves away from b2 are not counted there.
+# In hung, the target is paused before load starts, so moves away from it are not counted there.
 set -u
 cd "$(dirname "$0")/.."
-SCENARIOS=hung,slow,normal CAPS=0,2,1 DURATION=10 CLIENTS=40 DELAY=500 TIMELINE=
+SCENARIOS=hung,slow,normal CAPS=0,2,1 DURATION=10 CLIENTS=40 DELAY=500 TIMELINE= NBACK=3 TARGET=b2 WEIGHTS= WSET=
 WAIT_DEFAULT=${LB_WAIT:-2000} STATIC_SLO=1
 export LB_TIMEOUT=3000
 
@@ -31,6 +32,9 @@ while [ $# -gt 0 ]; do
         --clients)   CLIENTS=$(num "$1" "${2:-}" 1 250) || exit 1; shift ;;
         --delay)     DELAY=$(num "$1" "${2:-}" 1 600000) || exit 1; shift ;;
         --timeline)  TIMELINE=--timeline ;;
+        --backends)  NBACK=$(num "$1" "${2:-}" 1 8) || exit 1; shift ;;
+        --target)    TARGET=${2:-}; shift ;;
+        --weights)   [ $# -ge 2 ] || die "--weights needs a value such as 1,1,1"; WEIGHTS=$2; WSET=1; shift ;;
         *)           usage ;;
     esac
     shift
@@ -40,9 +44,21 @@ done
 for s in ${SCENARIOS//,/ }; do case $s in hung|slow|normal) ;; *) die "unknown scenario '$s'" ;; esac; done
 CAPLIST=
 for c in ${CAPS//,/ }; do CAPLIST+="$(num --caps "$c" 0 1024) " || exit 1; done
+case $TARGET in b[1-9]) ;; *) die "--target must be b1..b$NBACK, got '$TARGET'" ;; esac
+[ "${TARGET#b}" -le "$NBACK" ] || die "--target must be b1..b$NBACK, got '$TARGET'"
+ONES=$(seq "$NBACK" | sed 's/.*/1/' | paste -sd,)
+if [ -n "$WSET" ]; then
+    # One line of N weights: an empty value, a newline or a wrong count is refused here, before lb.sh down.
+    [[ $WEIGHTS =~ ^[1-4](,[1-4])*$ ]] && [ "$(awk -F, '{print NF}' <<<"$WEIGHTS")" = "$NBACK" ] ||
+        die "--weights needs $NBACK values of 1..4 such as $ONES, got '$WEIGHTS'"
+else
+    WEIGHTS=$ONES
+fi
+# lb.sh up takes the setup from these (bp_demo always starts from down, so no old members are kept).
+export LB_BACKENDS=$NBACK LB_WEIGHTS=$WEIGHTS
 
 LB=scripts/lb.sh
-# down resumes a paused backend before stopping it, so b2 is never left frozen.
+# down resumes a paused backend before stopping it, so the target is never left frozen.
 trap '$LB down >/dev/null 2>&1' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -61,13 +77,13 @@ for s in ${SCENARIOS//,/ }; do
         if [ "$c" = 0 ]; then export LB_WAIT=0; else export LB_WAIT=$WAIT_DEFAULT; fi
         $LB up >"$out.setup" 2>&1 || { echo "$s cap $c: lb.sh up failed, see $out.setup"; exit 1; }
         case $s in
-            hung) $LB pause b2 >>"$out.setup" ;;
-            slow) $LB slow b2 "$DELAY" >>"$out.setup" || { echo "$s cap $c: lb.sh slow failed"; exit 1; } ;;
+            hung) $LB pause "$TARGET" >>"$out.setup" ;;
+            slow) $LB slow "$TARGET" "$DELAY" >>"$out.setup" || { echo "$s cap $c: lb.sh slow failed"; exit 1; } ;;
         esac
         printf '%-7s cap %-3s %s ... ' "$s" "$c" "$(head -c 200 .lb/front.opts)"
         rc=0
         python3 tools/loadgen.py --clients "$CLIENTS" --duration "$DURATION" --path /echo --probe / --probe-timeout "$STATIC_SLO" \
-            --watch 127.0.0.1:8002 --json "$out.json" $TIMELINE >"$out.txt" 2>&1 || rc=$?
+            --watch "127.0.0.1:$((8000 + ${TARGET#b}))" --json "$out.json" $TIMELINE >"$out.txt" 2>&1 || rc=$?
         $LB down >/dev/null
         if [ "$rc" = 0 ] && python3 -c 'import json,sys; e=json.load(open(sys.argv[1]))["echo"]
 print("echo %d req, %s" % (e["requests"], " ".join("%s:%d" % kv for kv in sorted(e["codes"].items()))))' "$out.json" 2>/dev/null; then
@@ -87,6 +103,7 @@ if [ -n "$TIMELINE" ]; then
     done
 fi
 echo
+echo "backends $NBACK  weights $WEIGHTS  target $TARGET"
 python3 -c '
 import json, sys
 a = sys.argv[1:]

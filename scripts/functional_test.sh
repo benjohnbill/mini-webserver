@@ -9,6 +9,7 @@
 #   :8081  second front, /echo@ketama over b1/b2 (sticky keys, health checks, cap of 1)
 #   :8082  one worker and one queue slot for connection shedding
 #   :8083  front whose /echo list is a file, re-read on SIGHUP, over r1..r3 (:8004..:8006)
+#   :8084  ketama front over b10..b14 (:8010..:8014) with weights 1,3,1,2,4, checked against tools/lbsim.py
 set -u
 cd "$(dirname "$0")/.."
 make -s all || exit 1
@@ -45,7 +46,13 @@ set_route 8004 8005
 ./webserver -p 8006 -n r3 -r www 2>"$LOG/r3.log" & R3=$!
 # -B 0: the load below hits one backend at times; the per-backend cap would shed 503s unrelated to reload.
 ./webserver -p 8083 -B 0 -R "/echo=@$ROUTE_FILE" 2>"$LOG/front4.log" & FRONT4=$!
-trap 'kill -CONT $B1 $B2 2>/dev/null; kill $B1 $B2 $HOLE $FRONT $FRONT2 $FRONT3 $R1 $R2 $R3 $FRONT4 2>/dev/null; wait' EXIT
+# Weighted ketama front for the simulator check; names b10..b14 so lbsim (bN = :8000+N) uses the same ports.
+SIM_HOSTS=127.0.0.1:8010,127.0.0.1:8011,127.0.0.1:8012,127.0.0.1:8013,127.0.0.1:8014 SIM_WEIGHTS=1,3,1,2,4
+SIM_PIDS=
+for n in 10 11 12 13 14; do ./webserver -p 80$n -n b$n -r www 2>"$LOG/b$n.log" & SIM_PIDS+="$! "; done
+awk -F, -v w="$SIM_WEIGHTS" 'BEGIN {split(w, ws)} {for (i = 1; i <= NF; i++) print $i (ws[i] > 1 ? "*" ws[i] : "")}' <<<"$SIM_HOSTS" >"$LOG/sim.route"
+./webserver -p 8084 -B 0 -R "/echo@ketama=@$LOG/sim.route" 2>"$LOG/front5.log" & FRONT5=$!
+trap 'kill -CONT $B1 $B2 2>/dev/null; kill $B1 $B2 $HOLE $FRONT $FRONT2 $FRONT3 $R1 $R2 $R3 $FRONT4 $SIM_PIDS $FRONT5 2>/dev/null; wait' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 sleep 0.5
@@ -300,6 +307,31 @@ expect "missing file keeps the list"    "8004 8006 " "$(rows)"
 expect "kept list keeps OK counter"     "$OK1" "$(ok_of 8004)"
 expect "kept list still serves"         "r1 r3 " "$(names 6)"
 grep '^reload: failed: ' "$LOG/front4.log" | sort -u | sed 's/^/       /'
+
+echo "== distribution simulator (tools/lbsim.py) vs the weighted ketama front"
+SIM=http://127.0.0.1:8084
+# A backend as its port: "b12" (bN is :8000+N) or "127.0.0.1:8012" both become 8012.
+to_port() { awk '{n = $NF; if (n ~ /^b[0-9]+$/) n = 8000 + substr(n, 2); else sub(/.*:/, "", n); $NF = n; print}'; }
+python3 tools/lbsim.py --self-test >"$LOG/lbsim-self.txt" 2>&1 \
+    && ok "lbsim.py --self-test" || bad "lbsim.py --self-test (see below)"
+python3 tools/clientd.py --self-test >"$LOG/clientd-self.txt" 2>&1 \
+    && ok "clientd.py --self-test" || bad "clientd.py --self-test (see below)"
+tail -3 "$LOG/lbsim-self.txt" "$LOG/clientd-self.txt" 2>/dev/null | sed 's/^/       /'
+# lbsim's formulas (expected shares, ranges, moved, redistribution, concentration) vs independent Monte Carlo.
+python3 -B tests/lbsim_mc.py >"$LOG/lbsim-mc.txt" 2>&1 \
+    && ok "lbsim theory = Monte Carlo (tests/lbsim_mc.py)" || bad "lbsim theory = Monte Carlo (failed rows below)"
+grep -E ' FAIL$|^lbsim_mc:|Error' "$LOG/lbsim-mc.txt" | sed 's/^/       /'
+FRONT_SHARE=$(curl -s -m 2 "$SIM/_lb/status" | awk '$1 ~ /^127\.0\.0\.1:/ {print $1, $4}')
+SIM_SHARE=$(python3 tools/lbsim.py --hosts "$SIM_HOSTS" --weights "$SIM_WEIGHTS" --share 2>&1)
+expect "SHARE column = lbsim --share (weights $SIM_WEIGHTS)" "$SIM_SHARE" "$FRONT_SHARE"
+echo "$FRONT_SHARE" | sed 's/^/       /'
+# 30 source IPs, the same keys lb.sh keys uses (127.0.0.2..): the answering backend vs the simulated map.
+FRONT_MAP=$(for i in $(seq 2 31); do
+    echo "127.0.0.$i $(curl -s -m 2 -D - -o /dev/null --interface 127.0.0.$i "$SIM/echo" |
+        tr -d '\r' | awk -F': ' 'tolower($1)=="x-server-name"{print $2}')"; done | to_port)
+SIM_MAP=$(python3 tools/lbsim.py --hosts "$SIM_HOSTS" --weights "$SIM_WEIGHTS" --map 2>&1 |
+    awk '{split($1, o, "."); if (o[1] o[2] o[3] == "12700" && o[4] >= 2 && o[4] <= 31) print}' | to_port)
+expect "30 source IPs: X-Server-Name = lbsim --map" "$SIM_MAP" "$FRONT_MAP"
 
 echo "== failover (b1 killed)"
 kill $B1; wait $B1 2>/dev/null

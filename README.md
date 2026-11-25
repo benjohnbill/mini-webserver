@@ -63,6 +63,99 @@ bash scripts/lb.sh remove b4   # b4를 front 목록에서 빼고 끔
 
 `scripts/herdr_lab.sh`로 띄운 lab 컨테이너에서는 `mini-web backend new`, `mini-web backend rm b4`로 같은 일을 합니다.
 
+### 가중치
+
+백엔드마다 가중치 1..4(front의 `*N`)를 줄 수 있습니다. 1이 아닌 값은 `.lb/weights`(`bN W` 줄)에 저장되고, route 파일에는 `127.0.0.1:8002*3`처럼 들어갑니다. `up`/`add`/`remove`/reload 뒤에도 유지되고, `/_lb/status`의 WEIGHT/SHARE 열과 `keys` 끝의 요약(`b2  weight 3  keys K (P%)`)에 비례가 보입니다. 범위를 벗어난 값은 거부되며, 그때는 파일도 front도 바뀌지 않습니다.
+
+```sh
+LB_WEIGHTS=1,3,1 bash scripts/lb.sh up   # 백엔드 3개(개수 = 가중치 개수), b2만 3; LB_BACKENDS와 개수가 다르면 거부
+bash scripts/lb.sh add --weight 2         # mini-web backend new --weight 2
+bash scripts/lb.sh weight b2 1            # 실행 중 변경(SIGHUP reload, front 재시작 없음)
+bash scripts/lb.sh keys 60                # 키 분포 + 백엔드별 weight/keys 요약
+```
+
+`LB_BACKENDS`/`LB_WEIGHTS`는 멤버 목록(`.lb/backends`)이 없을 때(처음 `up`이나 `down` 뒤)만 씁니다. 목록이 있으면 front가 멈춰 있어도(lab 컨테이너 재시작 등) `up`은 기존 멤버와 가중치를 그대로 띄우고, 두 변수가 주어졌으면 `keeping members from .lb/backends (lb.sh down to reset)`를 stderr에 남깁니다. 처음부터 다시 정하려면 `lb.sh down` 뒤 `up`을 실행합니다.
+
+### 지속 클라이언트
+
+`tools/clientd.py` 데몬 하나가 클라이언트 N개를 스레드로 돌립니다. 클라이언트 i는 출발지 IP `127.0.0.(i+2)`로 `/echo`를 보내므로 ketama 키가 서로 달라 백엔드에 퍼집니다. 각 클라이언트는 한 번에 요청 하나만 보내고(`Connection: close`), 초당 R번(기본 2) 보냅니다. 수를 줄이면 번호가 큰 클라이언트부터 멈추므로 남은 클라이언트의 키는 그대로입니다. 상태는 `.lb/clients`, 통계는 `.lb/clients.stats`(1초마다 갱신), 로그는 `.lb/clients.log`에 있습니다. `down`도 클라이언트를 정리합니다.
+
+```sh
+mini-web client new 20            # = lb.sh client new 20; "clients: 20 (rps 2)"
+mini-web client new 0 --rps 5     # 수는 그대로 두고 rps만 변경
+mini-web client rm 5              # 번호가 큰 5개 정지
+mini-web client ls                # 누적/최근 1초 응답 코드, 백엔드별 고정 클라이언트 수와 요청 수
+mini-web client stop
+```
+
+제한:
+- 최대 250개(출발지 IP 127.0.0.2..251)이고, lab 컨테이너처럼 127.0.0.x로 bind할 수 있는 Linux에서만 씁니다(호스트 Windows에서는 안 됨).
+- 동시 요청은 많아야 클라이언트 수(≤ 250)이므로 기본 큐(256)에 들어갑니다. 다만 백엔드가 멈추거나 느리면 요청이 큐에 쌓여 `-W`로 503이 나고, `/_lb/status`도 같은 워커를 쓰므로 대시보드 갱신이 늦어질 수 있습니다.
+- 수 × rps가 200을 넘으면 경고를 출력하고, 실행은 그대로 합니다.
+
+### 분포 비교 (오프라인 시뮬레이터)
+
+`tools/lbsim.py`(`mini-web sim ...`)는 같은 키 집합에서 여러 방식의 서버별 몫, 서버 하나를 빼거나 더할 때 이동한 키의 비율, 빠진 서버의 키가 어디로 갔는지를 텍스트 막대와 표로 보여 줍니다. 한 서버가 그 키의 80% 이상을 받으면 `<- concentrated`가 붙습니다.
+
+| 방식 | 내용 |
+|---|---|
+| `mod` | `hash % 슬롯 수`(가중치만큼 슬롯을 펼침). 서버 수가 바뀌면 키 대부분이 이동합니다. |
+| `rr` | 가중치를 반영한 원형 리스트(라운드 로빈). 키 고정이 없어 키 단위 이동이 정의되지 않습니다. |
+| `random` | 키마다 한 번 가중치 비례 확률로 서버를 정해 두는 배치(`--seed N`, 기본 1). |
+| `ring1`, `ring10` | 서버당 점 1개 또는 10개 × weight인 ring. 점이 적으면 몫이 불균형합니다. 빠진 서버의 arc는 저마다 ring에서 다음 생존 점의 서버로 가므로 목적지가 여러 서버로 나뉠 수 있습니다. 전부 한 서버로 가는 것이 보장되는 경우는 빠진 서버의 arc가 하나일 때(ring1, 가중치 1)뿐입니다. |
+| `ketama` | 현재 front와 같은 구현(같은 해시, 서버당 160 × weight 점). |
+| `hrw` | 가중 rendezvous 해싱. |
+
+키를 254개만 세면 표본 오차가 커서, 보이는 숫자가 방식의 성질인지 우연인지 알기 어렵습니다. 그래서 실측 옆에 **수식 기대값(E)과 95% 범위**를 항상 같이 보여 줍니다.
+- 가정: 해시는 균등하고 서로 독립입니다.
+- 범위는 두 종류입니다.
+  - (a) 배치 편차만: ring의 arc 몫.
+  - (b) 배치 편차 + 키 K개의 표본 오차: keys 몫과 moved. 정확한 BetaBinomial/Binomial 분포의 2.5%·97.5% 분위수를 씁니다.
+- 실측이 범위 밖이면 `!`, 근사식이면 `≈`가 붙습니다.
+- 맨 아래 `summary (theory)` 표는 방식마다 한 줄로 이론 기준 차이를 요약합니다.
+
+기호: 가중치 w_i, W = Σw, 제거하는 서버 r, p_i = w_i/W, 남은 서버의 재분배 비율 q_j = w_j/(W − w_r).
+
+| 방식 | 몫 | 제거 시 이동(moved) | 재분배·쏠림 |
+|---|---|---|---|
+| `rr` | 정확히 p_i, 편차 0 | 정의 안 됨(키 고정 없음) | 정확히 q_j. 쏠림은 max q_j ≥ 0.8이면 1 |
+| `random` | p_i, keys sd √(p(1−p)/K) | p_r, sd √(p_r(1−p_r)/K) | 키마다 q_j. P(쏠림) = Σ_j P(Bin(n, q_j) ≥ ⌈0.8n⌉), n = round(K·p_r). 요청마다 새로 뽑으면 같은 키의 두 요청이 다른 서버로 갈 확률은 1 − Σp_i² |
+| `mod` | p_i, keys sd √(p(1−p)/K) | **정확**: 0..lcm(S, S′)−1의 나머지를 전부 세어 owner(x mod S) ≠ owner′(x mod S′)인 비율 | 같은 전수 계산으로 정확 |
+| `ring1`/`ring10`/`ketama` (점 m_i = P·w_i, M = P·W) | arc 몫 ~ Beta(m_i, M−m_i): 기대 p_i, 분산 m(M−m)/(M²(M+1)), 95%는 Beta 분위수. keys 개수는 정확히 BetaBinomial(K, m_i, M−m_i)(분산 = 배치 분산 + (p(1−p) − 배치 분산)/K), 95%는 그 분위수 | 기대 p_r | 기대는 정확히 q_j(점 주인의 순서가 무작위라 r의 각 arc는 다음 점의 주인 j에게 확률 m_j/(M−m_r)로 감). 쏠림: r의 arc 중 j에게 가는 개수 c_j ~ BetaBinomial(m_r, n_j, N−n_j)(N = M−m_r, n_j = P·w_j; 연속된 r 점은 함께 다음 서버로 감), arc 크기는 Dirichlet라 j의 몫 F_j ~ Beta(c_j, m_r−c_j)(양 끝: c_j = 0이면 F_j = 0, c_j = m_r이면 F_j = 1). P(쏠림) = Σ_j P(F_j ≥ 0.8)로 정확. m_r > 64이면 계산량 때문에 Σ_j P(Bin(m_r, q_j) ≥ ⌈0.8·m_r⌉)로 근사(≈). r의 각 arc는 다음 생존 점의 서버로 따로 가므로 목적지가 나뉠 수 있고, **m_r = 1일 때만 정확히 1**(arc가 하나라 전부 한 서버로 감) |
+| `hrw` | 정확히 p_i(지수 경주) | p_r(r의 키만 움직임) | 키마다 q_j. 쏠림은 `random`과 같은 식 |
+
+"가장 많이 떠안는 서버의 몫"(top)은 경우에 따라 정확하기도 하고 근사(`≈`)이기도 합니다.
+- 정확: `mod`(전수 계산한 재분배의 최댓값), `rr`(max q_j), 남는 서버가 하나이거나 m_r = 1인 ring(100%).
+- 중점 적분(`≈`), ring에서 m_r ≤ 64: top = ∫₀¹ P(max F ≥ t) dt를 100개 중점으로 계산합니다. t ≥ 0.5 구간은 Σ_j P(F_j ≥ t)로 정확하고, t < 0.5 구간은 min(1, Σ_j P(F_j ≥ t))라는 상한을 씁니다.
+- 독립 이항 근사(`≈`), ring에서 m_r > 64와 `hrw`/`random`: X_j ~ Bin(n, q_j)를 서로 독립으로 보고 E[max_j X_j]/n으로 계산합니다(ring은 n = m_r, hrw/random은 n = round(K·p_r)).
+
+처음에는 ring 쏠림도 "arc를 같은 크기의 독립 배정"으로 근사했습니다. 그런데 몬테카를로에서 ring1, w=3 제거의 P(쏠림)이 근사 0.088 대 실제 0.46으로 크게 틀려, 위의 정확식으로 바꿨습니다.
+
+이 식들은 `tests/lbsim_mc.py`가 lbsim의 식을 쓰지 않는 독립 몬테카를로로 검증합니다(고정 시드, 단독 약 13초, `functional_test.sh`가 실행). 확인하는 항목은 다음과 같습니다.
+- 무작위 ring 배치 수천 개의 arc 몫 평균, sd, 멤버별 arc 95%·keys 95% 적중률.
+- 해시로 만든 ring의 arc 몫, 그리고 키 254개 keys 몫의 sd.
+- 작은 K(7, 20)에서 keys·moved 95% 범위가 따로 계산한 정확한 Binomial/BetaBinomial 분위수와 완전히 같은지.
+- 제거된 arc가 실제로 어디로 가는지에서 나오는 재분배, 쏠림 확률, top.
+- 해시 키 20만 개로 본 mod, hrw, random의 이동과 재분배.
+
+```sh
+mini-web sim --backends 5 --remove b3               # 기본 키: 127.0.0.2..255(lb.sh keys와 같은 범위)
+mini-web sim --backends 3 --weights 1,3,1 --add     # b4를 가중치 1로 추가
+mini-web sim --backends 4 --keys 10000 --remove b2 --methods ring1,ketama
+```
+
+`ketama` 행이 실제 front와 같은지는 `functional_test.sh`가 검사합니다(`/_lb/status`의 SHARE = `--share`, 실제 응답 백엔드 = `--map`). jump hash는 임의의 서버 하나를 뺄 수 없어(마지막 버킷만 뺄 수 있음) 넣지 않았습니다. 대체 알고리즘을 front(C)에 넣지 않은 이유는 비교가 오프라인으로 충분하고, ketama 행은 실제 front와의 일치 검사로 확인되기 때문입니다.
+
+### bp_demo.sh 옵션
+
+`--backends N`(1..8, 기본 3), `--target bN`(장애를 걸 대상, 기본 b2), `--weights 1,3,1`(N개)을 받습니다. 인자 없이 실행하면 예전과 같습니다(b1..b3, 대상 b2, 가중치 모두 1). 결과 표 위에 `backends N  weights ...  target bN` 줄이 나옵니다.
+
+```sh
+bash scripts/bp_demo.sh --backends 5 --target b4 --weights 1,2,1,3,1 --scenarios hung --caps 0,2
+```
+
+`scripts/lb_test.sh`는 lb.sh/mini-web/bp_demo 회귀 검사입니다. `.lb/`와 :8001..:8080을 쓰므로 저장소 복사본 컨테이너에서만 실행합니다(`LB_TEST_IN_COPY=1`이 없으면 거부, 명령은 파일 머리말 참고).
+
 백엔드당 프록시 요청을 2개로 제한한 상태에서 b2를 일시 정지합니다. 부하가 계속되는 동안 b2는 `UP`, `2/2 FULL`로 표시되고 `SHED`가 증가합니다. `GET /`은 `200`을 반환하며, b2의 슬롯이 가득 차면 해당 키의 요청은 다음 백엔드로 넘어갑니다.
 
 ```sh
@@ -94,7 +187,8 @@ ApacheBench의 출발지 `127.0.0.1`은 b3 → b2 → b1 순서로 라우팅됩�
 - `src/proxy.c`: Reverse/Forward Proxy, hop-by-hop 헤더 제거, X-Forwarded-For, 502/504
 - `src/health.c`: 백엔드 능동 헬스 체크 스레드
 - `src/config.c`, `src/mime.c`: CLI 인자 처리, MIME 타입 매핑
-- `tests/`: 단위 테스트, `scripts/functional_test.sh`: 기능·엣지 케이스·부하 테스트, `scripts/lb.sh`: LB 데모 CLI
+- `tests/`: 단위 테스트, `scripts/functional_test.sh`: 기능·엣지 케이스·부하 테스트, `scripts/lb.sh`: LB 데모 CLI, `scripts/lb_test.sh`: lb.sh 회귀 검사(복사본 전용)
+- `tools/lbsim.py`: 분포 비교 시뮬레이터, `tools/clientd.py`: 지속 클라이언트 데몬, `tools/loadgen.py`: 일회성 부하
 - `www/`, `cgi-bin/`: 데모 정적 파일과 CGI 스크립트
 - `tools/Dockerfile`, `scripts/dev.sh`: 빌드·테스트용 컨테이너
 

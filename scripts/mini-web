@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
 # Short front door to scripts/lb.sh for the lab container (herdr_lab.sh puts it on PATH):
-#   mini-web backend new        start a backend on the lowest free port, front routes there too
-#   mini-web backend rm bN      stop bN and take it out of the front's route
-#   mini-web backend ls         the front's /_lb/status table
-#   mini-web <lb.sh command>    anything else goes to lb.sh as is (status, keys 20, pause b2, ...)
-LB="$(dirname "$(readlink -f "$0")")/lb.sh"
-if [ "${1:-}" = backend ]; then
-    case ${2:-} in
-        new) exec bash "$LB" add ;;
-        rm)  exec bash "$LB" remove "${3:-}" ;;
-        ls)  exec bash "$LB" status ;;
-        *)   echo "usage: mini-web backend new | rm bN | ls"; exit 1 ;;
-    esac
-fi
+#   mini-web backend new [--weight W]   start a backend on the lowest free port, front routes there too
+#   mini-web backend rm bN              stop bN and take it out of the front's route
+#   mini-web backend ls                 the front's /_lb/status table
+#   mini-web client new N [--rps R]     N more steady clients (source IPs 127.0.0.2.., at most 250)
+#   mini-web client rm N | ls | stop    fewer clients / their stats / stop them all
+#   mini-web sim [lbsim.py options]     offline distribution comparison (tools/lbsim.py --help)
+#   mini-web <lb.sh command>            anything else goes to lb.sh as is (status, keys 20, weight b2 3, ...)
+HERE="$(dirname "$(readlink -f "$0")")"
+LB="$HERE/lb.sh"
+lines() { echo "usage: mini-web backend new [--weight W] | rm bN | ls"
+          echo "       mini-web client new N [--rps R] | rm N | ls | stop"
+          echo "       mini-web sim [options]   |   mini-web <lb.sh command>:"; }
+usage() { lines; exit 1; }
+case ${1:-} in
+    backend)
+        case ${2:-} in
+            new) shift 2; exec bash "$LB" add "$@" ;;
+            rm)  exec bash "$LB" remove "${3:-}" ;;
+            ls)  exec bash "$LB" status ;;
+            *)   usage ;;
+        esac ;;
+    client) shift; exec bash "$LB" client "$@" ;;
+    sim)    shift; exec python3 "$HERE/../tools/lbsim.py" "$@" ;;
+    '')     lines; exec bash "$LB" ;;    # then lb.sh's own usage
+esac
 exec bash "$LB" "$@"
