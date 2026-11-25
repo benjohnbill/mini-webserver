@@ -60,6 +60,8 @@ struct rproxy_config {
     enum relay_mode relay_mode;
     int relay_conns;  /* RELAY_CONN_CAP: Origin exchanges in the process */
     int relay_buffer; /* RELAY_BACKPRESSURE: bytes for each connection */
+    /* Each loop writes loop-<N>.txt here: NULL when the stats are off. */
+    const char *relay_stats_dir;
 };
 
 struct tls_context;

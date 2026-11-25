@@ -16,9 +16,10 @@ struct event_loop;
    second rproxy cannot join the listen sockets of a first one. */
 bool event_loop_is_port_free(int port);
 
-/* Opens the listen socket on rproxy->config.port. Returns NULL, and
-   prints the cause, if a part cannot be set up. */
-struct event_loop *event_loop_create(struct rproxy *rproxy);
+/* Opens the listen socket on rproxy->config.port. index is the number of
+   the loop, 0 to loops - 1: it names the relay stats file of the loop.
+   Returns NULL, and prints the cause, if a part cannot be set up. */
+struct event_loop *event_loop_create(struct rproxy *rproxy, int index);
 void event_loop_destroy(struct event_loop *loop);
 
 /* Serves connections until rproxy->is_stopping is set, then closes the

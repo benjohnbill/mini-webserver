@@ -44,6 +44,7 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | `fetch` | Send a request and read the full reply |
    | `add` | Put one more item into a struct that exists. Return false, and change nothing, if it does not fit |
    | `remove` | Take an item out of a struct. Do nothing, or return `NULL`, if it is not there |
+   | `publish` | Write a file that another program reads. Write a temporary file and rename it, so that a reader never sees half a file |
 
 4. **One concept has one name in all files.** When you add a concept, add a row.
 
@@ -72,6 +73,8 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | A Relay mode | `enum relay_mode relay_mode` | `mode`, `relay` |
    | The relay buffer of one connection (backpressure) | `struct relay_buffer *relay` | `buf`, `ring`, `window` |
    | A conn-cap slot of one connection | `holds_exchange_slot`, `origin_exchanges` | `token`, `ticket`, `queue` |
+   | The peer port of a connection socket | `client_port` | `port`, `peer_port`, `src_port` |
+   | The directory of the relay stats files (`--relay-stats`) | `relay_stats_dir` | `stats_path`, `out_dir` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 

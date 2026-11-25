@@ -634,6 +634,23 @@ done
     && pass "backpressure serves 20 slow clients under 40 MiB RSS (peak $((peak_rss / 1024)) MiB)" \
     || fail "backpressure serves 20 slow clients under 40 MiB RSS: $whole whole, peak ${peak_rss} KiB"
 
+# --relay-stats: a slow download is open for about 6 s. A snapshot taken
+# during it must list the curl port with the reply bytes on the heap.
+mkdir -p "$WORK/stats"
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay unbounded --loops 2 \
+    --relay-stats "$WORK/stats"
+curl -sk --max-time 30 --limit-rate 1M -o /dev/null -w '%{local_port}' \
+    "$BASE/big.bin" > "$WORK/stats_port" &
+stats_pid=$!
+sleep 1.5
+cat "$WORK"/stats/loop-*.txt > "$WORK/stats_snapshot" 2>/dev/null
+wait "$stats_pid"
+stats_port=$(cat "$WORK/stats_port")
+awk -v port="$stats_port" '$1 == port && $2 > 0 {found = 1} END {exit !found}' \
+    "$WORK/stats_snapshot" \
+    && pass "--relay-stats lists an open connection by client port with its heap bytes" \
+    || fail "--relay-stats lists an open connection by client port with its heap bytes: port '$stats_port', $(tr '\n' '|' < "$WORK/stats_snapshot")"
+
 stop_proxy
 "$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \
     --origin "$HOST:$EPOLL_PORT" --relay backpressure --cache on \

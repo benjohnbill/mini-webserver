@@ -106,7 +106,8 @@ int main(int argc, char **argv)
                 "[--pow-prefix PATH ...] [--pow-bits N] "
                 "[--pay-prefix PATH ...] [--bot-key FILE] "
                 "[--relay unbounded|reply-cap|conn-cap|backpressure] "
-                "[--relay-conns N] [--relay-buffer BYTES]\n");
+                "[--relay-conns N] [--relay-buffer BYTES] "
+                "[--relay-stats DIR]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -240,6 +241,10 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
         return number_parse(value, RELAY_BUFFER_MIN, RELAY_BUFFER_MAX,
                             &config->relay_buffer);
     }
+    if (strcmp(name, "--relay-stats") == 0) {
+        config->relay_stats_dir = value;
+        return true;
+    }
     return cache_options_parse(&config->cache_options, name, value);
 }
 
@@ -371,13 +376,20 @@ static bool rproxy_start(struct rproxy *rproxy)
 }
 
 /* SPEC 12: the cache stores a whole reply, and backpressure never holds
-   one. */
+   one. The relay stats directory must exist at the start. */
 static bool relay_is_valid(const struct rproxy_config *config)
 {
     if (config->relay_mode == RELAY_BACKPRESSURE &&
         config->cache_options.is_on) {
         fprintf(stderr, "rproxy: --relay backpressure does not work with "
                         "--cache on\n");
+        return false;
+    }
+    /* A loop does not report a failed write: it tries again 200 ms later. */
+    if (config->relay_stats_dir != NULL &&
+        access(config->relay_stats_dir, W_OK) != 0) {
+        fprintf(stderr, "rproxy: --relay-stats %s: %s\n",
+                config->relay_stats_dir, strerror(errno));
         return false;
     }
 
@@ -613,7 +625,7 @@ static int loops_create(struct rproxy *rproxy, struct loop_thread *threads,
                         int count)
 {
     for (int i = 0; i < count; i++) {
-        threads[i].loop = event_loop_create(rproxy);
+        threads[i].loop = event_loop_create(rproxy, i);
         if (threads[i].loop == NULL) {
             return i;
         }

@@ -15,9 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/sockios.h>
 
 #include "behavior.h"
 #include "block_table.h"
@@ -61,6 +64,9 @@
 /* The status line, X-Cache, and the rest of a reply. */
 #define REPLY_PARTS_MAX 3
 #define NANOSECONDS_PER_SECOND 1e9
+/* --relay-stats: each loop writes its file this often. The demo
+   dashboard redraws at the same rate. */
+#define RELAY_STATS_PERIOD_MS 200
 
 /* The steps of one connection, in their order. One request for each
    connection (SPEC 11 "Two Verdict stages"). */
@@ -130,7 +136,8 @@ struct connection {
     struct event_loop *loop;
     enum connection_state state;
     int conn_fd;
-    int origin_fd; /* -1 while no Origin socket is open */
+    int origin_fd;   /* -1 while no Origin socket is open */
+    int client_port; /* the peer port of conn_fd, 0 if unknown */
     struct endpoint client_end;
     struct endpoint origin_end;
     uint32_t client_events; /* what conn_fd waits for: EPOLLIN or EPOLLOUT */
@@ -173,6 +180,8 @@ struct event_loop {
     struct connection *connections; /* the open connections */
     struct connection *closed;      /* freed at the end of the loop turn */
     int connection_count;
+    int index;        /* 0 to loops - 1 */
+    double stats_due; /* --relay-stats: the next write, monotonic */
     unsigned char scratch[HELLO_PEEK_MAX]; /* for the peek and the drain */
 };
 
@@ -183,7 +192,8 @@ static void loop_dispatch(struct event_loop *loop,
                           const struct epoll_event *event);
 static void loop_accept(struct event_loop *loop);
 static void connection_refuse(int conn_fd);
-static void client_ip_get(int conn_fd, char *client_ip, size_t size);
+static void client_address_get(int conn_fd, char *client_ip, size_t size,
+                               int *client_port);
 static void connection_open(struct event_loop *loop, int conn_fd);
 static void connection_set_deadline(struct connection *connection,
                                     double seconds);
@@ -271,13 +281,16 @@ static void connection_close(struct connection *connection);
 static void exchange_log(const struct exchange *exchange);
 static void behavior_log(const struct exchange *exchange);
 static void loop_expire_timers(struct event_loop *loop);
+static void loop_publish_stats(struct event_loop *loop);
+static bool relay_stats_format(const struct connection *connection, FILE *file);
+static long socket_get_queue(int fd, unsigned long request);
 static void connection_expire(struct connection *connection);
 static void relay_expire(struct connection *connection);
 static void exchange_slot_release(struct connection *connection);
 static void loop_free_closed(struct event_loop *loop);
 static void loop_close_all(struct event_loop *loop);
 
-struct event_loop *event_loop_create(struct rproxy *rproxy)
+struct event_loop *event_loop_create(struct rproxy *rproxy, int index)
 {
     struct event_loop *loop = calloc(1, sizeof(*loop));
     if (loop == NULL) {
@@ -285,6 +298,7 @@ struct event_loop *event_loop_create(struct rproxy *rproxy)
         return NULL;
     }
     loop->rproxy = rproxy;
+    loop->index = index;
     loop->listen_fd = listen_socket_open(rproxy->config.port);
     loop->epoll_fd = epoll_create1(0);
     loop->timers = timer_heap_create((size_t)rproxy->config.connections);
@@ -333,6 +347,7 @@ int event_loop_run(struct event_loop *loop)
             loop_dispatch(loop, &events[i]);
         }
         loop_expire_timers(loop);
+        loop_publish_stats(loop);
         loop_free_closed(loop);
     }
     loop_close_all(loop);
@@ -383,19 +398,23 @@ static int listen_socket_open(int port)
 }
 
 /* Until the first deadline, but at most EPOLL_WAIT_MS, so that the loop
-   sees a stop within 1 s. */
+   sees a stop within 1 s. With --relay-stats, at most
+   RELAY_STATS_PERIOD_MS, so that the stats file stays fresh. */
 static int loop_get_wait_ms(const struct event_loop *loop)
 {
+    int wait_max = loop->rproxy->config.relay_stats_dir != NULL
+                       ? RELAY_STATS_PERIOD_MS
+                       : EPOLL_WAIT_MS;
     const struct timer *first = timer_heap_find_first(loop->timers);
     if (first == NULL) {
-        return EPOLL_WAIT_MS;
+        return wait_max;
     }
     double wait = (first->deadline - clock_get_seconds()) * MS_PER_SECOND;
     if (wait <= 0) {
         return 0;
     }
 
-    return wait >= EPOLL_WAIT_MS ? EPOLL_WAIT_MS : (int)wait + 1;
+    return wait >= wait_max ? wait_max : (int)wait + 1;
 }
 
 static double clock_get_seconds(void)
@@ -449,24 +468,32 @@ static void connection_refuse(int conn_fd)
 {
     struct exchange exchange = {
         .verdict_name = "full", .cache_name = "-", .origin_index = -1};
-    client_ip_get(conn_fd, exchange.client_ip, sizeof(exchange.client_ip));
+    int client_port = 0;
+    client_address_get(conn_fd, exchange.client_ip, sizeof(exchange.client_ip),
+                       &client_port);
     close(conn_fd);
     exchange_log(&exchange);
 }
 
-static void client_ip_get(int conn_fd, char *client_ip, size_t size)
+/* The text form of the peer IP, "-" if unknown, and the peer port, 0 if
+   unknown. */
+static void client_address_get(int conn_fd, char *client_ip, size_t size,
+                               int *client_port)
 {
     struct sockaddr_storage addr;
     socklen_t addr_len = sizeof(addr);
     const void *host = NULL;
     snprintf(client_ip, size, "-");
+    *client_port = 0;
     if (getpeername(conn_fd, (struct sockaddr *)&addr, &addr_len) != 0) {
         return;
     }
     if (addr.ss_family == AF_INET) {
         host = &((struct sockaddr_in *)&addr)->sin_addr;
+        *client_port = ntohs(((struct sockaddr_in *)&addr)->sin_port);
     } else if (addr.ss_family == AF_INET6) {
         host = &((struct sockaddr_in6 *)&addr)->sin6_addr;
+        *client_port = ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
     }
     if (host != NULL) {
         inet_ntop(addr.ss_family, host, client_ip, (socklen_t)size);
@@ -495,8 +522,9 @@ static void connection_open(struct event_loop *loop, int conn_fd)
         .exchange = {
             .verdict_name = "-", .cache_name = "-", .origin_index = -1}};
     timer_init(&connection->timer);
-    client_ip_get(conn_fd, connection->exchange.client_ip,
-                  sizeof(connection->exchange.client_ip));
+    client_address_get(conn_fd, connection->exchange.client_ip,
+                       sizeof(connection->exchange.client_ip),
+                       &connection->client_port);
     fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL, 0) | O_NONBLOCK);
     struct epoll_event event = {.events = EPOLLIN | EPOLLET,
                                 .data.ptr = &connection->client_end};
@@ -1721,6 +1749,71 @@ static void loop_expire_timers(struct event_loop *loop)
                                           offsetof(struct connection, timer));
         connection_expire(connection);
     }
+}
+
+/* --relay-stats: the bytes that each open connection holds, for the demo
+   dashboard. The loop writes a .tmp file and renames it, so a reader never
+   sees half a file. The file of a loop has one writer: no lock. A failed
+   write is lost; the next one comes RELAY_STATS_PERIOD_MS later. */
+static void loop_publish_stats(struct event_loop *loop)
+{
+    const char *dir = loop->rproxy->config.relay_stats_dir;
+    double now = clock_get_seconds();
+    if (dir == NULL || now < loop->stats_due) {
+        return;
+    }
+    loop->stats_due = now + (double)RELAY_STATS_PERIOD_MS / MS_PER_SECOND;
+    char path[PATH_BUFFER_SIZE];
+    char tmp_path[PATH_BUFFER_SIZE];
+    int path_len =
+        snprintf(path, sizeof(path), "%s/loop-%d.txt", dir, loop->index);
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s/loop-%d.txt.tmp",
+                           dir, loop->index);
+    if (path_len < 0 || tmp_len < 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
+        return;
+    }
+    FILE *file = fopen(tmp_path, "w");
+    if (file == NULL) {
+        return;
+    }
+    bool is_written =
+        fprintf(file, "# client_port heap_bytes kernel_bytes\n") > 0;
+    for (const struct connection *connection = loop->connections;
+         connection != NULL && is_written; connection = connection->next) {
+        is_written = relay_stats_format(connection, file);
+    }
+    if (fclose(file) == 0 && is_written) {
+        rename(tmp_path, path);
+    }
+}
+
+/* One line: heap_bytes is the reply memory of rproxy (what the OOM killer
+   counts in Act 1). It counts reply_len, not reply_capacity: the buffer
+   grows by doubling, and only the bytes written into it are resident.
+   kernel_bytes is the client send queue and the unread bytes of the
+   Origin socket. */
+static bool relay_stats_format(const struct connection *connection, FILE *file)
+{
+    size_t heap_bytes = connection->reply_len + connection->relay.capacity;
+    long kernel_bytes = socket_get_queue(connection->conn_fd, SIOCOUTQ);
+    if (connection->origin_fd >= 0) {
+        kernel_bytes += socket_get_queue(connection->origin_fd, FIONREAD);
+    }
+
+    return fprintf(file, "%d %zu %ld\n", connection->client_port, heap_bytes,
+                   kernel_bytes) > 0;
+}
+
+/* SIOCOUTQ: the bytes in the send queue. FIONREAD: the bytes in the
+   receive queue. 0 if the ioctl fails. */
+static long socket_get_queue(int fd, unsigned long request)
+{
+    int bytes = 0;
+    if (ioctl(fd, request, &bytes) != 0) {
+        return 0;
+    }
+
+    return bytes;
 }
 
 /* What a deadline means in each state. In the connect the Origin gave no
