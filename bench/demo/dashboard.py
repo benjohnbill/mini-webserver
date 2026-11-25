@@ -1,27 +1,39 @@
 #!/usr/bin/env python3
-"""The terminal dashboard of the Back pressure demo (SPEC 12).
+"""The terminal dashboard of the Back pressure demo (SPEC 12, FINAL-10k).
+
+One skeleton for every scene of the talk. Each scene makes one block large
+and bright, and dims the others:
+
+  header        the Phase, the Relay mode, Phones per second, the scaling
+  formula       Relay buffer = read() from the Origin - write() to the Phone
+  bystander     one small page through rproxy, and how long it waits
+  memory        rproxy memory over time: the base of the open connections
+                (dim) and the Relay buffer bytes on top (bright)
+  relay buffer  the bytes that rproxy holds, and its limit in this mode
+  Phones        one bar for all Phones: done, receiving, queued, failed
+  rproxy        the connections of each Event loop
+  Origin        the Origin connections and the busy Workers
+  scores        one row for each Phase
 
 It reads the run directory that demo.sh writes:
-  act.json            the Act: number, Relay mode, rproxy pid, cgroup, ports,
-                      memory limit, and the speed tiers of the Phones
-  status-TIER.json    the Phones of one tier (bench/demo/phones.py)
-  relay/loop-*.txt    one line for each client connection of rproxy:
-                      "client_port origin_port pending capacity paused slot"
-  rproxy.log          the "cause" lines: why a reply failed
-  rproxy.exit         the exit code of rproxy, or "oom-kill", when it stopped
-  scores.json         one row for each Act that ended (this file writes it)
-  bystander.json      the last bystander curl (bench/demo/bystander.sh)
-It reads the memory of rproxy from memory.current of its cgroup, and the
-kernel buffers of each socket from `ss -tmnHO`.
+  act.json          the Act: Relay mode, rproxy pid and cgroup, the values
+  scene             the scene of `present` (P0, P1, 2A, 2B, P3, ORIGIN)
+  status-*.json     the Phones of one phones.py process (bench/demo/phones.py)
+  relay/loop-*.txt  one line for each rproxy connection: "client_port
+                    origin_port pending capacity paused slot queued"
+  origin.stats      "connections C workers W busy B" (server --stats)
+  rproxy.log        the "cause" lines: why a reply failed
+  rproxy.exit       the exit code of rproxy, or "oom-kill"
+  bystander.json    the last bystander curl (bench/demo/bystander.sh)
+  scores.json       one row for each Act that ended (this file writes it)
 
 Usage: bench/demo/dashboard.py [--run DIR] [--once [--watch S] [--width N]]
+       [--scene NAME]
 """
 import argparse
 import glob
 import json
 import os
-import re
-import subprocess
 import time
 
 from rich.console import Console, Group
@@ -29,46 +41,56 @@ from rich.live import Live
 from rich.text import Text
 
 POLL_PERIOD = 0.2          # seconds between two frames
-CHART_ROWS = 7
+CHART_ROWS_SMALL = 5
+CHART_ROWS_LARGE = 12
 CHART_SECONDS_PER_COLUMN = 0.5
-CHART_AXIS = 9             # columns of the axis labels
+CHART_AXIS = 10            # columns of the axis labels
 MIB = 1024 * 1024
 BLOCKS = " ▁▂▃▄▅▆▇█"
-GRID_PREFIX = 27           # columns of " <tier> <count> <speed> <done> "
-FOOTNOTE = (" speed tiers = KR carrier QoS caps; tier shares = assumption;"
-            " server memory is scaled")
-SKMEM = re.compile(r"([a-z]+)(\d+)")
+LABEL = 14                 # columns of a block label
+BAR_RIGHT = 34             # columns right of a bar for its numbers
 
-# One palette for the speed tiers (the pipe) and one for the results (the
-# grid). They share no colour.
-SLOW_COLOR = "medium_purple1"
-FAST_COLOR = "dark_cyan"
-STATES = {      # state: (label, colour, darker colour, plain char)
-    "done": ("200 OK", "green3", "green4", "#"),
-    "receiving": ("receiving", "dodger_blue1", "dodger_blue3", ">"),
-    "http_502": ("502", "red1", "red3", "2"),
-    "http_503": ("503", "orange1", "dark_orange3", "3"),
-    "http_other": ("other code", "red1", "red3", "o"),
-    "cut": ("cut", "magenta1", "magenta3", "x"),
-    "refused": ("refused", "gold1", "gold3", "r"),
-    "waiting": ("waiting", "grey30", "grey23", "."),
+# The scenes of the talk. act: the Act that runs it. focus: the blocks that
+# are large and bright.
+SCENES = {
+    "P0": {"act": 1, "title": "Phase 0  평소", "note": "rproxy up, no Phones",
+           "focus": {"bystander"}},
+    "P1": {"act": 1, "title": "Phase 1  unbounded",
+           "note": "no limit",
+           "focus": {"memory", "relay"}},
+    "2A": {"act": 2, "title": "Phase 2-A  memory-cap",
+           "note": "a cap on all reply bytes, 502 over it",
+           "focus": {"memory", "phones"}},
+    "2B": {"act": 3, "title": "Phase 2-B  conn-cap",
+           "note": "a cap on the connections, a queue for the rest",
+           "focus": {"bystander", "phones"}},
+    "P3": {"act": 4, "title": "Phase 3  backpressure",
+           "note": "read the Origin only when there is room",
+           "focus": {"memory", "relay"}},
+    "ORIGIN": {"act": 4, "title": "Origin  epoll-pool",
+               "note": "a slow Phone holds a socket, not a Worker",
+               "focus": {"loops", "origin", "scores"}},
+    "A5": {"act": 5, "title": "Origin  pool (comparison)",
+           "note": "a slow Phone holds a Worker",
+           "focus": {"origin", "phones"}},
 }
-SHORT = {"done": "OK", "receiving": "recv", "http_502": "502",
-         "http_503": "503", "http_other": "other", "cut": "cut",
-         "refused": "refused", "waiting": "wait"}
-STATE_ORDER = ("done", "receiving", "http_502", "http_503", "http_other",
-               "cut", "refused", "waiting")
+SCENE_OF_ACT = {1: "P1", 2: "2A", 3: "2B", 4: "P3", 5: "A5"}
 
-# The talk calls each Act a Phase; the screen uses the Phase and the mode.
-# Phase 0 is Act 1 before the Phones start.
-PHASE_ZERO = ("Phase 0", "평소", "rproxy up, no Phones yet")
-PHASES = {
-    1: ("Phase 1", "unbounded", "no limit"),
-    2: ("Phase 2-A", "reply-cap", "the 4 MiB limit we had"),
-    3: ("Phase 2-B", "conn-cap", "a connection limit, set for memory"),
-    4: ("Phase 3", "backpressure", "read the Origin as fast as the Phone"),
-    5: ("Epilogue", "backpressure", "pool Origin"),
+# The parts of the Phone bar, in order: label, colour, plain char.
+PARTS = {
+    "done": ("done", "green3", "#"),
+    "receiving": ("receiving", "dodger_blue1", ">"),
+    "queued": ("queued in rproxy", "gold1", "q"),
+    "http_502": ("502", "red1", "2"),
+    "http_503": ("503", "orange1", "3"),
+    "http_other": ("other code", "red3", "o"),
+    "cut": ("cut", "magenta1", "x"),
+    "refused": ("refused", "dark_red", "r"),
+    "waiting": ("not started", "grey30", "."),
 }
+BASE_COLOR = "grey42"      # the memory of the open connections
+RELAY_COLOR = "bold white"  # the Relay buffer bytes on top
+LIMIT_COLOR = "red"
 
 
 def parse_args():
@@ -79,8 +101,10 @@ def parse_args():
                         help="print one frame with no color and exit")
     parser.add_argument("--watch", type=float, default=0.0,
                         help="with --once: poll for S seconds first")
-    parser.add_argument("--width", type=int, default=95,
+    parser.add_argument("--width", type=int, default=113,
                         help="width of the --once frame")
+    parser.add_argument("--scene", help="show this scene, not the one of "
+                        "the run directory")
 
     return parser.parse_args()
 
@@ -101,44 +125,58 @@ def read_text(path):
         return None
 
 
+def file_time(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
 class Monitor:
     """What the dashboard remembers between two frames of one Act. After
     rproxy dies, every block shows the last frame before the death."""
 
     def __init__(self, act):
         self.act = act or {}
-        self.memory = []          # (seconds since act start, bytes)
+        self.memory = []      # (seconds since act start, bytes, relay bytes)
         self.peak = 0
         self.oom_kills = 0
-        self.death = None         # seconds since act start when rproxy died
-        self.relay = []           # lines of the relay stats, as dicts
-        self.kernel = {}          # stage -> sums of the sockets (ss)
-        self.tiers = None         # list of Tier, frozen at the death
-        self.seen = 0.0           # seconds since act start of the last frame
+        self.death = None     # seconds since act start when rproxy died
+        self.was_dead_at_start = False
+        self.relay = []       # lines of the relay stats, as dicts
+        self.loops = []       # connections of each Event loop
+        self.phones = {}      # state -> count, frozen at the death
+        self.seen = 0.0       # seconds since act start of the last frame
+        self.polls = 0
+        self.exit_code = None
 
     def poll(self, run_dir):
         start = self.act.get("started", time.time())
         now = time.time() - start
         pid = self.act.get("rproxy_pid")
+        self.polls += 1
         if pid and self.death is None:
             if self.is_alive(pid):
+                self.relay, self.loops = relay_read(run_dir)
                 self.poll_memory(now)
-                self.relay = relay_read(run_dir)
-                self.kernel = kernel_read(self.act, self.relay)
+                self.phones = phones_read(run_dir, self.act, self.relay)
                 self.seen = now
             else:
                 self.death = self.death_time(run_dir, start, now)
+                self.was_dead_at_start = self.polls == 1
+        if not self.phones:
+            self.phones = phones_read(run_dir, self.act, self.relay)
 
-        return read_text(os.path.join(run_dir, "rproxy.exit"))
+        self.exit_code = read_text(os.path.join(run_dir, "rproxy.exit"))
+
+        return self.exit_code
 
     @staticmethod
     def death_time(run_dir, start, now):
         """demo.sh writes rproxy.exit when rproxy stops: use its time."""
-        try:
-            return os.stat(os.path.join(run_dir, "rproxy.exit")).st_mtime \
-                - start
-        except OSError:
-            return now
+        stamp = file_time(os.path.join(run_dir, "rproxy.exit"))
+
+        return stamp - start if stamp else now
 
     @staticmethod
     def is_alive(pid):
@@ -161,149 +199,66 @@ class Monitor:
             return
         current = read_text(os.path.join(cgroup, "memory.current"))
         if current is not None and int(current) > 0:
-            self.memory.append((now, int(current)))
+            relay = sum(item["pending"] for item in self.relay)
+            self.memory.append((now, int(current), relay))
             self.peak = max(self.peak, int(current))
+
+    def death_word(self, exit_code):
+        if self.oom_kills or exit_code == "oom-kill":
+            return "killed by OOM"
+        if exit_code == "137":
+            return "killed"
+        if exit_code is None:
+            return "stopped"
+
+        return f"exited ({exit_code})"
 
 
 def relay_read(run_dir):
-    """The relay stats of all loops, one dict for each connection."""
+    """The relay stats of all loops: one dict for each connection, and the
+    connection count of each loop."""
     lines = []
-    for path in glob.glob(os.path.join(run_dir, "relay", "loop-*.txt")):
+    loops = []
+    for path in sorted(glob.glob(os.path.join(run_dir, "relay",
+                                              "loop-*.txt"))):
+        count = 0
         for line in (read_text(path) or "").splitlines():
             fields = line.split()
-            if line.startswith("#") or len(fields) != 6:
+            if line.startswith("#") or len(fields) not in (6, 7):
                 continue
             try:
-                port, origin, pending, capacity, paused, slot = map(
-                    int, fields)
+                values = list(map(int, fields)) + [0]
             except ValueError:
                 continue
-            lines.append({"port": port, "origin_port": origin,
-                          "pending": pending, "capacity": capacity,
-                          "paused": paused == 1, "slot": slot == 1})
+            count += 1
+            lines.append({"port": values[0], "pending": values[2],
+                          "capacity": values[3], "paused": values[4] == 1,
+                          "slot": values[5] == 1, "queued": values[6] == 1})
+        loops.append(count)
 
-    return lines
-
-
-def kernel_read(act, relay):
-    """The four kernel buffers of the pipe, from one `ss` call. Fill is the
-    socket memory over the socket buffer size: w/tb for a send buffer, r/rb
-    for a receive buffer. Each stage keeps the Phone port of each socket."""
-    proxy_port = act.get("proxy_port")
-    origin_port = act.get("origin_port")
-    if not proxy_port or not origin_port:
-        return {}
-    try:
-        out = subprocess.run(["ss", "-tmnHO", "state", "established"],
-                             capture_output=True, text=True,
-                             timeout=1).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    client_of = {line["origin_port"]: line["port"] for line in relay}
-    stages = {}
-    for line in out.splitlines():
-        socket = ss_parse(line)
-        if socket is None:
-            continue
-        stage, client = ss_stage(socket, proxy_port, origin_port, client_of)
-        if stage is None:
-            continue
-        sums = stages.setdefault(stage, {"used": 0, "size": 0, "queue": 0,
-                                         "clients": [], "blocked": []})
-        is_send = stage in ("origin send", "proxy send")
-        used = socket["w"] if is_send else socket["r"]
-        sums["used"] += used
-        sums["size"] += socket["tb"] if is_send else socket["rb"]
-        sums["queue"] += socket["send_q"] if is_send else socket["recv_q"]
-        sums["clients"].append((client, used))
-        if stage == "origin send" and socket["send_q"] > 0:
-            sums["blocked"].append(client)
-
-    return stages
+    return lines, loops
 
 
-def ss_parse(line):
-    """One line of `ss -tmnHO`: Recv-Q Send-Q local peer skmem:(...)."""
-    fields = line.split()
-    if len(fields) < 5 or not fields[4].startswith("skmem:("):
-        return None
-    try:
-        memory = {key: int(value) for key, value in SKMEM.findall(fields[4])}
-        return {"recv_q": int(fields[0]), "send_q": int(fields[1]),
-                "local": int(fields[2].rsplit(":", 1)[1]),
-                "peer": int(fields[3].rsplit(":", 1)[1]),
-                "r": memory.get("r", 0), "rb": memory.get("rb", 0),
-                "w": memory.get("w", 0), "tb": memory.get("tb", 0)}
-    except (ValueError, IndexError):
-        return None
-
-
-def ss_stage(socket, proxy_port, origin_port, client_of):
-    """Which buffer of the pipe a socket is, and the Phone port it serves."""
-    if socket["local"] == origin_port:
-        return "origin send", client_of.get(socket["peer"])
-    if socket["peer"] == origin_port:
-        return "proxy recv", client_of.get(socket["local"])
-    if socket["local"] == proxy_port:
-        return "proxy send", socket["peer"]
-    if socket["peer"] == proxy_port:
-        return "client recv", socket["local"]
-
-    return None, None
-
-
-class Tier:
-    """One speed tier: its place in act.json and its status file."""
-
-    def __init__(self, label, rate, count, status):
-        self.label = label
-        self.rate = rate                    # bytes per second
-        self.count = count
-        self.status = status
-        self.phones = (status or {}).get("phones", [])[:count]
-        self.states = [phone["state"] for phone in self.phones]
-        self.states += ["waiting"] * (count - len(self.states))
-
-    def total(self, *states):
-        return sum(1 for state in self.states if state in states)
-
-    def start_of(self, index):
-        """The start time of Phone `index` (phones.py: index × step)."""
-        status = self.status or {}
-        step = status.get("arrival", 0) / self.count if self.count else 0
-
-        return status.get("start", 0) + index * step
-
-
-def tiers_read(run_dir, act):
-    """The tiers of the Act, slowest first, joined to their status files."""
-    statuses = {}
+def phones_read(run_dir, act, relay):
+    """The Phone count of each state, from the totals of all status files
+    of this Act. A receiving Phone whose connection waits in the conn-cap
+    queue of rproxy counts as queued."""
+    counts = {state: 0 for state in PARTS}
     started = (act or {}).get("started", 0)
     for path in glob.glob(os.path.join(run_dir, "status-*.json")):
         status = read_json(path)
         if not status or status.get("start", 0) < started:
             continue                        # left from the last Act
-        statuses[status.get("tier", "")] = status
-    specs = [(tier["label"], tier["rate"] * 1000, tier["count"])
-             for tier in (act or {}).get("tiers", [])]
-    tiers = [Tier(label, rate, count, statuses.get(label))
-             for label, rate, count in specs]
+        for state, count in status.get("totals", {}).items():
+            counts[state if state in counts else "http_other"] += count
+    queued = min(counts["receiving"], sum(1 for item in relay
+                                          if item["queued"]))
+    counts["receiving"] -= queued
+    counts["queued"] = queued
+    started_phones = sum(counts.values())
+    counts["waiting"] += max(0, (act or {}).get("phones", 0) - started_phones)
 
-    return sorted(tiers, key=lambda tier: tier.rate)
-
-
-def tier_of_ports(tiers):
-    """Phone port -> "slow" or "fast". The fastest tier is fast."""
-    if not tiers:
-        return {}
-    fast = max(tiers, key=lambda tier: tier.rate)
-    groups = {}
-    for tier in tiers:
-        for phone in tier.phones:
-            if phone.get("port"):
-                groups[phone["port"]] = "fast" if tier is fast else "slow"
-
-    return groups
+    return counts
 
 
 def causes_read(run_dir):
@@ -319,106 +274,193 @@ def causes_read(run_dir):
     return counts
 
 
-def render(monitor, tiers, exit_code, causes, scores, bystander, width,
-           plain):
-    parts = [render_title(monitor, exit_code, width, plain),
-             render_bystander(monitor, bystander, width, plain)]
-    parts += render_chart(monitor, width)
+def origin_read(run_dir):
+    """The last line of server --stats, as a dict, or None."""
+    fields = (read_text(os.path.join(run_dir, "origin.stats")) or "").split()
+    try:
+        return {fields[i]: int(fields[i + 1])
+                for i in range(0, len(fields) - 1, 2)}
+    except ValueError:
+        return None
+
+
+def scene_get(run_dir, act, forced):
+    """The scene: --scene, then the scene file of `present` if it is newer
+    than the Act, then the scene of the Act."""
+    if forced:
+        return forced
+    path = os.path.join(run_dir, "scene")
+    name = read_text(path)
+    started = (act or {}).get("started", 0)
+    if name in SCENES and file_time(path) >= started - 1:
+        return name
+    if (act or {}).get("held"):
+        return "P0"
+
+    return SCENE_OF_ACT.get((act or {}).get("act"), "P1")
+
+
+# --- render -----------------------------------------------------------------
+
+def render(view):
+    """view: a dict with monitor, scene, exit_code, causes, scores,
+    bystander, origin, width, plain."""
+    focus = SCENES[view["scene"]]["focus"]
+    blocks = [
+        ("header", render_header(view)),
+        ("formula", render_formula(view)),
+        ("bystander", render_bystander(view, "bystander" in focus)),
+        ("memory", render_memory(view, "memory" in focus)),
+        ("relay", render_relay(view)),
+        ("phones", render_phones(view)),
+        ("loops", render_loops(view)),
+        ("origin", render_origin(view)),
+        ("scores", render_scores(view)),
+    ]
+    parts = []
+    for name, lines in blocks:
+        is_dim = name not in focus and name not in ("header", "formula")
+        if name in ("memory", "phones", "loops", "scores"):
+            parts.append(Text(""))
+        for line in lines:
+            if is_dim and not view["plain"]:
+                line.stylize("dim")
+            parts.append(line)
     parts.append(Text(""))
-    parts += render_pipe(monitor, tiers, width, plain)
-    parts.append(Text(""))
-    parts += render_grid(tiers, width, plain,
-                         monitor.act.get("file_bytes", 0))
-    parts += render_legend(monitor, tiers, causes, plain)
-    parts.append(Text(""))
-    parts += render_scores(scores, score_row(monitor, tiers), width)
-    parts.append(Text(FOOTNOTE, style="dim"))
+    parts.append(Text(footnote(view["monitor"].act), style="dim"))
 
     return Group(*parts)
 
 
-def render_title(monitor, exit_code, width, plain):
-    phase, mode, note = PHASES.get(monitor.act.get("act"),
-                                   ("Waiting", "-", ""))
-    if monitor.act.get("held"):         # `present` holds the Phones
-        phase, mode, note = PHASE_ZERO
-    text = Text(f" {phase}  ", style="bold")
-    text.append(mode, style="bold cyan")
-    text.append(f"   {note}", style="dim")
-    if monitor.act.get("act"):
-        status = (" ALIVE " if monitor.death is None else
-                  f" {death_word(monitor, exit_code).upper()}"
-                  f" at {monitor.death:.1f} s ")
-        style = "bold black on green3" if monitor.death is None \
-            else "bold white on red3"
-        text.append(" " * max(2, width - text.cell_len - len(status) - 8))
-        text.append("rproxy ")
-        text.append(status, style="" if plain else style)
-    text.truncate(width)
+def block_title(name, is_focus, plain):
+    mark = ">> " if is_focus and plain else ("▶ " if is_focus else "  ")
+    text = Text(f" {mark}{name}", style="bold" if is_focus else "")
 
     return text
 
 
-def render_bystander(monitor, bystander, width, plain):
-    """The last bystander curl of this Act, so the audience sees a small
-    page pass or fail next to the Phones."""
-    text = Text(" bystander  GET /index.html  ", style="bold")
+def render_header(view):
+    monitor = view["monitor"]
+    scene = SCENES[view["scene"]]
+    act = monitor.act
+    text = Text(f" {scene['title']}", style="bold")
+    text.append(f"   {scene['note']}", style="dim")
+    status = rproxy_status(monitor, view["exit_code"])
+    if status:
+        word, style = status
+        text.append(" " * max(2, view["width"] - text.cell_len - len(word)
+                              - 9))
+        text.append("rproxy ")
+        text.append(word, style="" if view["plain"] else style)
+    text.truncate(view["width"])
+
+    return [text]
+
+
+def render_formula(view):
+    act = view["monitor"].act
+    text = Text(" Relay buffer = read() from the Origin − write() to the"
+                " Phone", style="bold cyan")
+    if act.get("act") and not act.get("held"):
+        load = (f"{act.get('phones', 0):,} Phones start at"
+                f" {act.get('phone_rate', 0)}/s")
+        text.append(" " * max(2, view["width"] - text.cell_len - len(load)
+                              - 1))
+        text.append(load, style="dim")
+
+    return [text]
+
+
+def rproxy_status(monitor, exit_code):
+    if not monitor.act.get("act"):
+        return None
+    if monitor.death is None:
+        return " ALIVE ", "bold black on green3"
+    if monitor.was_dead_at_start:
+        return " ENDED EARLIER ", "bold white on grey30"
+    word = f" {monitor.death_word(exit_code).upper()} at {monitor.death:.1f} s "
+
+    return word, "bold white on red3"
+
+
+def render_bystander(view, is_focus):
+    """The last bystander curl of this Act. While it waits, the seconds of
+    the wait, large when the scene is about waiting."""
+    monitor = view["monitor"]
+    bystander = view["bystander"]
+    text = block_title("bystander", is_focus, view["plain"])
+    text.append("   GET /index.html  ")
     started = monitor.act.get("started", 0)
-    if not bystander or bystander.get("time", 0) < started:
+    if not bystander or bystander.get("start", bystander.get("time", 0)) \
+            < started - 1:
         text.append("-", style="dim")
-        return text
+        return [text]
+    if bystander.get("pending"):
+        waited = time.time() - bystander.get("start", time.time())
+        text.append(f" waiting {waited:4.1f} s ",
+                    style="" if view["plain"] else "bold black on gold1")
+        lines = [text]
+        if is_focus:
+            lines.append(Text(f"     still no page after {waited:.0f} s",
+                              style="bold gold1"))
+        return lines
     style = "bold black on green3" if bystander.get("ok") \
         else "bold white on red3"
     text.append(f" {bystander.get('line', '?')} ",
-                style="" if plain else style)
-    text.append(f"  at {bystander['time'] - started:.0f} s", style="dim")
-    text.truncate(width)
+                style="" if view["plain"] else style)
+    text.append(f"   at {bystander['time'] - started:.0f} s", style="dim")
 
-    return text
+    return [text]
 
 
-def render_chart(monitor, width):
-    limit = monitor.act.get("memory_max", 1024 * MIB)
-    top = limit * 1.15
+def render_memory(view, is_focus):
+    monitor = view["monitor"]
+    width = view["width"]
+    rows = CHART_ROWS_LARGE if is_focus else CHART_ROWS_SMALL
+    limit = monitor.act.get("memory_max", 4096 * MIB)
+    top = limit * 1.1
     columns = max(10, width - CHART_AXIS - 1)
-    buckets = chart_buckets(monitor, columns)
+    offset = chart_offset(monitor, columns)
+    buckets = chart_buckets(monitor, columns, offset)
+    limit_row = min(rows - 1, int(limit / top * rows))
     death_column = None
-    if monitor.death is not None:
-        death_column = min(int(monitor.death / CHART_SECONDS_PER_COLUMN),
-                           columns - 1) - chart_offset(monitor, columns)
-    limit_row = min(CHART_ROWS - 1, int(limit / top * CHART_ROWS))
-    lines = [chart_header(monitor, limit)]
-    for row in range(CHART_ROWS - 1, -1, -1):
-        label = f"{limit / MIB:.0f} MiB" if row == limit_row else \
+    if monitor.death is not None and not monitor.was_dead_at_start:
+        death_column = min(int(monitor.death / CHART_SECONDS_PER_COLUMN)
+                           - offset, columns - 1)
+    lines = [memory_header(monitor, limit, is_focus, view["plain"])]
+    for row in range(rows - 1, -1, -1):
+        label = f"{limit / MIB / 1024:.0f} GiB" if row == limit_row else \
             ("0" if row == 0 else "")
         line = Text(label.rjust(CHART_AXIS - 1) + " ", style="dim")
         for column in range(columns):
             if column == death_column:
-                line.append("X" if row == CHART_ROWS - 1 else "|",
-                            style="bold red")
+                line.append("X" if row == rows - 1 else "|", style="bold red")
                 continue
             value = buckets[column] if column < len(buckets) else None
-            line.append(*chart_cell(value, row, limit_row, top, limit))
+            line.append(*chart_cell(value, row, rows, limit_row, top))
         lines.append(line)
-    seconds = (chart_offset(monitor, columns) + columns) \
-        * CHART_SECONDS_PER_COLUMN
+    seconds = (offset + columns) * CHART_SECONDS_PER_COLUMN
     lines.append(Text(" " * CHART_AXIS + f"time, {seconds:.0f} s across",
                       style="dim"))
 
     return lines
 
 
-def chart_header(monitor, limit):
-    header = Text(" rproxy memory  ", style="bold")
+def memory_header(monitor, limit, is_focus, plain):
+    header = block_title("rproxy memory", is_focus, plain)
     if not monitor.memory:
-        header.append("no sample yet", style="dim")
+        header.append("   no sample yet", style="dim")
         return header
-    current = monitor.memory[-1][1]
-    style = "bold red" if current >= limit * 0.8 else "bold white"
-    header.append(f"{current / MIB:.0f} MiB", style=style)
-    header.append(f"   peak {monitor.peak / MIB:.0f} MiB", style="dim")
-    header.append(f"   - - limit {limit / MIB:.0f} MiB = server memory"
-                  " (scaled)", style="red")
+    _, current, relay = monitor.memory[-1]
+    style = "bold red" if current >= limit * 0.8 else "bold"
+    header.append(f"   {mib(current)}", style=style)
+    header.append(f"  peak {mib(monitor.peak)}", style="dim")
+    header.append("    ")
+    header.append("▒" if plain else "█", style=BASE_COLOR)
+    header.append(f" connections {mib(current - relay)}  ")
+    header.append("█", style=RELAY_COLOR)
+    header.append(f" Relay buffer {mib(relay)}  ")
+    header.append(f"- - limit {limit / MIB / 1024:.0f} GiB", style=LIMIT_COLOR)
 
     return header
 
@@ -434,350 +476,250 @@ def chart_offset(monitor, columns):
     return max(0, last - columns + 1)
 
 
-def chart_buckets(monitor, columns):
-    offset = chart_offset(monitor, columns)
+def chart_buckets(monitor, columns, offset):
+    """One (total, relay) for each column: the sample with the most memory."""
     buckets = []
-    for seconds, value in monitor.memory:
+    for seconds, total, relay in monitor.memory:
         column = int(seconds / CHART_SECONDS_PER_COLUMN) - offset
         if column < 0:
             continue
         while len(buckets) <= column:
             buckets.append(None)
-        buckets[column] = max(buckets[column] or 0, value)
+        if buckets[column] is None or total > buckets[column][0]:
+            buckets[column] = (total, relay)
 
     return buckets
 
 
-def chart_cell(value, row, limit_row, top, limit):
-    """The text and the style of one cell of the memory chart."""
-    if value is None or value <= 0:
-        return ("-", "red") if row == limit_row else (" ",)
-    fill = value / top * CHART_ROWS - row
-    style = "red" if value >= limit * 0.8 else "white"
+def chart_cell(value, row, rows, limit_row, top):
+    """One cell: dim for the open connections, bright for the Relay buffer
+    bytes above them."""
+    if value is None:
+        return ("-", LIMIT_COLOR) if row == limit_row else (" ",)
+    total, relay = value
+    base = max(0, total - relay)
+    fill = total / top * rows - row
+    if fill <= 0:
+        return ("-", LIMIT_COLOR) if row == limit_row else (" ",)
+    is_base = (row + 1) <= base / top * rows
+    style = BASE_COLOR if is_base else RELAY_COLOR
     if fill >= 1:
         return ("█", style)
-    if fill > 0:
-        return (BLOCKS[max(1, int(fill * 8))], style)
-    if row == limit_row:
-        return ("-", "red")
-    if row == 0:
-        return (BLOCKS[1], style)    # a small value still shows
 
-    return (" ",)
+    return (BLOCKS[max(1, int(fill * 8))], style)
 
 
-def death_word(monitor, exit_code):
-    if monitor.oom_kills or exit_code == "oom-kill":
-        return "killed by OOM"
-    if exit_code == "137":
-        return "killed"
-    if exit_code is None:
-        return "gone"
-
-    return f"exited ({exit_code})"
-
-
-def render_pipe(monitor, tiers, width, plain):
-    """The five buffers from the Origin to the Phone. Each bar is the fill
-    of that buffer against its own size, split into slow and fast."""
-    groups = tier_of_ports(tiers)
-    relay_mode = monitor.act.get("relay", "")
-    slow_count = sum(tier.count for tier in tiers[:-1])
-    fast_count = tiers[-1].count if tiers else 0
-    title = Text(" buffer pipe", style="bold")
-    title.append("   relay buffer = read() − write()   fill vs own size  ",
-                 style="dim")
-    title.append_text(swatch(SLOW_COLOR, "s", plain))
-    title.append(f" slow {slow_count}  ")
-    title.append_text(swatch(FAST_COLOR, "f", plain))
-    title.append(f" fast {fast_count}")
-    lines = [title]
-    bar_width = max(10, width - 60)
-    for stage in ("origin send", "proxy recv"):
-        lines.append(pipe_kernel_row(stage, monitor.kernel, groups,
-                                     bar_width, plain))
-    lines.append(pipe_relay_row(monitor.relay, groups, relay_mode,
-                                bar_width, plain))
-    for stage in ("proxy send", "client recv"):
-        lines.append(pipe_kernel_row(stage, monitor.kernel, groups,
-                                     bar_width, plain))
-    lines += pipe_status(monitor, tiers, groups, relay_mode)
-
-    return lines
-
-
-def pipe_kernel_row(stage, kernel, groups, bar_width, plain):
-    line = Text(f" {stage:<13}")
-    sums = kernel.get(stage)
-    if not sums or not sums["size"]:
-        line.append("·" * bar_width, style="grey23")
-        line.append("  no connection", style="dim")
-        return line
-    slow = sum(used for client, used in sums["clients"]
-               if groups.get(client) == "slow")
-    fast = sum(used for client, used in sums["clients"]
-               if groups.get(client) == "fast")
-    other = max(0, sums["used"] - slow - fast)
-    line.append_text(split_bar(slow / sums["size"], fast / sums["size"],
-                               bar_width, plain, other / sums["size"]))
-    line.append(f" {sums['used'] / sums['size'] * 100:4.0f}%", style="bold")
-    line.append(f"  {mib(sums['used'])} of {mib(sums['size'])}",
-                style="dim")
-    line.append(" · kernel limit", style="dim")
-
-    return line
-
-
-def pipe_relay_row(relay, groups, relay_mode, bar_width, plain):
-    """rproxy's own memory. With back pressure it has a limit (the relay
-    buffer, read() - write()); in the other modes it has none."""
-    line = Text(f" {'relay buffer':<13}", style="bold")
-    slow = sum(item["pending"] for item in relay
-               if groups.get(item["port"]) == "slow")
-    fast = sum(item["pending"] for item in relay
-               if groups.get(item["port"]) == "fast")
-    held = sum(item["pending"] for item in relay)
-    size = sum(item["capacity"] for item in relay)
-    if relay_mode == "backpressure":
-        if size:
-            line.append_text(split_bar(slow / size, fast / size, bar_width,
-                                       plain))
-            line.append(f" {held / size * 100:4.0f}%", style="bold")
-            line.append(f"  {mib(held)} of {mib(size)}", style="dim")
-        else:
-            line.append("·" * bar_width + "      ", style="grey23")
-        line.append(" · 64 KiB each: the limit", style="bold yellow")
-        return line
-    if held:
-        line.append_text(split_bar(slow / held, fast / held, bar_width,
-                                   plain))
-    else:
-        line.append("·" * bar_width, style="grey23")
-    line.append(f" {mib(held):>9}", style="bold red" if held > 100 * MIB
-                else "bold")
-    line.append(" · whole reply, cut at 4 MiB" if relay_mode == "reply-cap"
-                else " · whole reply, no limit, grows", style="red")
-
-    return line
-
-
-def pipe_status(monitor, tiers, groups, relay_mode):
-    """One line in the same form for every mode: signal -> what rproxy
-    does. Then the count that proves it."""
+def render_relay(view):
+    """The Relay buffer bytes and the limit of this mode."""
+    monitor = view["monitor"]
+    act = monitor.act
+    is_focus = "relay" in SCENES[view["scene"]]["focus"]
     relay = monitor.relay
-    full_send = sum(1 for client, used in
-                    monitor.kernel.get("proxy send", {}).get("clients", [])
-                    if used > 0)
-    signal = {
-        "unbounded": f"proxy send full on {full_send} → rproxy reads the "
-                     "Origin anyway → relay grows",
-        "reply-cap": "reply > 4 MiB whole-reply limit → 502",
-        "conn-cap": f"{sum(1 for item in relay if item['slot'])}/"
-                    f"{monitor.act.get('relay_conns', 20)} slots held → "
-                    "next request 503",
-        "backpressure": "relay full (64 KiB) → rproxy stops reading the "
-                        "Origin → the Origin waits",
-    }.get(relay_mode, "")
-    lines = [Text(" → " + signal, style="bold")]
-    if relay_mode == "backpressure":
-        paused = [item for item in relay if item["paused"]]
-        lines.append(count_line("Origin read paused now", paused,
-                                len(relay), groups))
-        blocked = monitor.kernel.get("origin send", {}).get("blocked", [])
-        oldest = oldest_age(blocked, tiers, monitor)
-        text = Text(f"   {len(blocked)} Origin connections wait on write()",
-                    style="dim")
-        if oldest is not None:
-            text.append(f" · oldest {oldest:.0f} s", style="dim")
-        lines.append(text)
-    elif relay_mode == "conn-cap":
-        holders = [item for item in relay if item["slot"]]
-        lines.append(count_line("slots held", holders, None, groups))
+    held = sum(item["pending"] for item in relay)
+    mode = act.get("relay", "")
+    text = block_title("Relay buffer", is_focus, view["plain"])
+    bar_width = max(10, view["width"] - LABEL - BAR_RIGHT - 4)
+    line = Text(" " * LABEL)
+    if mode == "backpressure":
+        room = sum(item["capacity"] for item in relay)
+        paused = sum(1 for item in relay if item["paused"])
+        line.append_text(bar([(held, "cyan")], room, bar_width, view["plain"]))
+        line.append(f"  {mib(held)} of {len(relay):,} × "
+                    f"{act.get('relay_buffer', 0) // 1024} KiB")
+        text.append(f"   at most {act.get('relay_buffer', 0) // 1024} KiB for"
+                    f" each connection · Origin read paused on {paused:,}",
+                    style="bold")
+        return [text, line]
+    if mode == "memory-cap":
+        cap = act.get("relay_memory", 0) * MIB
+        line.append_text(bar([(held, "cyan")], cap, bar_width,
+                             view["plain"]))
+        line.append(f"  {mib(held)} of the {mib(cap)} cap")
+        text.append("   the whole reply of each connection · new exchanges"
+                    " get 502 over the cap", style="bold")
+        return [text, line]
+    holders = sum(1 for item in relay if item["pending"] > 0)
+    text.append(f"   the whole reply of each connection · no limit ·"
+                f" {mib(held)} in {holders:,} connections",
+                style="bold red" if held > MIB * 1024 else "bold")
+    if mode == "conn-cap":
+        slots = sum(1 for item in relay if item["slot"])
+        queued = sum(1 for item in relay if item["queued"])
+        text.append(f"   slots {slots:,}/{act.get('relay_conns', 0):,}"
+                    f" · queued {queued:,}", style="bold gold1")
 
-    return lines
-
-
-def count_line(name, items, open_count, groups):
-    slow = sum(1 for item in items if groups.get(item["port"]) == "slow")
-    fast = sum(1 for item in items if groups.get(item["port"]) == "fast")
-    other = len(items) - slow - fast
-    text = Text(f"   {name}: {len(items)}", style="bold")
-    if open_count is not None:
-        text.append(f" of {open_count} open")
-    text.append(f"  (slow {slow} · fast {fast}"
-                + (f" · other {other})" if other else ")"))
-
-    return text
+    return [text]
 
 
-def oldest_age(ports, tiers, monitor):
-    """Seconds since the oldest of these Phones started."""
-    starts = []
-    for tier in tiers:
-        for index, phone in enumerate(tier.phones):
-            if phone.get("port") in ports:
-                starts.append(tier.start_of(index))
-    if not starts:
-        return None
-    now = monitor.act.get("started", 0) + monitor.seen
-
-    return now - min(starts)
-
-
-def render_grid(tiers, width, plain, file_bytes):
-    """One cell for each Phone, by tier. Neighbours alternate between two
-    shades of the state colour, so single cells stay apart."""
-    columns = max(10, width - GRID_PREFIX - 1)
-    lines = [Text(" Phones", style="bold")]
-    lines[0].append("   1 cell = 1 Phone   speed  done", style="dim")
-    fast = max(tiers, key=lambda tier: tier.rate) if tiers else None
-    for tier in tiers:
-        for row_start in range(0, max(tier.count, 1), columns):
-            if row_start == 0:
-                line = Text(f" {tier.label:>8} {tier.count:>3} ",
-                            style="bold")
-                line.append(tier_progress(tier, tier is fast, file_bytes),
-                            style="dim")
-            else:
-                line = Text(" " * GRID_PREFIX)
-            for index, state in enumerate(
-                    tier.states[row_start:row_start + columns]):
-                line.append_text(cell(state, row_start + index, plain))
-            lines.append(line)
-
-    return lines
-
-
-def tier_progress(tier, is_fast, file_bytes):
-    """The measured speed and the share done of a slow tier: 14 columns."""
-    if is_fast:
-        return " " * 14
-    speeds = [phone.get("speed", 0) for phone in tier.phones
-              if phone["state"] == "receiving"]
-    done = sum(phone.get("bytes", 0) for phone in tier.phones
-               if phone["state"] in ("receiving", "done", "cut"))
-    share = done / (file_bytes * tier.count) * 100 \
-        if file_bytes and tier.count else 0
-    speed = f"{sum(speeds) / len(speeds) / 1000:4.0f} KB/s" if speeds \
-        else "    - KB/s"
-
-    return f"{speed} {share:2.0f}% "
-
-
-def cell(state, index, plain):
-    label, color, darker, char = STATES.get(state, STATES["cut"])
-    if plain:
-        return Text(char)
-
-    return Text(" ", style=f"on {color if index % 2 == 0 else darker}")
-
-
-def swatch(color, char, plain):
-    return Text(char if plain else " ", style="" if plain else f"on {color}")
-
-
-def render_legend(monitor, tiers, causes, plain):
-    """Each state with its count. A failed state names its causes, from the
-    "cause" lines of rproxy; a cut after the death of rproxy is "rproxy
-    died"."""
-    text = Text(" ")
-    for state in STATE_ORDER:
-        count = sum(tier.total(state) for tier in tiers)
-        if not count and state in ("http_other", "refused", "cut"):
+def render_phones(view):
+    """One bar for all Phones, and the count of each part."""
+    monitor = view["monitor"]
+    counts = monitor.phones
+    total = max(1, sum(counts.values()))
+    is_focus = "phones" in SCENES[view["scene"]]["focus"]
+    text = block_title("Phones", is_focus, view["plain"])
+    text.append(f"   {total:,} Phones", style="dim")
+    bar_width = max(10, view["width"] - LABEL - 4)
+    parts = [(counts.get(state, 0), PARTS[state][1]) for state in PARTS]
+    line = Text(" " * LABEL)
+    line.append_text(bar(parts, total, bar_width, view["plain"],
+                         [PARTS[state][2] for state in PARTS]))
+    legend = Text(" " * LABEL)
+    for state, (label, color, char) in PARTS.items():
+        count = counts.get(state, 0)
+        if not count and state not in ("done", "receiving", "waiting"):
             continue
-        label, color, _, char = STATES[state]
-        text.append_text(swatch(color, char, plain))
-        text.append(f" {label} {count}  ")
-    lines = [text]
-    reasons = cause_text(monitor, tiers, causes)
-    if reasons:
-        lines.append(Text("   why: " + reasons, style="dim"))
+        legend.append(char if view["plain"] else "■", style=color)
+        legend.append(f" {label} {count:,}   ")
+    lines = [text, line, legend]
+    why = cause_text(monitor, counts, view["causes"])
+    if why:
+        lines.append(Text(" " * LABEL + "why: " + why, style="dim"))
 
     return lines
 
 
-def cause_text(monitor, tiers, causes):
+def cause_text(monitor, counts, causes):
     parts = []
     for status, state in (("502", "http_502"), ("503", "http_503")):
-        count = sum(tier.total(state) for tier in tiers)
-        if count:
+        if counts.get(state):
             named = {cause: n for (code, cause), n in causes.items()
                      if code == status}
             parts.append(f"{status} " + (", ".join(
-                f"{cause} {n}" for cause, n in named.items())
+                f"{cause} {n:,}" for cause, n in named.items())
                 or "cause unknown"))
-    cuts = sum(tier.total("cut") for tier in tiers)
-    if cuts:
-        timed_out = min(cuts, sum(n for (code, cause), n in causes.items()
-                                  if cause == "client-timeout"))
-        rest = cuts - timed_out
-        words = [f"client-timeout {timed_out}"] if timed_out else []
-        if rest:
-            words.append(f"rproxy died {rest}" if monitor.death is not None
-                         else f"cause unknown {rest}")
-        parts.append("cut " + ", ".join(words))
+    if counts.get("cut") and monitor.death is not None:
+        parts.append("cut: rproxy died")
+    if counts.get("refused") and monitor.death is not None:
+        parts.append("refused: rproxy died")
 
     return "   ".join(parts)
 
 
-def score_row(monitor, tiers):
+def render_loops(view):
+    loops = view["monitor"].loops
+    is_focus = "loops" in SCENES[view["scene"]]["focus"]
+    text = block_title("rproxy", is_focus, view["plain"])
+    if not loops:
+        text.append("   no Event loop stats", style="dim")
+        return [text]
+    text.append(f"   {len(loops)} Event loops (threads) hold"
+                f" {sum(loops):,} connections:  ")
+    text.append(" ".join(f"{count:,}" for count in loops), style="cyan")
+    text.truncate(view["width"])
+
+    return [text]
+
+
+def render_origin(view):
+    act = view["monitor"].act
+    origin = view["origin"]
+    is_focus = "origin" in SCENES[view["scene"]]["focus"]
+    text = block_title("Origin", is_focus, view["plain"])
+    text.append(f"   {act.get('origin_model', '?')}", style="bold")
+    if not origin:
+        text.append("   no stats", style="dim")
+        return [text]
+    text.append(f"   {origin.get('connections', 0):,} connections open ·"
+                f" Workers busy {origin.get('busy', 0)}"
+                f"/{origin.get('workers', 0)}")
+    text.append(f"   (each answer: {act.get('origin_work', 0)} ms of CPU)",
+                style="dim")
+
+    return [text]
+
+
+def score_row(monitor, scene):
     """The row of this Act for the score table, as it is now."""
     act = monitor.act
-    number = act.get("act")
-    if not number or not tiers or act.get("held"):
+    if not act.get("act") or act.get("held") or monitor.was_dead_at_start:
         return None
-    counts = {state: sum(tier.total(state) for tier in tiers)
-              for state in STATE_ORDER}
-    phones = sum(tier.count for tier in tiers)
-    file_mb = act.get("file_bytes", 0) / 1e6
-    ceiling = {
-        "unbounded": f"{phones} × {file_mb:.0f} MB",
-        "reply-cap": f"{phones} × 4 MiB",
-        "conn-cap": f"{act.get('relay_conns', 20)} × {file_mb:.0f} MB",
-        "backpressure": f"{phones} × 64 KiB",
-    }.get(act.get("relay"), "-")
+    counts = monitor.phones
+    failed = {state: n for state, n in counts.items()
+              if n and state in ("http_502", "http_503", "http_other", "cut",
+                                 "refused")}
     note = ""
     if monitor.death is not None:
-        note = f"OOM at {monitor.death:.0f} s"
-    elif act.get("relay") == "backpressure":
-        note = "Origin waits"
+        word = monitor.death_word(monitor.exit_code)
+        if word != "stopped":    # demo.sh stopped it for the next Act
+            note = f"{word} at {monitor.death:.0f} s"
 
-    return {"act": number, "at": round(monitor.seen),
-            "peak_mib": round(monitor.peak / MIB), "ceiling": ceiling,
-            "counts": {k: v for k, v in counts.items() if v},
-            "note": note}
+    # The Origin scene runs on the Act of Phase 3: one row for both.
+    return {"scene": "P3" if scene == "ORIGIN" else scene,
+            "at": round(monitor.seen),
+            "peak_mib": round(monitor.peak / MIB),
+            "done": counts.get("done", 0),
+            "open": counts.get("receiving", 0) + counts.get("queued", 0),
+            "failed": failed, "note": note}
 
 
-def render_scores(scores, live, width):
-    lines = [Text(f" {'Phase':<10}{'mode':<13}{'at':>5}{'peak':>10}"
-                  f"  {'ceiling':<14}Phones, sum 200", style="bold")]
-    rows = [(row, False) for row in scores]
+def render_scores(view):
+    is_focus = "scores" in SCENES[view["scene"]]["focus"]
+    lines = [block_title("Phases", is_focus, view["plain"])]
+    lines[0].append(f"   {'':10}{'at':>6}{'peak':>11}{'done':>8}"
+                    f"{'open':>8}   failed", style="bold")
+    # A row of the dashboard before FINAL-10k has no "failed": skip it.
+    rows = [(row, False) for row in view["scores"] if "failed" in row]
+    live = score_row(view["monitor"], view["scene"])
     if live:
         rows.append((live, True))
     for row, is_live in rows:
-        phase, mode, _ = PHASES.get(row["act"], ("?", "?", ""))
-        counts = " ".join(f"{SHORT[state]} {n}" for state, n in
-                          row["counts"].items())
-        text = Text(f" {phase:<10}{mode:<13}{row['at']:>4}s"
-                    f"{row['peak_mib']:>6} MiB  {row['ceiling']:<14}",
+        title = SCENES.get(row.get("scene"), {}).get("title", "?")
+        failed = " ".join(f"{PARTS[state][0]} {n:,}"
+                          for state, n in row["failed"].items()) or "-"
+        text = Text(f"   {title:<24}{row['at']:>4} s{row['peak_mib']:>7} MiB"
+                    f"{row['done']:>8,}{row['open']:>8,}   {failed}",
                     style="bold" if is_live else "")
-        text.append(counts)
         if row["note"]:
-            text.append(f" · {row['note']}", style="dim")
-        text.truncate(width)
+            text.append(f"   {row['note']}", style="red")
+        text.truncate(view["width"])
         lines.append(text)
 
     return lines
 
 
-def scores_save(run_dir, monitor):
+def footnote(act):
+    return (f" speeds = KR carrier QoS caps ÷ {act.get('speed_scale', 1)};"
+            " tier shares = assumption; server memory is scaled")
+
+
+def mib(value):
+    if value >= 10 * MIB:
+        return f"{value / MIB:,.0f} MiB"
+    if value >= MIB:
+        return f"{value / MIB:.1f} MiB"
+
+    return f"{value / 1024:.0f} KiB"
+
+
+def bar(parts, total, width, plain, chars=None):
+    """A bar of `width` cells: each part (count, colour) takes its share of
+    `total`. A part with a count gets at least one cell."""
+    text = Text()
+    used = 0
+    for index, (count, color) in enumerate(parts):
+        if count <= 0 or total <= 0:
+            continue
+        cells = max(1, round(count / total * width))
+        cells = min(cells, width - used)
+        char = (chars[index] if chars else "#") if plain else " "
+        text.append(char * cells, style="" if plain else f"on {color}")
+        used += cells
+    text.append("·" * (width - used), style="grey23")
+
+    return text
+
+
+# --- main -------------------------------------------------------------------
+
+def scores_save(run_dir, monitor, scene):
     """Keep the last row of an Act when the next Act starts."""
-    row = score_row(monitor, monitor.tiers or [])
+    row = score_row(monitor, scene)
     if row is None:
         return
     path = os.path.join(run_dir, "scores.json")
     scores = [old for old in (read_json(path) or [])
-              if old.get("act") != row["act"]]
+              if old.get("scene") != row["scene"]]
     scores.append(row)
     temp = path + ".tmp"
     with open(temp, "w") as file:
@@ -792,65 +734,35 @@ def scores_clear(run_dir):
         pass
 
 
-def mib(value):
-    if value >= 10 * MIB:
-        return f"{value / MIB:.0f} MiB"
-    if value >= MIB:
-        return f"{value / MIB:.1f} MiB"
-
-    return f"{value / 1024:.0f} KiB"
-
-
-def split_bar(slow_share, fast_share, width, plain, other_share=0.0):
-    """A bar in three parts: slow, fast, and bytes of no known Phone (a
-    socket that the relay stats do not list yet)."""
-    text = Text()
-    used = 0
-    for share, color, char in ((slow_share, SLOW_COLOR, "s"),
-                               (fast_share, FAST_COLOR, "f"),
-                               (other_share, "grey50", "o")):
-        count = min(width - used, round(share * width))
-        if count > 0:
-            text.append(char * count if plain else " " * count,
-                        style="" if plain else f"on {color}")
-            used += count
-    text.append("·" * (width - used), style="grey23")
-
-    return text
-
-
-def act_key(act):
-    return (act or {}).get("started")
-
-
 def main():
     args = parse_args()
     act_path = os.path.join(args.run, "act.json")
     monitor = Monitor(read_json(act_path))
+    last_scene = [None]
 
     def frame(plain, width):
         nonlocal monitor
         act = read_json(act_path)
-        if act_key(act) != act_key(monitor.act):
-            if (act or {}).get("held"):
-                # Phase 0 starts a new `present`: the table starts empty.
-                scores_clear(args.run)
-            else:
-                scores_save(args.run, monitor)
-            monitor = Monitor(act)                 # a new Act: reset
+        if (act or {}).get("started") != monitor.act.get("started"):
+            if args.once:
+                pass                     # a check frame changes no file
+            elif (act or {}).get("held"):
+                scores_clear(args.run)   # Phase 0: a new `present`
+            elif last_scene[0]:
+                scores_save(args.run, monitor, last_scene[0])
+            monitor = Monitor(act)
         exit_code = monitor.poll(args.run)
-        tiers = tiers_read(args.run, act)
-        # After rproxy dies, show the Phones as they were at that moment.
-        if monitor.death is None or monitor.tiers is None:
-            monitor.tiers = tiers
+        scene = scene_get(args.run, act, args.scene)
+        last_scene[0] = scene
         scores = [row for row in read_json(
             os.path.join(args.run, "scores.json")) or []
-            if row.get("act") != (act or {}).get("act")]
+            if row.get("scene") != scene]
 
-        bystander = read_json(os.path.join(args.run, "bystander.json"))
-
-        return render(monitor, monitor.tiers, exit_code,
-                      causes_read(args.run), scores, bystander, width, plain)
+        return render({
+            "monitor": monitor, "scene": scene, "exit_code": exit_code,
+            "causes": causes_read(args.run), "scores": scores,
+            "bystander": read_json(os.path.join(args.run, "bystander.json")),
+            "origin": origin_read(args.run), "width": width, "plain": plain})
 
     if args.once:
         end = time.time() + args.watch

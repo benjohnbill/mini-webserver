@@ -41,8 +41,10 @@ FILE_PATH="${FILE_PATH:-/update.bin}"
 MEMORY_MAX="${MEMORY_MAX:-4G}"        # memory limit of the rproxy scope (Q35)
 CONNECTIONS="${CONNECTIONS:-12000}"   # rproxy --connections
 # Act 2 limit, MiB of replies. With 2560 the base cost of the connections
-# came on top, and rproxy died at 4G anyway (2026-11-26).
-RELAY_MEMORY="${RELAY_MEMORY:-2048}"
+# came on top, and rproxy died at 4G anyway; with 2048 it died once right
+# after an Act 1 OOM, when the Origin was slow and 6500 connections waited
+# (2026-11-26).
+RELAY_MEMORY="${RELAY_MEMORY:-1536}"
 RELAY_CONNS="${RELAY_CONNS:-2000}"    # Act 3 limit
 RELAY_QUEUE="${RELAY_QUEUE:-60}"      # Act 3: seconds in the queue, then 503
 RELAY_BUFFER="${RELAY_BUFFER:-16384}" # Act 4 and 5 buffer
@@ -73,11 +75,12 @@ RPROXY_ARGS="${RPROXY_ARGS:-}"        # more rproxy flags, for a rehearsal
 PRESENT_PAUSE="${PRESENT_PAUSE:-}"    # seconds; replaces each Enter of `present`
 PRESENT_DEATH_WAIT=60                 # Phase 1: the longest wait for the kill
 PRESENT_ACT4_WAIT=10                  # Phase 3: seconds before the bystander
-PRESENT_2A_WAIT="${PRESENT_2A_WAIT:-12}"   # Phase 2-A: seconds of reply-cap
-# Phase 2-A: seconds before the bystander. Early, so that the dashboard shows
-# "/index.html 200" next to the 502s for the rest of 2-A.
-PRESENT_2A_BYSTANDER="${PRESENT_2A_BYSTANDER:-4}"
-PRESENT_2B_WAIT="${PRESENT_2B_WAIT:-30}"   # Phase 2-B: seconds of conn-cap (measured: 503s pile up after 15-30 s)
+# Phase 2-A: seconds before the bystander, after the cap is reached
+# (about 8 s at 500 Phones/s).
+PRESENT_2A_BYSTANDER="${PRESENT_2A_BYSTANDER:-10}"
+# Phase 2-B: seconds before the bystander joins the queue, after the slots
+# are full (about 4 s at 500 Phones/s).
+PRESENT_2B_BYSTANDER="${PRESENT_2B_BYSTANDER:-6}"
 
 # The Phones get the upper half of the CPUs, rproxy and the Origin the lower
 # half, so the Python clients do not take CPU time from the servers.
@@ -476,55 +479,58 @@ present_header() {
     echo "=== $* ==="
 }
 
-# The live flow of the talk. Each Phase waits for Enter.
+# The scene of the dashboard (bench/demo/dashboard.py).
+scene_set() {
+    echo "$1" >"$RUN/scene.tmp" && mv "$RUN/scene.tmp" "$RUN/scene"
+}
+
+# The live flow of the talk (FINAL-10k). Each Enter starts the next scene.
 present() {
-    local pid i
+    local pid
     rm -f "$RUN/scores.json"     # the score table starts empty
-    present_header "Phase 0  평소: Act 1 rproxy, Phone 없음"
+    present_header "Phase 0  평소: rproxy, Phone 없음"
     act_start 1 dry hold
+    scene_set P0
     present_bystander
     present_wait
 
-    present_header "Phase 1  unbounded: Phone 출발"
+    present_header "Phase 1  unbounded: $(mix_total) Phones, $PHONE_RATE_1/s"
+    scene_set P1
     touch "$RUN/go"
     pid="$(pid_read rproxy)"
-    for i in $(seq $((PRESENT_DEATH_WAIT * 10))); do
+    for _ in $(seq $((PRESENT_DEATH_WAIT * 10))); do
         pid_is_alive "$pid" || break
         sleep 0.1
     done
-    if pid_is_alive "$pid"; then
-        echo "    rproxy is alive after $PRESENT_DEATH_WAIT s"
-    else
-        sleep 0.5    # let the runner record the exit
-        # The same clock as the dashboard: from "started" of act.json.
-        echo "    rproxy: $(cat "$RUN/rproxy.exit" 2>/dev/null || echo gone)" \
-            "at $(python3 -c 'import json, os, sys
-act = json.load(open(sys.argv[1] + "/act.json"))
-exit_time = os.stat(sys.argv[1] + "/rproxy.exit").st_mtime
-print(round(exit_time - act["started"], 1))' \
-            "$RUN" 2>/dev/null || echo "?") s"
-    fi
+    sleep 0.5    # let the runner record the exit
     present_bystander
     present_wait
 
-    # Phase 2 is two wrong fixes in a row, with no Enter between them:
-    # 2-A the 4 MiB whole-reply limit we had, 2-B a connection limit.
-    present_header "Phase 2-A  reply-cap: the 4 MiB limit we had"
+    present_header "Phase 2-A  memory-cap: $RELAY_MEMORY MiB of replies"
     act_start 2 dry
+    scene_set 2A
     sleep "$PRESENT_2A_BYSTANDER"
     present_bystander
-    sleep $((PRESENT_2A_WAIT > PRESENT_2A_BYSTANDER ?
-        PRESENT_2A_WAIT - PRESENT_2A_BYSTANDER : 0))
-    present_header "Phase 2-B  conn-cap: a connection limit, set for memory"
+    present_wait
+
+    # 2-B: the bystander waits in the conn-cap queue. It runs in the
+    # background, and the dashboard counts its wait.
+    present_header "Phase 2-B  conn-cap: $RELAY_CONNS slots, a queue of $RELAY_QUEUE s"
     act_start 3 dry
-    sleep "$PRESENT_2B_WAIT"
+    scene_set 2B
+    sleep "$PRESENT_2B_BYSTANDER"
+    BYSTANDER_WAIT="$RELAY_QUEUE" present_bystander &
+    present_wait
+
+    present_header "Phase 3  backpressure: $((RELAY_BUFFER / 1024)) KiB for each connection"
+    act_start 4 dry
+    scene_set P3
+    sleep "$PRESENT_ACT4_WAIT"
     present_bystander
     present_wait
 
-    present_header "Phase 3  backpressure"
-    act_start 4 dry
-    sleep "$PRESENT_ACT4_WAIT"
-    present_bystander
+    present_header "Origin  $ORIGIN_MODEL: $ORIGIN_WORKERS Workers"
+    scene_set ORIGIN
     present_wait
 
     act_stop
