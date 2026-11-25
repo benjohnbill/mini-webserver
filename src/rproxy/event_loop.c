@@ -1205,6 +1205,7 @@ static enum step origin_exchange_start(struct connection *connection)
         status_reply_plan(connection, status, NULL);
         return reply_start(connection);
     }
+    client_send_buffer_cap(connection);
     connection->origin_index = origin_list_pick(&rproxy->list);
     connection->exchange.origin_index = (int)connection->origin_index;
     connection_set_deadline(connection, rproxy->config.origin_timeout);
@@ -1229,7 +1230,6 @@ static int exchange_slot_take(struct connection *connection)
         return 503;
     }
     connection->holds_exchange_slot = true;
-    client_send_buffer_cap(connection);
 
     return 0;
 }
@@ -1237,10 +1237,16 @@ static int exchange_slot_take(struct connection *connection)
 /* Autotuning grows the kernel send buffer of conn_fd up to tcp_wmem
    (4 MiB), and that memory is charged to rproxy. In conn-cap a 4 MiB
    buffer also let rproxy close (and free the slot) about 10 s before a
-   400 KB/s client had its last byte: 29 Phones finished, not 20. So both
-   modes cap it at --relay-buffer. */
+   400 KB/s client had its last byte: 29 Phones finished, not 20. 200 slow
+   clients took 392 MiB of socket memory without the cap (2026-11-25). So
+   the demo modes cap it at --relay-buffer, and the bytes that wait stay in
+   rproxy, where the relay stats count them. RELAY_REPLY_CAP is the default
+   mode and keeps autotuning. */
 static void client_send_buffer_cap(struct connection *connection)
 {
+    if (connection->loop->rproxy->config.relay_mode == RELAY_REPLY_CAP) {
+        return;
+    }
     int relay_buffer = connection->loop->rproxy->config.relay_buffer;
     setsockopt(connection->conn_fd, SOL_SOCKET, SO_SNDBUF, &relay_buffer,
                sizeof(relay_buffer));
@@ -1410,9 +1416,6 @@ static enum step relay_start(struct connection *connection)
     if (relay->data == NULL) {
         return origin_exchange_end(connection, 502);
     }
-    /* 200 slow clients took 392 MiB of socket memory without the cap
-       (2026-11-25). */
-    client_send_buffer_cap(connection);
     connection->state = STATE_RELAY;
 
     return STEP_NEXT;
