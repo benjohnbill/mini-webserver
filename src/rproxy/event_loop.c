@@ -46,7 +46,6 @@
 #define HELLO_PEEK_MAX (5 + 16384)
 /* Seconds that a client has for each step that waits for it. The
    deadline moves when bytes move. */
-#define CLIENT_TIMEOUT 5
 #define MS_PER_SECOND 1000
 /* Seconds that the drain after an error reply can take. */
 #define DRAIN_TIMEOUT ((double)DRAIN_WAIT_MS / MS_PER_SECOND)
@@ -217,6 +216,7 @@ static void client_address_get(int conn_fd, char *client_ip, size_t size,
 static void connection_open(struct event_loop *loop, int conn_fd);
 static void connection_set_deadline(struct connection *connection,
                                     double seconds);
+static int client_timeout_get(const struct connection *connection);
 static void connection_advance(struct connection *connection);
 static enum step connection_step(struct connection *connection);
 static enum step hello_step(struct connection *connection);
@@ -577,8 +577,15 @@ static void connection_open(struct event_loop *loop, int conn_fd)
     }
     loop->connections = connection;
     loop->connection_count++;
-    connection_set_deadline(connection, CLIENT_TIMEOUT);
+    connection_set_deadline(connection, client_timeout_get(connection));
     connection_advance(connection);
+}
+
+/* --client-timeout: how long rproxy waits for the client in each client
+   state. */
+static int client_timeout_get(const struct connection *connection)
+{
+    return connection->loop->rproxy->config.client_timeout;
 }
 
 /* The heap has room for each connection of the loop, so the add works. */
@@ -672,7 +679,7 @@ static enum client_hello_status hello_peek(struct connection *connection,
     }
     if ((size_t)count > connection->hello_len) {
         connection->hello_len = (size_t)count;
-        connection_set_deadline(connection, CLIENT_TIMEOUT);
+        connection_set_deadline(connection, client_timeout_get(connection));
     }
 
     return status;
@@ -735,7 +742,7 @@ static enum step handshake_start(struct connection *connection)
         return STEP_CLOSE;
     }
     connection->state = STATE_HANDSHAKE;
-    connection_set_deadline(connection, CLIENT_TIMEOUT);
+    connection_set_deadline(connection, client_timeout_get(connection));
 
     return STEP_NEXT;
 }
@@ -764,7 +771,7 @@ static enum step handshake_step(struct connection *connection)
         return connection_wait_tls(connection, status);
     }
     connection->state = STATE_REQUEST;
-    connection_set_deadline(connection, CLIENT_TIMEOUT);
+    connection_set_deadline(connection, client_timeout_get(connection));
 
     return STEP_NEXT;
 }
@@ -852,7 +859,7 @@ static enum tls_status buffer_read_some(struct connection *connection)
                          buffer->capacity - buffer->used, &count);
     if (status == TLS_DONE) {
         buffer->used += count;
-        connection_set_deadline(connection, CLIENT_TIMEOUT);
+        connection_set_deadline(connection, client_timeout_get(connection));
     }
 
     return status;
@@ -927,7 +934,7 @@ static const char *status_get_reason(int status)
 static enum step reply_start(struct connection *connection)
 {
     connection->state = STATE_REPLY;
-    connection_set_deadline(connection, CLIENT_TIMEOUT);
+    connection_set_deadline(connection, client_timeout_get(connection));
 
     return STEP_NEXT;
 }
@@ -1664,7 +1671,7 @@ static enum step relay_wait(struct connection *connection,
         bool waits_for_client = relay->sent < relay->used;
         connection_set_deadline(
             connection, waits_for_client
-                            ? CLIENT_TIMEOUT
+                            ? client_timeout_get(connection)
                             : connection->loop->rproxy->config.origin_timeout);
     }
     if (status != TLS_DONE) {
@@ -1756,7 +1763,7 @@ static enum step reply_step(struct connection *connection)
         if (status != TLS_DONE) {
             return connection_wait_tls(connection, status);
         }
-        connection_set_deadline(connection, CLIENT_TIMEOUT);
+        connection_set_deadline(connection, client_timeout_get(connection));
         connection->send_queue = LONG_MAX; /* a write: a new start */
         reply_advance(connection, count);
     }
@@ -2062,7 +2069,7 @@ static void connection_expire(struct connection *connection)
         return;
     case STATE_REPLY:
         if (send_queue_has_drained(connection)) {
-            connection_set_deadline(connection, CLIENT_TIMEOUT);
+            connection_set_deadline(connection, client_timeout_get(connection));
             return;
         }
         connection->exchange.cause = "client-timeout";
@@ -2084,7 +2091,7 @@ static void relay_expire(struct connection *connection)
     }
     if (connection->relay.sent < connection->relay.used &&
         send_queue_has_drained(connection)) {
-        connection_set_deadline(connection, CLIENT_TIMEOUT);
+        connection_set_deadline(connection, client_timeout_get(connection));
         return;
     }
     connection->exchange.cause = "client-timeout";
@@ -2093,7 +2100,7 @@ static void relay_expire(struct connection *connection)
 
 /* A slow client empties the kernel send queue, but EPOLLOUT comes only
    when a large part of the queue is free. At 50 KB/s that is more than
-   CLIENT_TIMEOUT. So the bytes move although rproxy writes none: a queue
+   --client-timeout. So the bytes move although rproxy writes none: a queue
    that is smaller than at the last deadline is progress. */
 static bool send_queue_has_drained(struct connection *connection)
 {

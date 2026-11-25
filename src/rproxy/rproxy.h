@@ -37,8 +37,9 @@ struct rproxy_config {
     const char *cert_file;
     const char *key_file;
     int origin_timeout;
-    int loops;       /* Event loops, one thread each */
-    int connections; /* open connections for each Event loop */
+    int client_timeout; /* seconds that rproxy waits for a client */
+    int loops;          /* Event loops, one thread each */
+    int connections;    /* open connections for each Event loop */
     double rate;
     double burst;
     enum rate_key rate_key;

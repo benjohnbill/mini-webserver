@@ -27,6 +27,7 @@
 #include "tls.h"
 
 #define DEFAULT_ORIGIN_TIMEOUT 5
+#define DEFAULT_CLIENT_TIMEOUT 5
 #define DEFAULT_BURST 10.0
 #define DEFAULT_TARPIT 10
 /* nginx worker_connections in the nginx.conf that nginx ships. */
@@ -100,7 +101,8 @@ int main(int argc, char **argv)
             stderr,
             "usage: ./rproxy --port P --cert FILE --key FILE "
             "--origin HOST:PORT [--origin HOST:PORT ...] "
-            "[--origin-timeout S] [--loops N] [--connections N] "
+            "[--origin-timeout S] [--client-timeout S] [--loops N] "
+            "[--connections N] "
             "[--rate R] [--burst B] "
             "[--rate-key ip|ja4] [--tarpit S] [--cache off|on] "
             "[--cache-admit all|size|second] [--cache-object-max BYTES] "
@@ -132,6 +134,7 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
 {
     *rproxy = (struct rproxy){
         .config = {.origin_timeout = DEFAULT_ORIGIN_TIMEOUT,
+                   .client_timeout = DEFAULT_CLIENT_TIMEOUT,
                    .loops = loops_get_default(),
                    .connections = DEFAULT_CONNECTIONS,
                    .burst = DEFAULT_BURST,
@@ -187,6 +190,9 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
     }
     if (strcmp(name, "--origin") == 0) {
         return origin_add(&rproxy->list, value);
+    }
+    if (strcmp(name, "--client-timeout") == 0) {
+        return number_parse(value, 1, TIMEOUT_MAX, &config->client_timeout);
     }
     if (strcmp(name, "--origin-timeout") == 0) {
         return number_parse(value, 1, TIMEOUT_MAX, &config->origin_timeout);
