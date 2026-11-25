@@ -27,13 +27,30 @@ curl -i localhost:8080/echo                                  # X-Server-Name: b1
 curl -x http://127.0.0.1:8080 http://127.0.0.1:8001/          # Forward Proxy
 ```
 
-옵션: `-p` 포트, `-r` 정적 루트, `-c` CGI 디렉터리, `-t` 워커 스레드 수, `-q` 대기 큐 크기, `-F` Forward Proxy 허용, `-T` 프록시 타임아웃(ms), `-k` keep-alive 타임아웃(ms), `-n` 서버 이름(`X-Server-Name`), `-R` 라우팅 규칙(반복 가능), `-h` 도움말.
+옵션: `-p` 포트, `-r` 정적 루트, `-c` CGI 디렉터리, `-t` 워커 스레드 수, `-q` 대기 큐 크기, `-F` Forward Proxy 허용, `-T` 프록시 타임아웃(ms), `-k` keep-alive 타임아웃(ms), `-n` 서버 이름(`X-Server-Name`), `-R` 라우팅 규칙(반복 가능, `접두사[@ketama]=host:port[*가중치],...`; `@ketama`가 없으면 Round-Robin, `*N`은 가중치 1..4), `-h` 도움말.
 
 ## 구조
 
 - 동시성: accept 스레드 하나와 pthread 스레드 풀, 크기가 정해진 연결 큐. 큐가 가득 차면 503을 응답합니다.
 - 요청 처리 순서: 절대 URI는 Forward Proxy, 라우팅 규칙과 맞는 경로는 Reverse Proxy, `/cgi-bin/`은 CGI, `/echo`는 내장 동적 응답, 그 밖은 정적 파일입니다.
+- 로드 밸런싱: 경로마다 Round-Robin 또는 Ketama 일관 해싱(키는 클라이언트 IP)을 고릅니다. 가중치는 두 방식 모두에 적용됩니다.
+- 헬스 체크: 연결 실패만 다음 백엔드로 재시도합니다(이미 요청을 보낸 뒤의 오류는 재시도하지 않음). 연속 3번 실패하면 DOWN, 1초마다 능동 검사해 연속 2번 성공하면 다시 UP이 됩니다.
+- `GET /_lb/status`: 백엔드별 상태 표(text/plain). localhost에서 온 요청만 응답하고, 그 밖은 404입니다.
 - 종료: `SIGINT`/`SIGTERM`을 받으면 accept를 멈추고 워커를 join합니다. `SIGPIPE`는 무시합니다.
+
+## LB 데모
+
+`scripts/lb.sh`가 프론트 `:8080`(`/echo@ketama`)과 백엔드 b1..b3(`:8001..:8003`)을 띄웁니다. pid 파일과 로그는 `.lb/`에 둡니다.
+
+```sh
+bash scripts/lb.sh up        # 전부 시작
+bash scripts/lb.sh keys      # 출발지 IP 20개(127.0.0.2..)가 어느 백엔드로 가는지
+bash scripts/lb.sh stop b2   # b2를 끄면
+bash scripts/lb.sh keys      # b2의 키만 옮겨짐: "b2 → b3  (moved)", moved 약 1/3
+bash scripts/lb.sh status    # b2 DOWN
+bash scripts/lb.sh start b2  # 몇 초 뒤 status에서 UP, keys를 다시 돌리면 b2로 돌아옴
+bash scripts/lb.sh down      # 전부 종료
+```
 
 ## Map (파일 지도)
 
@@ -42,10 +59,11 @@ curl -x http://127.0.0.1:8080 http://127.0.0.1:8001/          # Forward Proxy
 - `src/http.c`: 요청 파싱(요청 라인, 헤더, Content-Length 본문, keep-alive, 파이프라이닝)과 응답 생성
 - `src/server.c`, `src/main.c`: 소켓, 스레드 풀, 요청 분배, 정적 파일, 시그널 처리
 - `src/cgi.c`: CGI/1.1 실행 (fork/execve, 타임아웃, 프로세스 그룹 정리)
-- `src/route.c`: 최장 접두사 라우팅과 원자적 Round-Robin
+- `src/route.c`: 최장 접두사 라우팅, Round-Robin과 Ketama 선택, 백엔드 health 상태
 - `src/proxy.c`: Reverse/Forward Proxy, hop-by-hop 헤더 제거, X-Forwarded-For, 502/504
+- `src/health.c`: 백엔드 능동 헬스 체크 스레드
 - `src/config.c`, `src/mime.c`: CLI 인자 처리, MIME 타입 매핑
-- `tests/`: 단위 테스트, `scripts/functional_test.sh`: 기능·엣지 케이스·부하 테스트
+- `tests/`: 단위 테스트, `scripts/functional_test.sh`: 기능·엣지 케이스·부하 테스트, `scripts/lb.sh`: LB 데모 CLI
 - `www/`, `cgi-bin/`: 데모 정적 파일과 CGI 스크립트
 - `tools/Dockerfile`, `scripts/dev.sh`: 빌드·테스트용 컨테이너
 

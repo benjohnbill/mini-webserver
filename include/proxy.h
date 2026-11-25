@@ -32,6 +32,12 @@ long proxy_build_request(const http_request *req, const char *target,
 int proxy_reverse(int client_fd, const http_request *req, const backend *b,
                   int timeout_ms, const char *client_ip);
 
+/* Same as proxy_reverse but on an already connected upstream fd, which
+ * it always closes. Lets the caller retry other backends on connect
+ * failure without ever resending a request. */
+int proxy_reverse_fd(int client_fd, int upstream, const http_request *req,
+                     const backend *b, const char *client_ip);
+
 /* Forward proxy: req->uri is absolute ("http://..."). Same return
  * convention as proxy_reverse; 400 for an unparsable URI. */
 int proxy_forward(int client_fd, const http_request *req, int timeout_ms,

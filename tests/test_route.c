@@ -1,6 +1,39 @@
 #include "route.h"
 #include "test.h"
 
+#include <limits.h>
+#include <stdint.h>
+
+#define KEYS 10000
+
+/* Same hash as route.c, for the naive hash % N comparison. */
+static uint32_t hashstr(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (; *s; ++s)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+static const char *key_of(int i)
+{
+    static char key[32];
+    snprintf(key, sizeof key, "10.%d.%d.%d", i >> 16, (i >> 8) & 255, i & 255);
+    return key;
+}
+
+static size_t pick1(route *r, const char *key)
+{
+    backend *b = NULL;
+    CHECK(route_pick(r, key, &b, 1) == 1);
+    return b ? (size_t)(b - r->backends) : 0;
+}
+
 static void test_parse(void)
 {
     route_table table;
@@ -16,13 +49,21 @@ static void test_parse(void)
     CHECK_STR(entry->backends[1].host, "::1");
     CHECK_STR(entry->backends[1].port, "8001");
     CHECK_STR(entry->backends[2].port, "65535");
+    CHECK(entry->ketama == 0);
+    CHECK(entry->backends[0].weight == 1);
+    CHECK(entry->ring_len == 0);
+    CHECK(backend_is_up(&entry->backends[0]));
+    CHECK(entry->backends[0].changed_ms > 0);
+    printf("sizeof(route_table) = %zu bytes\n", sizeof table);
 
     const char *invalid[] = {
         "/api", "/api=host", "/api=host:0", "/api=host:70000",
         "api=host:80", "/api=", "/api=:80", "/api=host:",
         "/api=host:+80", "/api=host:80,", "/api=host:80,,other:81",
         "/api=[::1:8001", "/api=host:00000080",
-        "/api=a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,i:9"
+        "/api=a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,i:9",
+        "/api=host:80*0", "/api=host:80*5", "/api=host:80*", "/api=host:80*2x",
+        "/api=host:80*12", "/api=host*2:80", "/api=[::1]:80*", "/api@ketama=host:80*9"
     };
     unsigned char snapshot[sizeof table];
     memcpy(snapshot, &table, sizeof table);
@@ -42,7 +83,20 @@ static void test_parse(void)
     CHECK(route_table_add(&table, long_spec) == -1);
     CHECK(memcmp(&table, snapshot, sizeof table) == 0);
 
-    for (size_t i = 1; i < ROUTE_MAX_ROUTES; ++i)
+    CHECK(route_table_add(&table, "/k@ketama=a:1*2,[::1]:80*4,c:3") == 0);
+    entry = &table.routes[1];
+    CHECK_STR(entry->prefix, "/k");
+    CHECK(entry->ketama == 1);
+    CHECK(entry->backends[0].weight == 2);
+    CHECK_STR(entry->backends[1].host, "::1");
+    CHECK_STR(entry->backends[1].port, "80");
+    CHECK(entry->backends[1].weight == 4);
+    CHECK(entry->backends[2].weight == 1);
+    CHECK(entry->ring_len == ROUTE_RING_POINTS * 7);
+    for (size_t j = 1; j < entry->ring_len; ++j)
+        CHECK(entry->ring_hash[j - 1] <= entry->ring_hash[j]);
+
+    for (size_t i = 2; i < ROUTE_MAX_ROUTES; ++i)
         CHECK(route_table_add(&table, "/=a:1") == 0);
     CHECK(route_table_add(&table, "/full=a:1") == -1);
     CHECK(table.count == ROUTE_MAX_ROUTES);
@@ -74,9 +128,137 @@ static void test_round_robin(void)
     route_table table;
     route_table_init(&table);
     CHECK(route_table_add(&table, "/=a:1,b:2,c:3") == 0);
+    CHECK(route_table_add(&table, "/w=a:1*2,b:2,c:3") == 0);
     route *entry = &table.routes[0];
-    for (size_t i = 0; i < 7; ++i)
-        CHECK(route_next_backend(entry) == &entry->backends[i % 3]);
+    for (int i = 0; i < 7; ++i)
+        CHECK(pick1(entry, NULL) == (size_t)(i % 3));
+
+    /* Weighted 2:1:1 interleaves as a,b,c,a. */
+    entry = &table.routes[1];
+    size_t counts[3] = {0};
+    for (int i = 0; i < 400; ++i)
+        ++counts[pick1(entry, NULL)];
+    CHECK(counts[0] == 200 && counts[1] == 100 && counts[2] == 100);
+
+    /* Cursor wrap at UINT_MAX must not repeat a slot and skip a backend. */
+    entry = &table.routes[0];
+    entry->next = UINT_MAX - 1;
+    for (int i = 0; i < 4; ++i) {
+        backend *out[3];
+        CHECK(route_pick(entry, NULL, out, 3) == 3);
+        CHECK(out[0] != out[1] && out[1] != out[2] && out[0] != out[2]);
+    }
+}
+
+static void test_ketama_spread(void)
+{
+    route_table table;
+    route_table_init(&table);
+    CHECK(route_table_add(&table, "/@ketama=10.0.0.1:80,10.0.0.2:80,10.0.0.3:80") == 0);
+    CHECK(route_table_add(&table, "/w@ketama=10.0.0.1:80*2,10.0.0.2:80,10.0.0.3:80") == 0);
+    route *r = &table.routes[0];
+
+    static size_t before[KEYS];
+    size_t counts[3] = {0};
+    for (int i = 0; i < KEYS; ++i)
+        ++counts[before[i] = pick1(r, key_of(i))];
+    for (size_t b = 0; b < 3; ++b) {
+        printf("ketama equal: backend %zu %.1f%% of keys (ring share %.1f%%)\n", b,
+               100.0 * counts[b] / KEYS, 100.0 * route_share(r, b));
+        CHECK(counts[b] > KEYS * 28 / 100 && counts[b] < KEYS * 38 / 100);
+    }
+    CHECK(pick1(r, NULL) == pick1(r, ""));
+
+    for (int i = 0; i < 3; ++i)
+        backend_report(&r->backends[1], 0);
+    CHECK(!backend_is_up(&r->backends[1]));
+    int moved = 0, naive_moved = 0;
+    for (int i = 0; i < KEYS; ++i) {
+        size_t now = pick1(r, key_of(i));
+        if (before[i] == 1)
+            CHECK(now != 1);
+        else
+            CHECK(now == before[i]);
+        moved += now != before[i];
+        uint32_t h = hashstr(key_of(i));
+        naive_moved += h % 3 != h % 2;
+    }
+    printf("backend 1 down: ketama moved %.1f%% of keys, naive hash %% N moved %.1f%%\n",
+           100.0 * moved / KEYS, 100.0 * naive_moved / KEYS);
+
+    r = &table.routes[1];
+    size_t heavy = 0;
+    for (int i = 0; i < KEYS; ++i)
+        heavy += pick1(r, key_of(i)) == 0;
+    printf("ketama 2:1:1: backend 0 %.1f%% of keys\n", 100.0 * heavy / KEYS);
+    CHECK(heavy > KEYS * 45 / 100 && heavy < KEYS * 55 / 100);
+}
+
+static void test_pick(void)
+{
+    route_table table;
+    route_table_init(&table);
+    CHECK(route_table_add(&table, "/@ketama=a:1,b:2,c:3") == 0);
+    CHECK(route_table_add(&table, "/rr=a:1*3,b:2,c:3*2") == 0);
+    for (size_t t = 0; t < 2; ++t) {
+        route *r = &table.routes[t];
+        backend *out[4];
+        CHECK(route_pick(r, "k", out, 0) == 0);
+        CHECK(route_pick(r, "k", out, 2) == 2);
+        CHECK(out[0] != out[1]);
+        CHECK(route_pick(r, "k", out, 4) == 3);
+        CHECK(out[0] != out[1] && out[1] != out[2] && out[0] != out[2]);
+
+        for (int i = 0; i < 3; ++i)
+            backend_report(&r->backends[0], 0);
+        CHECK(route_pick(r, "k", out, 4) == 2);
+        CHECK(out[0] != &r->backends[0] && out[1] != &r->backends[0]);
+        for (size_t b = 1; b < 3; ++b)
+            for (int i = 0; i < 3; ++i)
+                backend_report(&r->backends[b], 0);
+        CHECK(route_pick(r, "k", out, 4) == 0);
+    }
+}
+
+static void test_health(void)
+{
+    backend b = {0};
+    backend_report(&b, 0);
+    backend_report(&b, 0);
+    CHECK(backend_is_up(&b));
+    backend_report(&b, 1);             /* resets the fail streak */
+    backend_report(&b, 0);
+    backend_report(&b, 0);
+    CHECK(backend_is_up(&b));
+    backend_report(&b, 0);
+    CHECK(!backend_is_up(&b));
+    CHECK(b.changed_ms > 0);
+    int64_t down_at = b.changed_ms;
+    backend_report(&b, 0);             /* already DOWN: no second transition */
+    CHECK(b.changed_ms == down_at);
+    backend_report(&b, 1);
+    CHECK(!backend_is_up(&b));
+    backend_report(&b, 0);             /* resets the ok streak */
+    backend_report(&b, 1);
+    CHECK(!backend_is_up(&b));
+    backend_report(&b, 1);
+    CHECK(backend_is_up(&b));
+    CHECK(b.req_ok == 0 && b.req_err == 0);
+}
+
+static void test_share(void)
+{
+    route_table table;
+    route_table_init(&table);
+    CHECK(route_table_add(&table, "/@ketama=a:1*2,b:2,c:3*3") == 0);
+    CHECK(route_table_add(&table, "/rr=a:1*2,b:2,c:3*3") == 0);
+    for (size_t t = 0; t < 2; ++t) {
+        double sum = 0;
+        for (size_t b = 0; b < 3; ++b)
+            sum += route_share(&table.routes[t], b);
+        CHECK(sum > 0.999999 && sum < 1.000001);
+    }
+    CHECK(route_share(&table.routes[1], 2) == 0.5);
 }
 
 int main(void)
@@ -84,5 +266,9 @@ int main(void)
     test_parse();
     test_match();
     test_round_robin();
+    test_ketama_spread();
+    test_pick();
+    test_health();
+    test_share();
     TEST_MAIN_END();
 }

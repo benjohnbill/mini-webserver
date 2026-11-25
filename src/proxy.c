@@ -87,7 +87,14 @@ int tcp_connect_timeout(const char *host, const char *port, int timeout_ms)
 
     int connected = -1, timed_out = 0;
     for (const struct addrinfo *a = addresses; a; a = a->ai_next) {
+        /* CLOEXEC: a concurrent CGI fork must not inherit this socket. */
+#ifdef SOCK_CLOEXEC
+        int fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+#else
         int fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (fd >= 0)
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
         if (fd < 0)
             continue;
         if (connect_address(fd, a, timeout_ms) == 0) {
@@ -337,25 +344,21 @@ static int relay_response(int client_fd, int upstream)
     }
 }
 
-static int proxy_to_backend(int client_fd, const http_request *req, const backend *b,
-                            const char *target, int include_port, int timeout_ms,
-                            const char *client_ip)
+/* Send req on an already connected upstream fd, relay the response, close
+ * the fd. */
+static int send_and_relay(int client_fd, int upstream, const http_request *req,
+                          const backend *b, const char *target, int include_port,
+                          const char *client_ip)
 {
     char host_header[sizeof b->host + sizeof b->port + 3];
     int ipv6 = strchr(b->host, ':') != NULL;
     int host_len = snprintf(host_header, sizeof host_header, "%s%s%s%s%s",
                             ipv6 ? "[" : "", b->host, ipv6 ? "]" : "",
                             include_port ? ":" : "", include_port ? b->port : "");
-    if (host_len < 0 || (size_t)host_len >= sizeof host_header)
-        return 502;
-
-    int upstream = tcp_connect_timeout(b->host, b->port, timeout_ms);
-    if (upstream < 0)
-        return errno == ETIMEDOUT ? 504 : 502;
-
-    size_t capacity = HTTP_MAX_HEAD_BYTES * 2 + HTTP_MAX_BODY;
-    char *request = malloc(capacity);
     int status = 502;
+    size_t capacity = HTTP_MAX_HEAD_BYTES * 2 + HTTP_MAX_BODY;
+    char *request = host_len < 0 || (size_t)host_len >= sizeof host_header
+                        ? NULL : malloc(capacity);
     if (request) {
         long length = proxy_build_request(req, target, host_header, client_ip, request, capacity);
         if (length >= 0) {
@@ -367,6 +370,22 @@ static int proxy_to_backend(int client_fd, const http_request *req, const backen
         status = relay_response(client_fd, upstream);
     close(upstream);
     return status;
+}
+
+static int proxy_to_backend(int client_fd, const http_request *req, const backend *b,
+                            const char *target, int include_port, int timeout_ms,
+                            const char *client_ip)
+{
+    int upstream = tcp_connect_timeout(b->host, b->port, timeout_ms);
+    if (upstream < 0)
+        return errno == ETIMEDOUT ? 504 : 502;
+    return send_and_relay(client_fd, upstream, req, b, target, include_port, client_ip);
+}
+
+int proxy_reverse_fd(int client_fd, int upstream, const http_request *req,
+                     const backend *b, const char *client_ip)
+{
+    return send_and_relay(client_fd, upstream, req, b, req->uri, 1, client_ip);
 }
 
 int proxy_reverse(int client_fd, const http_request *req, const backend *b,

@@ -6,6 +6,7 @@
 #   :8001  backend "b1"  ┐ round-robin targets for /echo
 #   :8002  backend "b2"  ┘
 #   :8003  black hole (accepts, never answers) for the timeout case
+#   :8081  second front, /echo@ketama over b1/b2 (sticky keys, health checks)
 set -u
 cd "$(dirname "$0")/.."
 make -s all || exit 1
@@ -31,7 +32,8 @@ while True: conns.append(s.accept()[0])' & HOLE=$!
     -R '/echo=127.0.0.1:8001,127.0.0.1:8002' \
     -R '/down=127.0.0.1:8009' \
     -R '/slow=127.0.0.1:8003' 2>"$LOG/front.log" & FRONT=$!
-trap 'kill $B1 $B2 $HOLE $FRONT 2>/dev/null' EXIT
+./webserver -p 8081 -R '/echo@ketama=127.0.0.1:8001,127.0.0.1:8002' 2>"$LOG/front2.log" & FRONT2=$!
+trap 'kill $B1 $B2 $HOLE $FRONT $FRONT2 2>/dev/null' EXIT
 sleep 0.5
 
 echo "== static files"
@@ -73,6 +75,25 @@ curl -s -D - -o /dev/null -x http://127.0.0.1:8080 http://127.0.0.1:8002/ | grep
     && ok "forward proxy reached b2" || bad "forward proxy reached b2"
 expect "unreachable origin -> 502" 502 "$(code -x http://127.0.0.1:8080 http://127.0.0.1:8009/)"
 
+echo "== ketama / lb status"
+server_from() { # source-ip port -> X-Server-Name
+    curl -s -m 2 -D - -o /dev/null --interface "$1" "http://127.0.0.1:$2/echo" | \
+        tr -d '\r' | awk -F': ' 'tolower($1)=="x-server-name"{print $2}'
+}
+for ip in 127.0.0.5 127.0.0.6 127.0.0.7; do
+    S=$(for _ in 1 2 3 4 5; do server_from $ip 8081; done | sort -u | tr '\n' ' ')
+    case $S in "b1 "|"b2 ") ok "sticky $ip -> $S" ;; *) bad "sticky $ip (got '$S')" ;; esac
+done
+expect "/_lb/status from loopback -> 200" 200 "$(code localhost:8081/_lb/status)"
+curl -s localhost:8081/_lb/status | grep -q ketama \
+    && ok "/_lb/status mentions ketama" || bad "/_lb/status mentions ketama"
+SELF=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [ -n "$SELF" ]; then
+    expect "/_lb/status from non-loopback -> 404" 404 "$(code "http://$SELF:8081/_lb/status")"
+else
+    echo "  skip /_lb/status non-loopback (no non-loopback address)"
+fi
+
 echo "== protocol edge cases"
 expect "garbage -> 400"          "HTTP/1.1 400 Bad Request" "$(raw 'garbage\r\n\r\n')"
 expect "bad version -> 505"      "HTTP/1.1 505 HTTP Version Not Supported" "$(raw 'GET / HTTP/2.0\r\nHost: x\r\n\r\n')"
@@ -95,10 +116,24 @@ FAILED=$(awk '/^Failed requests/{print $3}' "$LOG/ab.txt")
 expect "ab 2000 req / c=50, 0 failed" 0 "${FAILED:-missing}"
 grep -E 'Requests per second' "$LOG/ab.txt" | sed 's/^/       /'
 
+echo "== failover (b1 killed)"
+kill $B1; wait $B1 2>/dev/null
+CODES=$(for i in 11 12 13 14 15 16; do code -m 3 --interface 127.0.0.$i localhost:8081/echo; echo; done | sort -u | tr '\n' ' ')
+expect "ketama skips dead b1"    "200 " "$CODES"
+expect "round-robin skips dead b1" "200 200 200 200 " \
+    "$(for _ in 1 2 3 4; do code -m 3 localhost:8080/echo; echo; done | tr '\n' ' ')"
+for _ in $(seq 25); do
+    curl -s localhost:8081/_lb/status | grep '127.0.0.1:8001' | grep -q DOWN && break
+    sleep 0.2
+done
+curl -s localhost:8081/_lb/status | grep '127.0.0.1:8001' | grep -q DOWN \
+    && ok "status shows 127.0.0.1:8001 DOWN" || bad "status shows 127.0.0.1:8001 DOWN"
+
 echo "== graceful shutdown"
-kill -TERM $FRONT
-for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 $FRONT 2>/dev/null || break; sleep 0.3; done
+kill -TERM $FRONT $FRONT2
+for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 $FRONT 2>/dev/null || kill -0 $FRONT2 2>/dev/null || break; sleep 0.3; done
 kill -0 $FRONT 2>/dev/null && bad "SIGTERM exits" || ok "SIGTERM exits"
+kill -0 $FRONT2 2>/dev/null && bad "SIGTERM exits (front2)" || ok "SIGTERM exits (front2)"
 
 echo
 echo "passed $PASS, failed $FAIL"

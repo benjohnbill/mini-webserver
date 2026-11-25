@@ -30,6 +30,7 @@
 #endif
 
 #include "cgi.h"
+#include "health.h"
 #include "http.h"
 #include "proxy.h"
 #include "route.h"
@@ -37,6 +38,7 @@
 #define SEND_TIMEOUT_MS 10000         /* a stuck reader must not pin a worker */
 
 static volatile sig_atomic_t g_stop = 0;
+static int g_busy;                    /* workers inside handle_connection, __atomic */
 
 static void on_signal(int sig)
 {
@@ -115,6 +117,14 @@ static int queue_has_waiting(client_queue *q)
     return waiting;
 }
 
+static size_t queue_count(client_queue *q)
+{
+    pthread_mutex_lock(&q->mu);
+    size_t n = q->count;
+    pthread_mutex_unlock(&q->mu);
+    return n;
+}
+
 static void queue_close(client_queue *q)
 {
     pthread_mutex_lock(&q->mu);
@@ -144,6 +154,7 @@ typedef struct {
     const char *ip;
     http_request *req;
     int keep_alive;                   /* cleared when the conn must close */
+    client_queue *queue;              /* for /_lb/status */
 } ctx;
 
 static int is_head(const ctx *x) { return strcmp(x->req->method, "HEAD") == 0; }
@@ -387,6 +398,47 @@ int path_has_dot_segment(const char *path)
     return 0;
 }
 
+/* Loopback peers only: the table exposes backend topology. */
+static int serve_lb_status(ctx *x)
+{
+    if (strncmp(x->ip, "127.", 4) != 0 && strcmp(x->ip, "::1") != 0)
+        return reply_error(x, 404, NULL);
+    size_t cap = 65536;               /* 16 routes x 8 backends fit easily */
+    char *out = malloc(cap);
+    int n = out ? lb_status_render(out, cap, x->cfg,
+                                   __atomic_load_n(&g_busy, __ATOMIC_RELAXED),
+                                   queue_count(x->queue))
+                : -1;
+    if (n < 0) {
+        free(out);
+        return reply_error(x, 500, NULL);
+    }
+    reply(x, 200, "text/plain; charset=utf-8", out, (size_t)n, NULL);
+    free(out);
+    return 200;
+}
+
+/* Try backends in route_pick order. Only a failed connect moves on to the
+ * next one: once the request was sent it is never retried. */
+static int proxy_route(ctx *x, route *r)
+{
+    backend *c[ROUTE_MAX_BACKENDS];
+    size_t n = route_pick(r, x->ip, c, ROUTE_MAX_BACKENDS);
+    for (size_t i = 0; i < n; i++) {
+        backend *b = c[i];
+        int up = tcp_connect_timeout(b->host, b->port, x->cfg->proxy_timeout_ms);
+        backend_report(b, up >= 0);
+        if (up < 0) {
+            __atomic_fetch_add(&b->req_err, 1, __ATOMIC_RELAXED);
+            continue;
+        }
+        int st = proxy_reverse_fd(x->fd, up, x->req, b, x->ip);
+        __atomic_fetch_add(st == 0 ? &b->req_ok : &b->req_err, 1, __ATOMIC_RELAXED);
+        return st;
+    }
+    return 502;
+}
+
 /* Returns the status for the access log (0 = relayed by a proxy). */
 static int dispatch(ctx *x)
 {
@@ -405,6 +457,10 @@ static int dispatch(ctx *x)
         return reply_error(x, 400, NULL);
     }
 
+    if (req->uri[0] == '/' && strcmp(req->path, "/_lb/status") == 0 &&
+        (strcmp(req->method, "GET") == 0 || is_head(x)))
+        return serve_lb_status(x);
+
     /* 1. absolute-form target -> forward proxy. Proxied connections are
      *    closed afterwards: the relay streams until the origin closes. */
     if (strncasecmp(req->uri, "http://", 7) == 0) {
@@ -421,9 +477,7 @@ static int dispatch(ctx *x)
     route *r = route_match(&cfg->routes, req->path);
     if (r != NULL) {
         x->keep_alive = 0;
-        const backend *b = route_next_backend(r);
-        int st = b ? proxy_reverse(x->fd, req, b, cfg->proxy_timeout_ms, x->ip)
-                   : 502;
+        int st = proxy_route(x, r);
         if (st != 0)
             return reply_error(x, st, NULL);
         return 0;
@@ -497,7 +551,7 @@ static void handle_connection(server_config *cfg, client_queue *q,
          * If other clients are queued, answer with "Connection: close" so
          * this worker frees up instead of starving them. */
         ctx x = { cfg, cl->fd, cl->ip, req,
-                  req->keep_alive && !g_stop && !queue_has_waiting(q) };
+                  req->keep_alive && !g_stop && !queue_has_waiting(q), q };
         int status = dispatch(&x);
         log_access(cl->ip, req, status);
         http_request_free(req);
@@ -518,7 +572,9 @@ static void *worker_main(void *arg)
     worker_arg *wa = arg;
     client cl;
     while (queue_pop(wa->queue, &cl) == 0) {
+        __atomic_fetch_add(&g_busy, 1, __ATOMIC_RELAXED);
         handle_connection(wa->cfg, wa->queue, &cl);
+        __atomic_fetch_sub(&g_busy, 1, __ATOMIC_RELAXED);
         close(cl.fd);
     }
     return NULL;
@@ -666,6 +722,9 @@ int server_run(server_config *cfg)
     for (; threads != NULL && started < cfg->threads; started++)
         if (pthread_create(&threads[started], NULL, worker_main, &wa) != 0)
             break;
+    /* Created while signals are blocked, like the workers. */
+    if (started > 0 && health_start(cfg) != 0)
+        fprintf(stderr, "could not start health checker\n");
     pthread_sigmask(SIG_SETMASK, &old, NULL);
 
     if (started == 0) {
@@ -684,6 +743,7 @@ int server_run(server_config *cfg)
      * (each finishes its current request; idle keep-alive connections end
      * within keepalive_timeout_ms). */
     close(lfd);
+    health_stop();
     queue_close(&queue);
     for (int i = 0; i < started; i++)
         pthread_join(threads[i], NULL);
