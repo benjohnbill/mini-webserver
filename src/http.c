@@ -1,6 +1,6 @@
 #include "http.h"
 
-#include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,33 +30,21 @@ static bool parse_size(const char *text, size_t *size)
     return true;
 }
 
-static int read_head_bytes(Stream *stream, HttpHead *head)
+/* Leave any bytes after the header for the body or next interim response. */
+static int take_head(HttpHead *head, const unsigned char **data, size_t *size)
 {
-    size_t used = 0;
-    if (stream->start == stream->end) {
-        stream->start = 0;
-        stream->end = 0;
-    }
-    while (used < HTTP_HEADER_LIMIT) {
-        if (stream->start == stream->end) {
-            ssize_t bytes = stream_read(stream, stream->buffer, sizeof stream->buffer);
-            if (bytes < 0)
-                return errno == ETIMEDOUT ? 408 : 400;
-            if (bytes == 0)
-                return used == 0 ? -1 : 400;
-            stream->start = 0;
-            stream->end = (size_t)bytes;
-        }
-        unsigned char byte = stream->buffer[stream->start++];
-        if (byte == '\0')
+    while (*size > 0 && head->used < HTTP_HEADER_LIMIT) {
+        unsigned char c = *(*data)++;
+        (*size)--;
+        if (c == 0)
             return 400;
-        head->raw[used++] = (char)byte;
-        if (used >= 4 && memcmp(head->raw + used - 4, "\r\n\r\n", 4) == 0) {
-            head->raw[used] = '\0';
+        head->raw[head->used++] = (char)c;
+        if (head->used >= 4 && memcmp(head->raw + head->used - 4, "\r\n\r\n", 4) == 0) {
+            head->raw[head->used] = 0;
             return 0;
         }
     }
-    return 431;
+    return head->used == HTTP_HEADER_LIMIT ? 431 : HTTP_MORE;
 }
 
 static bool valid_value(const char *value)
@@ -68,13 +56,8 @@ static bool valid_value(const char *value)
     return true;
 }
 
-static int read_head(Stream *stream, HttpHead *head)
+static int parse_head(HttpHead *head)
 {
-    memset(head, 0, sizeof *head);
-    int result = read_head_bytes(stream, head);
-    if (result != 0)
-        return result;
-
     head->first_line = head->raw;
     char *end = strstr(head->raw, "\r\n");
     *end = '\0';
@@ -116,26 +99,14 @@ static int read_head(Stream *stream, HttpHead *head)
     return head->has_length && head->has_transfer_encoding ? 400 : 0;
 }
 
-ssize_t http_read_body(Stream *stream, void *buffer, size_t size)
-{
-    size_t queued = stream->end - stream->start;
-    if (queued == 0)
-        return stream_read(stream, buffer, size);
-    if (size > queued)
-        size = queued;
-    memcpy(buffer, stream->buffer + stream->start, size);
-    stream->start += size;
-    return (ssize_t)size;
-}
-
 static bool supported_version(const char *version)
 {
     return strcmp(version, "HTTP/1.1") == 0 || strcmp(version, "HTTP/1.0") == 0;
 }
 
-int http_read_request(Stream *stream, Request *request)
+static int parse_request(Request *request)
 {
-    int result = read_head(stream, &request->head);
+    int result = parse_head(&request->head);
     if (result != 0)
         return result;
 
@@ -192,28 +163,42 @@ int http_read_request(Stream *stream, Request *request)
     request->path = strndup(request->target, path_length);
     if (request->path == NULL)
         return 500;
+    return 0;
+}
 
-    if (request->head.length > 0) {
+int http_feed_request_head(Request *request, const unsigned char **data, size_t *size)
+{
+    int status = take_head(&request->head, data, size);
+    return status == 0 ? parse_request(request) : status;
+}
+
+int http_feed_request(Request *request, const unsigned char *data, size_t size)
+{
+    if (request->head.first_line == NULL) {
+        int status = http_feed_request_head(request, &data, &size);
+        if (status != 0)
+            return status;
+    }
+    if (request->head.length > 0 && request->body == NULL) {
         request->body = malloc(request->head.length);
         if (request->body == NULL)
             return 500;
     }
-    size_t received = 0;
-    while (received < request->head.length) {
-        ssize_t bytes = http_read_body(stream, request->body + received,
-                                       request->head.length - received);
-        if (bytes <= 0)
-            return bytes < 0 && errno == ETIMEDOUT ? 408 : 400;
-        received += (size_t)bytes;
-    }
-    return 0;
+    size_t remaining = request->head.length - request->received;
+    size_t take = size < remaining ? size : remaining;
+    if (take > 0)
+        memcpy(request->body + request->received, data, take);
+    request->received += take;
+    return request->received == request->head.length ? 0 : HTTP_MORE;
 }
 
-int http_read_response(Stream *stream, UpstreamResponse *response)
+int http_feed_response(UpstreamResponse *response, const unsigned char **data, size_t *size)
 {
-    int result = read_head(stream, &response->head);
-    if (result != 0)
-        return result == 408 ? 504 : 502;
+    int status_code = take_head(&response->head, data, size);
+    if (status_code == HTTP_MORE)
+        return HTTP_MORE;
+    if (status_code != 0 || parse_head(&response->head) != 0)
+        return 502;
 
     char *version = response->head.first_line;
     char *status = strchr(version, ' ');
@@ -257,13 +242,16 @@ bool http_forward_header(const HttpHead *head, const char *name)
     return true;
 }
 
-int http_send_line(Stream *stream, const char *name, const char *value)
+int http_append(HttpOutput *out, const char *format, ...)
 {
-    if (stream_send(stream, name, strlen(name)) == -1 ||
-        stream_send(stream, ": ", 2) == -1 ||
-        stream_send(stream, value, strlen(value)) == -1 ||
-        stream_send(stream, "\r\n", 2) == -1)
+    size_t space = sizeof out->data - out->length;
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(out->data + out->length, space, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= space)
         return -1;
+    out->length += (size_t)written;
     return 0;
 }
 
@@ -279,6 +267,7 @@ static const char *reason_phrase(int status)
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
     case 417: return "Expectation Failed";
+    case 429: return "Too Many Requests";
     case 431: return "Request Header Fields Too Large";
     case 501: return "Not Implemented";
     case 502: return "Bad Gateway";
@@ -288,29 +277,22 @@ static const char *reason_phrase(int status)
     }
 }
 
-int http_send_head(Stream *stream, int status, const char *type, size_t length,
+int http_make_head(HttpOutput *out, int status, const char *type, size_t length,
                    const char *allow)
 {
-    char header[512];
-    int bytes = snprintf(header, sizeof header,
-                         "HTTP/1.1 %d %s\r\n"
-                         "Content-Type: %s\r\n"
-                         "Content-Length: %zu\r\n"
-                         "Connection: close\r\n"
-                         "%s%s%s\r\n",
-                         status, reason_phrase(status), type, length,
-                         allow ? "Allow: " : "", allow ? allow : "", allow ? "\r\n" : "");
-    if (bytes < 0 || (size_t)bytes >= sizeof header)
-        return -1;
-    return stream_send(stream, header, (size_t)bytes);
+    out->length = 0;
+    return http_append(out, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
+                       "Content-Length: %zu\r\nConnection: close\r\n%s%s%s%s\r\n",
+                       status, reason_phrase(status), type, length,
+                       allow ? "Allow: " : "", allow ? allow : "", allow ? "\r\n" : "",
+                       status == 429 ? "Retry-After: 1\r\n" : "");
 }
 
-int http_send_error(Stream *stream, int status, const char *allow)
+int http_make_error(HttpOutput *out, int status, const char *allow)
 {
-    char body[128];
-    int bytes = snprintf(body, sizeof body, "%d %s\n", status, reason_phrase(status));
-    if (bytes < 0 || (size_t)bytes >= sizeof body ||
-        http_send_head(stream, status, "text/plain; charset=utf-8", (size_t)bytes, allow) == -1)
+    const char *reason = reason_phrase(status);
+    size_t length = 3 + 1 + strlen(reason) + 1;
+    if (http_make_head(out, status, "text/plain; charset=utf-8", length, allow) < 0)
         return -1;
-    return stream_send(stream, body, (size_t)bytes);
+    return http_append(out, "%d %s\n", status, reason);
 }

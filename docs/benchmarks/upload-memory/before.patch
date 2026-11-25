@@ -1,0 +1,49 @@
+--- a/src/connection.c
++++ b/src/connection.c
+@@ -147,7 +147,7 @@
+     /* A recv of the header may already include part (or all) of the body. */
+     c->buffered = size < c->request.head.length ? size : c->request.head.length;
+     memmove(c->chunk, body, c->buffered);
+-    c->request.received = c->buffered;
++    /* The complete proxied body is already owned by request.body. */
+     c->paused_budget_ms = IO_TIMEOUT_MS;
+     switch_upload_clock(c);
+     c->backend = net_start_connect(backend->ip, backend->port);
+@@ -225,17 +225,16 @@
+             }
+             return;
+         }
++    }
++    int status = http_feed_request(req, data, size);
++    if (status == 0) {
+         const Route *route = match_route(c->config, req->path);
+-        if (route && strcmp(req->path, "/echo") != 0 &&
+-            (strcmp(req->method, "GET") == 0 || strcmp(req->method, "POST") == 0)) {
+-            begin_proxy(c, route, data, size);
+-            return;
+-        }
+-    }
+-    int status = http_feed_request(req, data, size);
+-    if (status == 0)
+-        dispatch_local(c);
+-    else if (status != HTTP_MORE) {
++        if (route && strcmp(req->path, "/echo") &&
++            (!strcmp(req->method, "GET") || !strcmp(req->method, "POST")))
++            begin_proxy(c, route, c->chunk, 0);
++        else
++            dispatch_local(c);
++    } else if (status != HTTP_MORE) {
+         c->drain_after_error = true;
+         error_response(c, status, NULL);
+     }
+@@ -365,7 +364,9 @@
+     if (c->unsent > 0)
+         return;
+     if (c->phase == SEND_BACKEND_HEAD || c->phase == SEND_BACKEND_BODY) {
+-        if (c->buffered > 0) {
++        if (c->phase == SEND_BACKEND_HEAD && c->request.body && c->request.received) {
++            queue_write(c, SEND_BACKEND_BODY, c->request.body, c->request.received);
++        } else if (c->buffered > 0) {
+             queue_write(c, SEND_BACKEND_BODY, c->chunk, c->buffered);
+             c->buffered = 0;
+         } else if (c->request.received < c->request.head.length) {

@@ -34,6 +34,10 @@ bool parse_route(const char *value, Route *route)
         return false;
 
     size_t prefix_length = (size_t)(equals - value);
+    const char tag[] = "@ketama";
+    if (prefix_length > sizeof tag - 1 &&
+        memcmp(equals - (sizeof tag - 1), tag, sizeof tag - 1) == 0)
+        prefix_length -= sizeof tag - 1;
     if (prefix_length > HTTP_TARGET_LIMIT)
         return false;
     for (const unsigned char *p = (const unsigned char *)value;
@@ -44,17 +48,39 @@ bool parse_route(const char *value, Route *route)
     while (prefix_length > 1 && value[prefix_length - 1] == '/')
         prefix_length--;
 
-    const char *ip = equals + 1;
-    const char *colon = strchr(ip, ':');
-    if (colon == NULL || colon == ip || (size_t)(colon - ip) >= sizeof route->ip)
+    const char *item = equals + 1;
+    route->count = 0;
+    route->ring = NULL;
+    for (;;) {
+        const char *end = item + strcspn(item, ",");
+        const char *colon = memchr(item, ':', (size_t)(end - item));
+        if (!colon || colon == item || (size_t)(colon - item) >= INET_ADDRSTRLEN ||
+            route->count == BACKEND_LIMIT)
+            return false;
+        Backend *backend = &route->backends[route->count];
+        size_t length = (size_t)(colon - item);
+        memcpy(backend->ip, item, length);
+        backend->ip[length] = 0;
+        char port[16];
+        size_t digits = (size_t)(end - colon - 1);
+        if (digits >= sizeof port)
+            return false;
+        memcpy(port, colon + 1, digits);
+        port[digits] = 0;
+        struct in_addr ip;
+        if (inet_pton(AF_INET, backend->ip, &ip) != 1 || !parse_port(port, &backend->port))
+            return false;
+        for (size_t i = 0; i < route->count; i++)
+            if (route->backends[i].port == backend->port &&
+                strcmp(route->backends[i].ip, backend->ip) == 0)
+                return false;
+        route->count++;
+        if (!*end)
+            break;
+        item = end + 1;
+    }
+    if (route->count > 1 && !ketama_build(route))
         return false;
-    size_t ip_length = (size_t)(colon - ip);
-    memcpy(route->ip, ip, ip_length);
-    route->ip[ip_length] = '\0';
-    struct in_addr address;
-    if (inet_pton(AF_INET, route->ip, &address) != 1 || !parse_port(colon + 1, &route->port))
-        return false;
-
     memcpy(route->prefix, value, prefix_length);
     route->prefix[prefix_length] = '\0';
     return true;
@@ -203,190 +229,61 @@ static int open_static_file(int root_fd, char *path, const char **name, int *sta
     }
 }
 
-static void handle_static(Stream *client, int root_fd, const Request *request)
+int open_static(int root_fd, const char *request_path, int *result_fd,
+                size_t *length, const char **type)
 {
     char path[HTTP_TARGET_LIMIT + 1];
-    if (!decode_path(request->path, path)) {
-        http_send_error(client, 400, NULL);
-        return;
-    }
-
+    if (!decode_path(request_path, path))
+        return 400;
     const char *name;
-    int error_status;
-    int fd = open_static_file(root_fd, path, &name, &error_status);
-    if (fd == -1) {
-        http_send_error(client, error_status, NULL);
-        return;
-    }
-
+    int status = 500;
+    int fd = open_static_file(root_fd, path, &name, &status);
+    if (fd < 0)
+        return status;
     struct stat info;
-    if (fstat(fd, &info) == -1 || info.st_size < 0 || (uintmax_t)info.st_size > SIZE_MAX) {
-        http_send_error(client, 500, NULL);
-    } else if (!S_ISREG(info.st_mode)) {
-        http_send_error(client, 403, NULL);
-    } else {
-        size_t remaining = (size_t)info.st_size;
-        int sent = http_send_head(client, 200, mime_type_for(name), remaining, NULL);
-        unsigned char buffer[8192];
-        while (sent == 0 && remaining > 0) {
-            size_t size = remaining < sizeof buffer ? remaining : sizeof buffer;
-            ssize_t bytes = read(fd, buffer, size);
-            if (bytes < 0 && errno == EINTR)
-                continue;
-            if (bytes <= 0)
-                break;
-            sent = stream_send(client, buffer, (size_t)bytes);
-            remaining -= (size_t)bytes;
-        }
+    if (fstat(fd, &info) == -1 || info.st_size < 0 || (uintmax_t)info.st_size > SIZE_MAX)
+        status = 500;
+    else if (!S_ISREG(info.st_mode))
+        status = 403;
+    else {
+        *result_fd = fd;
+        *length = (size_t)info.st_size;
+        *type = mime_type_for(name);
+        return 0;
     }
     close(fd);
+    return status;
 }
 
-static void handle_echo(Stream *client, const Request *request)
+int build_proxy_request(HttpOutput *out, const Backend *backend, const Request *request)
 {
-    if (http_send_head(client, 200, "application/octet-stream", request->head.length, NULL) == 0)
-        stream_send(client, request->body, request->head.length);
-}
-
-static int send_backend_request(Stream *backend, const Route *route, const Request *request)
-{
-    char first_line[HTTP_TARGET_LIMIT + 128];
-    int bytes = snprintf(first_line, sizeof first_line, "%s %s HTTP/1.1\r\nHost: %s:%u\r\n",
-                         request->method, request->target, route->ip, (unsigned)route->port);
-    if (bytes < 0 || (size_t)bytes >= sizeof first_line ||
-        stream_send(backend, first_line, (size_t)bytes) == -1)
+    out->length = 0;
+    if (http_append(out, "%s %s HTTP/1.1\r\nHost: %s:%u\r\n", request->method,
+                    request->target, backend->ip, (unsigned)backend->port) < 0)
         return -1;
-
     for (size_t i = 0; i < request->head.count; i++) {
-        Header header = request->head.headers[i];
-        if (strcasecmp(header.name, "Host") != 0 &&
-            http_forward_header(&request->head, header.name) &&
-            http_send_line(backend, header.name, header.value) == -1)
+        Header h = request->head.headers[i];
+        if (strcasecmp(h.name, "Host") != 0 && http_forward_header(&request->head, h.name) &&
+            http_append(out, "%s: %s\r\n", h.name, h.value) < 0)
             return -1;
     }
-
-    char ending[160];
-    bytes = snprintf(ending, sizeof ending, "Via: %s mini-webserver\r\n"
-                     "Connection: close\r\nContent-Length: %zu\r\n\r\n",
-                     request->version + 5, request->head.length);
-    if (bytes < 0 || (size_t)bytes >= sizeof ending ||
-        stream_send(backend, ending, (size_t)bytes) == -1)
-        return -1;
-    return stream_send(backend, request->body, request->head.length);
+    return http_append(out, "Via: %s mini-webserver\r\nConnection: close\r\n"
+                       "Content-Length: %zu\r\n\r\n", request->version + 5, request->head.length);
 }
 
-static int send_backend_head(Stream *client, const UpstreamResponse *response)
+int build_proxy_response(HttpOutput *out, const UpstreamResponse *response)
 {
-    char status[16];
-    int bytes = snprintf(status, sizeof status, "HTTP/1.1 %d ", response->status);
-    if (bytes < 0 || (size_t)bytes >= sizeof status ||
-        stream_send(client, status, (size_t)bytes) == -1 ||
-        stream_send(client, response->reason, strlen(response->reason)) == -1 ||
-        stream_send(client, "\r\n", 2) == -1)
+    out->length = 0;
+    if (http_append(out, "HTTP/1.1 %d %s\r\n", response->status, response->reason) < 0)
         return -1;
-
     for (size_t i = 0; i < response->head.count; i++) {
-        Header header = response->head.headers[i];
-        if (http_forward_header(&response->head, header.name) &&
-            http_send_line(client, header.name, header.value) == -1)
+        Header h = response->head.headers[i];
+        if (http_forward_header(&response->head, h.name) &&
+            http_append(out, "%s: %s\r\n", h.name, h.value) < 0)
             return -1;
     }
-
-    if (response->head.has_length && response->status != 204) {
-        char length[32];
-        bytes = snprintf(length, sizeof length, "%zu", response->head.length);
-        if (bytes < 0 || (size_t)bytes >= sizeof length ||
-            http_send_line(client, "Content-Length", length) == -1)
-            return -1;
-    }
-    return stream_send(client, "Connection: close\r\n\r\n",
-                       sizeof "Connection: close\r\n\r\n" - 1);
-}
-
-static void relay_body(Stream *client, Stream *backend, const UpstreamResponse *response)
-{
-    unsigned char buffer[8192];
-    size_t remaining = response->head.length;
-    while (!response->head.has_length || remaining > 0) {
-        size_t size = sizeof buffer;
-        if (response->head.has_length && remaining < size)
-            size = remaining;
-        ssize_t bytes = http_read_body(backend, buffer, size);
-        if (bytes <= 0 || stream_send(client, buffer, (size_t)bytes) == -1)
-            return;
-        if (response->head.has_length)
-            remaining -= (size_t)bytes;
-    }
-}
-
-static void handle_proxy(Stream *client, const Route *route, const Request *request)
-{
-    int64_t deadline = net_deadline();
-    int fd = net_connect(route->ip, route->port, deadline);
-    int error = 0;
-    if (fd == -1) {
-        error = errno == ETIMEDOUT ? 504 : 502;
-    } else {
-        Stream backend;
-        stream_init(&backend, fd, deadline);
-        UpstreamResponse response;
-        if (send_backend_request(&backend, route, request) == -1) {
-            error = errno == ETIMEDOUT ? 504 : 502;
-        } else {
-            do {
-                error = http_read_response(&backend, &response);
-                if (error == 0 && response.status == 101)
-                    error = 502;
-            } while (error == 0 && response.status < 200);
-
-            if (error == 0 && response.head.has_transfer_encoding)
-                error = 502;
-            if (error == 0) {
-                client->deadline = net_deadline();
-                if (send_backend_head(client, &response) == 0 &&
-                    response.status != 204 && response.status != 304)
-                    relay_body(client, &backend, &response);
-            }
-        }
-        close(fd);
-    }
-
-    if (error != 0) {
-        client->deadline = net_deadline();
-        http_send_error(client, error, NULL);
-    }
-}
-
-void handle_client(int fd, const ServerConfig *config)
-{
-    Stream client;
-    stream_init(&client, fd, net_deadline());
-    Request request = {0};
-    int status = http_read_request(&client, &request);
-    client.deadline = net_deadline();
-
-    if (status > 0) {
-        if (http_send_error(&client, status, NULL) == 0)
-            net_finish_error(fd);
-    } else if (status == 0) {
-        bool get = strcmp(request.method, "GET") == 0;
-        bool post = strcmp(request.method, "POST") == 0;
-        const Route *route = match_route(config, request.path);
-        bool echo = strcmp(request.path, "/echo") == 0;
-        if (echo && post)
-            handle_echo(&client, &request);
-        else if (echo)
-            http_send_error(&client, 405, "POST");
-        else if (route != NULL && (get || post))
-            handle_proxy(&client, route, &request);
-        else if (route != NULL)
-            http_send_error(&client, 405, "GET, POST");
-        else if (get)
-            handle_static(&client, config->root_fd, &request);
-        else
-            http_send_error(&client, 405, "GET");
-    }
-
-    free(request.body);
-    free(request.path);
+    if (response->head.has_length && response->status != 204 &&
+        http_append(out, "Content-Length: %zu\r\n", response->head.length) < 0)
+        return -1;
+    return http_append(out, "Connection: close\r\n\r\n");
 }
