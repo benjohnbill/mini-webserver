@@ -75,8 +75,8 @@ Use clang-format 21.1.8 and clang-tidy 21.1.6. Different versions format the sam
    | A conn-cap slot of one connection | `holds_exchange_slot`, `origin_exchanges` | `token`, `ticket`, `queue` |
    | The peer port of a connection socket | `client_port` | `port`, `peer_port`, `src_port` |
    | The directory of the relay stats files (`--relay-stats`) | `relay_stats_dir` | `stats_path`, `out_dir` |
-| The client send queue at the last reply deadline (SIOCOUTQ) | `send_queue` | `outq`, `queued`, `pending` |
-| The reply bytes that all loops hold (`memory-cap`) | `reply_bytes_held` | `memory_used`, `held`, `total` |
+   | The client send queue at the last reply deadline (SIOCOUTQ) | `send_queue` | `outq`, `queued`, `pending` |
+   | The reply bytes that all loops hold (`memory-cap`) | `reply_bytes_held` | `memory_used`, `held`, `total` |
 
 5. **Do not put `typedef` on a struct. Give a name to each number constant** (`HEADER_MAX`).
 
