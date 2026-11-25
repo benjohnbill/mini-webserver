@@ -227,7 +227,7 @@ def ring_concentration(removed, remaining_points):
 
 
 def mod_exact(weights: list[int], remove: int | None = None, add: bool = False) -> dict:
-    result = dict(moved=None, redistribution=None, p_concentrated=None, top_share=None)
+    result = dict(moved=None, extra=None, redistribution=None, p_concentrated=None, top_share=None)
     if remove is None and not add:
         return result
     before = weighted_slots(weights)
@@ -238,14 +238,17 @@ def mod_exact(weights: list[int], remove: int | None = None, add: bool = False) 
         after_weights.append(1)
     after = weighted_slots(after_weights)
     period = math.lcm(len(before), len(after))
-    moved, arrivals = 0, Counter()
+    target = remove if remove is not None else len(weights)
+    moved, extra, arrivals = 0, 0, Counter()
     # Treat residues as uniform over the period, ignoring the incomplete uint32 cycle.
     for x in range(period):
         old, new = before[x % len(before)], after[x % len(after)]
-        moved += old != new
+        if old != new:
+            moved += 1
+            extra += (old if remove is not None else new) != target
         if old == remove:
             arrivals[new] += 1
-    result["moved"] = moved / period
+    result.update(moved=moved / period, extra=extra / period)
     if remove is not None:
         count = sum(arrivals.values())
         top = max(arrivals.values()) / count
@@ -334,11 +337,13 @@ def theory(method: str, weights: list[int], keys: int,
     else:
         share95 = [binomial_interval(keys, p) for p in share]
     result = dict(share=share, share95=share95, arc95=arc95, moved=None, moved95=None,
+                  extra=None, extra95=None,
                   redistribution=None, p_concentrated=None, top_share=None, approx=set())
     if method == "mod":
         result.update(mod_exact(weights, remove, add))
         if result["moved"] is not None:
             result["moved95"] = binomial_interval(keys, result["moved"])
+            result["extra95"] = binomial_interval(keys, result["extra"])
     elif remove is not None:
         remaining = total - weights[remove]
         ratios = [None if i == remove else w / remaining for i, w in enumerate(weights)]
@@ -364,6 +369,8 @@ def theory(method: str, weights: list[int], keys: int,
         moved95 = (beta_binomial_interval(keys, points, points * total) if points
                    else binomial_interval(keys, moved))
         result.update(moved=moved, moved95=moved95)
+    if method != "mod" and result["moved"] is not None:
+        result.update(extra=0.0, extra95=(0.0, 0.0))
     return result
 
 
@@ -463,9 +470,10 @@ def compare(method, before, after, nkeys, remove, seed):
     weights = [b.weight for b in before]
     removed_index = next((i for i, b in enumerate(before) if b.name == remove), None)
     adding = after is not None and removed_index is None
+    target = after[-1].name if adding else remove
     model = theory(method, weights, nkeys, remove=removed_index, add=adding)
     counts, counts_after, arrivals = Counter(), Counter(), Counter()
-    moved = 0
+    moved = extra = 0
     arcs, arcs_after = {}, {}
     if method != "rr":
         pick, arcs = distribution(method, before, seed)
@@ -484,7 +492,9 @@ def compare(method, before, after, nkeys, remove, seed):
                 else:
                     new_name = pick_after(key)
                 counts_after[new_name] += 1
-                moved += old_name != new_name
+                if old_name != new_name:
+                    moved += 1
+                    extra += (new_name if adding else old_name) != target
                 if old_name == remove:
                     arrivals[new_name] += 1
     else:
@@ -503,6 +513,9 @@ def compare(method, before, after, nkeys, remove, seed):
             fraction = moved / nkeys
             print(f"  moved {moved}/{nkeys} ({fraction:.1%})  E {model['moved']:.1%} "
                   f"{interval_text(model['moved95'], fraction)}")
+            fraction = extra / nkeys
+            print(f"  extra moved {extra}/{nkeys} ({fraction:.1%})  E {model['extra']:.1%} "
+                  f"{interval_text(model['extra95'], fraction)}")
         if remove:
             redistribution = model["redistribution"]
             if method == "rr":
@@ -529,7 +542,7 @@ def compare(method, before, after, nkeys, remove, seed):
 
 def print_summary(models, weights, remove):
     print("summary (theory)")
-    print("  method  max share dev(95%)  moved E  P(concentrated)  note")
+    print("  method  max share dev(95%)  moved 95%     extra moved  P(concentrated)  note")
     for method, model in models:
         deviation = max(max(p - lo, hi - p)
                         for p, (lo, hi) in zip(model["share"], model["share95"]))
@@ -543,7 +556,12 @@ def print_summary(models, weights, remove):
             note = f"per-request draw: no key affinity; same key changes 1 - sum(p²) = {change:.1%}"
         elif method == "ring1" and remove is not None and weights[remove] == 1:
             note = "one arc → always one server"
-        print(f"  {method:<6}  {deviation:>17.1%}  {theory_value(model, 'moved'):>7}  "
+        moved_range = "n/a"
+        if model["moved95"] is not None:
+            lo, hi = model["moved95"]
+            moved_range = f"{100 * lo:.1f}-{hi:.1%}"
+        print(f"  {method:<6}  {deviation:>18.1%}  {moved_range:<12}  "
+              f"{theory_value(model, 'extra'):>11}  "
               f"{theory_value(model, 'p_concentrated'):>15}  {note}".rstrip())
 
 
@@ -575,6 +593,15 @@ def self_test():
     assert parse_address("[::1]:08001") == ("::1", 8001)
     assert list(client_keys(255))[-1] == "10.0.0.254"
     assert mod_exact([1, 1, 1], remove=1)["moved"] == 2 / 3
+    assert mod_exact([1, 1, 1], remove=1)["extra"] == 1 / 3
+    assert mod_exact([1, 1, 1], add=True)["extra"] == 1 / 2
+    assert mod_exact([1, 1, 1])["extra"] is None
+    for method in (*POINTS, "hrw", "random"):
+        for change in ({"remove": 1}, {"add": True}):
+            model = theory(method, [1, 1, 1], 7, **change)
+            assert model["extra"] == 0.0 and model["extra95"] == (0.0, 0.0)
+    rr = theory("rr", [1, 1, 1], 7, remove=1)
+    assert rr["extra"] is None and rr["extra95"] is None
     assert theory("ring1", [1, 1, 1], 254, remove=1)["p_concentrated"] == 1
     assert theory("rr", [1, 3], 254, remove=1)["share95"] == [(0.25, 0.25), (0.75, 0.75)]
     assert abs(beta_quantile(2, 2, 0.5) - 0.5) < 1e-12

@@ -154,6 +154,49 @@ mini-web client stop
 - 실측이 범위 밖이면 `!`, 근사식이면 `≈`가 붙습니다.
 - 맨 아래 `summary (theory)` 표는 방식마다 한 줄로 이론 기준 차이를 요약합니다.
 
+`summary (theory)`의 열은 다음과 같습니다. "변경 대상 서버" t는 `--remove`이면 빠진 서버, `--add`이면 새 서버입니다.
+- `max share dev(95%)`: 변경 **전** 구성에서 멤버 i마다 키 몫의 95% 범위 [lo_i, hi_i]를 구하고, max_i max(p_i − lo_i, hi_i − p_i)를 냅니다(p_i = w_i/W, 단위는 전체 키 대비 %p).
+  - [lo_i, hi_i]는 ring 계열이 BetaBinomial(K, P·w_i, P·(W−w_i))/K, `hrw`/`random`/`mod`가 Binomial(K, w_i/W)/K입니다(P = 가중치 한 단위당 점 수: ring1 1, ring10 10, ketama 160. 예: ketama에서 가중치 3인 서버는 점 480개이고 P·w_i = 160·3). `rr`은 몫이 정확히 w_i/W라 이 열의 편차가 0입니다.
+- `moved 95%`: 옮겨지는 키 비율의 95% 범위로, 방식별 블록의 `moved ... E x% [a-b]`와 같은 값입니다.
+  - 서버 이름(배치)과 키 집합의 운에 따라 95% 확률로 들어가는 구간입니다. 실제 서비스에서는 배치가 한 번 정해지면 고정되므로 "구성할 때 운이 이 정도로 좋거나 나쁠 수 있다"는 뜻입니다.
+  - ring 계열은 BetaBinomial(K, m_t, M−m_t)/K(추가는 BetaBinomial(K, P, P·W)/K), `hrw`/`random`은 Binomial(K, p_t)/K입니다.
+  - `mod`는 Binomial(K, moved)/K입니다. 서버 순서로 결정되어 배치 운이 없으므로 키 표본 오차만 반영합니다. `rr`은 `n/a`(키 고정 없음)입니다.
+- `extra moved`: 변경 대상 서버와 무관한데도 서버가 바뀐 키의 비율입니다(기대값).
+  - 제거: 변경 전 서버 ≠ 변경 후 서버이고, 변경 전 서버가 t가 아닌 키.
+  - 추가: 변경 전 서버 ≠ 변경 후 서버이고, 변경 후 서버가 t가 아닌 키.
+  - 그래서 moved = (t에 걸린 이동) + extra moved입니다.
+  - `mod`는 0..lcm(S, S′)−1의 나머지를 전부 세어 위 조건에 맞는 비율을 직접 구합니다(정확).
+  - `ring1`/`ring10`/`ketama`/`hrw`/`random`은 정확히 0입니다. t와 무관한 키는 선택 결과(다음 점, 최고 점수, 고정된 추첨)가 바뀌지 않기 때문입니다.
+  - 방식별 블록에도 실측 한 줄이 나옵니다(`extra moved n/K (x%)  E y% [lo-hi]`). `rr`은 정의되지 않아 표에 `n/a`, 블록에는 줄이 없습니다.
+- `--remove`/`--add`가 없으면 `moved 95%`와 `extra moved`는 `n/a`입니다.
+
+예: `mini-web sim --backends 5 --weights 1,3,1,1,2 --remove b3`의 summary(키 254개)
+```
+summary (theory)
+  method  max share dev(95%)  moved 95%     extra moved  P(concentrated)  note
+  mod                   6.0%  67.7-78.7%          60.7%             0.0%  exact (enumerated)
+  rr                    0.0%  n/a                   n/a             0.0%  no key affinity
+  random                6.0%  8.7-16.5%            0.0%             0.0%  per-request draw: no key affinity; same key changes 1 - sum(p²) = 75.0%
+  ring1                34.2%  0.0-41.3%            0.0%           100.0%  one arc → always one server
+  ring10               12.5%  5.5-21.7%            0.0%             6.2%
+  ketama                6.6%  8.3-17.3%            0.0%             0.0%
+  hrw                   6.0%  8.7-16.5%            0.0%             0.0%
+```
+- 표의 값은 모두 이론값입니다. 일관 해싱 계열에서 실제로 옮겨지는 키는 b3의 키뿐이고, 그 비율의 기대값은 b3의 몫 12.5%입니다. 그래도 95% 범위는 ring1 0~41%에서 ketama 8~17%까지 차이가 큽니다(이 실행에서 ring1의 b3는 표본 키를 하나도 갖지 않아 실측 이동이 0%였습니다).
+- mod는 기대값으로 73.2%를 옮기고, 그중 기대값 60.7%p가 b3와 무관한 키입니다.
+- 실측은 방식별 블록에 나옵니다. mod는 `moved 182/254 (71.7%)  E 73.2% [67.7-78.7]` 다음 줄에 `extra moved 140/254 (55.1%)  E 60.7% [54.7-66.5]`입니다(실측 71.7%·55.1%, 기대값 73.2%·60.7%).
+
+같은 구성에 `--add`(b6, 가중치 1)를 주면 추가 서버의 몫 1/9 기준이 됩니다. 쏠림은 제거에서만 정의되므로 `n/a`입니다.
+```
+  method  max share dev(95%)  moved 95%     extra moved  P(concentrated)  note
+  mod                   6.0%  72.4-82.7%          66.7%              n/a  exact (enumerated)
+  ring1                34.2%  0.0-37.4%            0.0%              n/a
+  ring10               12.5%  4.7-19.7%            0.0%              n/a
+  ketama                6.6%  7.1-15.4%            0.0%              n/a
+  hrw                   6.0%  7.5-15.0%            0.0%              n/a
+```
+(`rr`/`random` 행은 생략했습니다.)
+
 기호: 가중치 w_i, W = Σw, 제거하는 서버 r, p_i = w_i/W, 남은 서버의 재분배 비율 q_j = w_j/(W − w_r).
 
 | 방식 | 몫 | 제거 시 이동(moved) | 재분배·쏠림 |
@@ -174,12 +217,14 @@ mini-web client stop
 
 처음에는 ring 쏠림도 "arc를 같은 크기의 독립 배정"으로 근사했습니다. 그런데 몬테카를로에서 ring1, w=3 제거의 P(쏠림)이 근사 0.088 대 실제 0.46으로 크게 틀려, 위의 정확식으로 바꿨습니다.
 
-이 식들은 `tests/lbsim_mc.py`가 lbsim의 식을 쓰지 않는 독립 몬테카를로로 검증합니다(고정 시드, 단독 약 20초, `functional_test.sh` 안에서는 서버와 함께 돌아 약 27초). 확인하는 항목은 다음과 같습니다.
+이 식들은 `tests/lbsim_mc.py`가 lbsim의 식을 쓰지 않는 독립 몬테카를로로 검증합니다(고정 시드, 단독 약 13~20초: 한가한 기계에서 약 13초, 다른 작업과 함께 돌 때 약 20초). 확인하는 항목은 다음과 같습니다.
 - 무작위 ring 배치 수천 개의 arc 몫 평균, sd, 멤버별 arc 95%·keys 95% 적중률.
 - 해시로 만든 ring의 arc 몫, 그리고 키 254개 keys 몫의 sd.
 - 작은 K(7, 20)에서 keys·moved 95% 범위가 따로 계산한 정확한 Binomial/BetaBinomial 분위수와 완전히 같은지.
 - 제거된 arc가 실제로 어디로 가는지에서 나오는 재분배, 쏠림 확률, top.
 - 해시 키 20만 개로 본 mod, hrw, random의 이동과 재분배.
+- `extra moved`: mod는 자체 전수 계산과 해시 키 20만 개, 일관 해싱 계열은 해시로 만든 ring과 hrw에서 제거·추가 때 실측이 항상 0인지.
+- `moved 95%`: 방식마다 배치와 키를 매번 새로 뽑았을 때 실측 moved가 범위 안에 드는 비율(0.93..0.995, 제거와 추가).
 
 |옵션|값 / 기본값|설명|함께 쓸 수 있는 옵션|
 |---|---|---|---|

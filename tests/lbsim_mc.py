@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monte Carlo check of tools/lbsim.py's theory (contract-3 section 5).
+"""Monte Carlo check of tools/lbsim.py's theory (contract-3 section 5, contract-4 section 6).
 
 Every expected value here comes from simulating the method itself (random ring placements, hashed rings,
 hashed keys, random draws); lbsim's formulas are only the thing being checked. Fixed seeds, standard
@@ -477,6 +477,203 @@ def keyed_add_checks(rng, nkeys=60_000):
           moved / nkeys, 3 * math.sqrt(p * (1 - p) / nkeys))
 
 
+# --- contract 4: extra moved and moved 95% ---------------------------------------------------------
+
+def mod_extra_fraction(weights, remove=None):
+    """Own enumeration over one period: keys whose server changes although they were not on the removed
+    server (remove) or did not go to the new server (add)."""
+    before = [i for i, w in enumerate(weights) for _ in range(w)]
+    after = ([i for i, w in enumerate(weights) if i != remove for _ in range(w)] if remove is not None
+             else before + [len(weights)])
+    t = remove if remove is not None else len(weights)
+    period = math.lcm(len(before), len(after))
+    extra = 0
+    for x in range(period):
+        old, new = before[x % len(before)], after[x % len(after)]
+        extra += old != new and (old != t if remove is not None else new != t)
+    return Fraction(extra, period)
+
+
+def mod_extra95_checks():
+    """mod extra95 at small K: Binomial(K, own enumerated extra) range by exact Fractions, compared exactly."""
+    for keys in (7, 20):
+        for weights in ((1, 3, 1), (1, 1, 1), (3, 1, 1), (1, 3, 1, 1, 2), (1, 2)):
+            for remove in (*range(len(weights)), None):
+                p = mod_extra_fraction(weights, remove)
+                want = binomial_range(keys, p)
+                th = lbsim.theory("mod", list(weights), keys, remove=remove, add=remove is None)
+                what = f"K={keys} mod {','.join(map(str, weights))} " + (
+                    f"remove b{remove + 1}" if remove is not None else "add")
+                check(f"{what}: extra95 = Binomial range of own extra {p} {want}", 1,
+                      int(th["extra95"] is not None and tuple(th["extra95"]) == want), 0, True)
+
+
+def mod_extra_checks(key_hashes):
+    """theory("mod")["extra"] and mod_exact()["extra"] against the own enumeration, then against hashed keys."""
+    cases = [((1, 1, 1), r) for r in range(3)] + [((1, 3, 1, 1, 2), r) for r in range(5)]
+    cases += [((1, 2), 1), ((2, 1, 1), 0), ((3, 1, 1), 1), ((1, 1, 4, 1, 1), 0)]
+    cases += [(w, None) for w in ((1, 1, 1), (1, 3, 1, 1, 2), (2, 1, 1), (1, 2))]
+    for weights, remove in cases:
+        what = f"mod {','.join(map(str, weights))} " + (f"remove b{remove + 1}" if remove is not None else "add")
+        want = float(mod_extra_fraction(weights, remove))
+        th = lbsim.theory("mod", list(weights), 254, remove=remove, add=remove is None)
+        check(f"{what}: extra = own enumeration", want, th["extra"], 1e-12)
+        check(f"{what}: mod_exact extra = own enumeration", want,
+              lbsim.mod_exact(list(weights), remove=remove, add=remove is None)["extra"], 1e-12)
+    check("mod 1,1,1 remove b2: extra = hand count 1/3", 1 / 3, float(mod_extra_fraction((1, 1, 1), 1)), 1e-12)
+    check("mod 1,1,1 add: extra = hand count 1/2", 1 / 2, float(mod_extra_fraction((1, 1, 1))), 1e-12)
+    for weights, remove in (((1, 3, 1, 1, 2), 2), ((1, 3, 1, 1, 2), None), ((3, 1, 1), 1)):
+        slots = [i for i, w in enumerate(weights) for _ in range(w)]
+        after = ([i for i, w in enumerate(weights) if i != remove for _ in range(w)] if remove is not None
+                 else slots + [len(weights)])
+        t = remove if remove is not None else len(weights)
+        extra = 0
+        for h in key_hashes:
+            old, new = slots[h % len(slots)], after[h % len(after)]
+            extra += old != new and (old != t if remove is not None else new != t)
+        p = lbsim.theory("mod", list(weights), 254, remove=remove, add=remove is None)["extra"]
+        what = f"mod {','.join(map(str, weights))} " + (f"remove b{remove + 1}" if remove is not None else "add")
+        check(f"{what}: extra ({len(key_hashes) // 1000}k hashed keys)", p, extra / len(key_hashes),
+              3 * math.sqrt(max(p * (1 - p), 1e-12) / len(key_hashes)))
+
+
+def consistent_extra_checks(rng, reps=12, nkeys=254):
+    """Consistent hashing: a key not on the changed server keeps its server, so the measured extra moved
+    is 0 in every trial. Real hashed rings / hrw with host names and keys that change per trial."""
+    n = len(WEIGHTS)
+    for method in ("ring1", "ring10", "ketama", "hrw", "random"):
+        for change in ("remove", "add"):
+            for r in ([1, 2] if change == "remove" else [None]):
+                th = lbsim.theory(method, list(WEIGHTS), nkeys, remove=r, add=r is None)
+                what = f"{method} {change}" + (f" b{r + 1}" if r is not None else "")
+                check(f"{what}: theory extra = 0", 0.0, th["extra"], 0, True)
+                check(f"{what}: theory extra95 = (0, 0)", 1, int(tuple(th["extra95"]) == (0.0, 0.0)), 0, True)
+        worst = 0
+        for trial in range(reps):
+            hosts = [f"10.{trial}.{rng.randrange(256)}.{i}:80" for i in range(n + 1)]
+            weights = list(WEIGHTS) + [1]
+            keys = [f"x{rng.getrandbits(40)}" for _ in range(nkeys)]
+            for r in (trial % n, None):            # remove one member, then add a weight-1 member
+                old_idx = list(range(n))
+                new_idx = [i for i in range(n) if i != r] if r is not None else list(range(n + 1))
+                if method in ("ring1", "ring10", "ketama"):
+                    ppw = {"ring1": 1, "ring10": 10, "ketama": 160}[method]
+                    ring_old = lbsim.build_ring([hosts[i] for i in old_idx], [weights[i] for i in old_idx], ppw)
+                    ring_new = lbsim.build_ring([hosts[i] for i in new_idx], [weights[i] for i in new_idx], ppw)
+                    pairs = [(old_idx[ring_old.lookup(k)], new_idx[ring_new.lookup(k)]) for k in keys]
+                elif method == "hrw":
+                    pairs = []
+                    for k in keys:
+                        score = [hrw_score(x, w) for x, w in zip(hrw_hashes(k, hosts), weights)]
+                        pairs.append((max(old_idx, key=score.__getitem__), max(new_idx, key=score.__getitem__)))
+                else:                                  # random as lbsim defines it (contract-3 section 3)
+                    olds = rng.choices(old_idx, [weights[i] for i in old_idx], k=nkeys)
+                    if r is not None:
+                        rest = [i for i in old_idx if i != r]
+                        pairs = [(o, rng.choices(rest, [weights[i] for i in rest])[0] if o == r else o)
+                                 for o in olds]
+                    else:
+                        pairs = [(o, n if rng.randrange(sum(WEIGHTS) + 1) == 0 else o) for o in olds]
+                t = r if r is not None else n
+                extra = sum(o != m and (o != t if r is not None else m != t) for o, m in pairs)
+                worst = max(worst, extra)
+        check(f"{method}: measured extra moved = 0 in all {2 * reps} hashed remove/add trials (max count)",
+              0, worst, 0, True)
+
+
+def moved95_coverage(rng, reps=400, nkeys=254, r=2):
+    """moved/K inside theory's moved95, with placement and keys drawn fresh every trial (0.93..0.995)."""
+    n = len(WEIGHTS)
+    total = sum(WEIGHTS)
+    rnd = rng.random
+    for method in ("ring1", "ring10", "ketama", "hrw", "random", "mod"):
+        for change in ("remove", "add"):
+            rem = r if change == "remove" else None
+            lo, hi = lbsim.theory(method, list(WEIGHTS), nkeys, remove=rem, add=rem is None)["moved95"]
+            t = r if rem is not None else n             # removal: keys of r move; add: keys won by the new one
+            weights = list(WEIGHTS) if rem is not None else list(WEIGHTS) + [1]
+            count = reps if method != "ketama" else reps // 2
+            hits = 0
+            for _ in range(count):
+                if method in ("ring1", "ring10", "ketama"):
+                    ppw = {"ring1": 1, "ring10": 10, "ketama": 160}[method]
+                    pos, own = uniform_placement(rng, [ppw * w for w in weights])
+                    size = len(pos)
+                    moved = sum(own[bisect_right(pos, rnd()) % size] == t for _ in range(nkeys))
+                elif method == "hrw":           # pure model: u ~ U(0,1) per key and backend
+                    moved = 0
+                    for _ in range(nkeys):
+                        score = [-w / math.log(1.0 - rnd()) for w in weights]
+                        moved += max(range(len(weights)), key=score.__getitem__) == t
+                elif method == "random":
+                    moved = (rng.choices(range(n), WEIGHTS, k=nkeys).count(r) if rem is not None
+                             else sum(rng.randrange(total + 1) == 0 for _ in range(nkeys)))
+                else:                           # mod: fresh uniform 32-bit key hashes, fixed slot order
+                    before = [i for i, w in enumerate(WEIGHTS) for _ in range(w)]
+                    after = ([i for i in before if i != r] if rem is not None else before + [n])
+                    moved = 0
+                    for _ in range(nkeys):
+                        h = rng.getrandbits(32)
+                        moved += before[h % len(before)] != after[h % len(after)]
+                hits += lo <= moved / nkeys <= hi
+            check_rate(f"{method} {change}{f' b{r + 1}' if rem is not None else ''}: moved95 coverage "
+                       f"({count} trials, 0.93..0.995)", 0.9625, hits, count, 0.0325)
+
+
+def output_checks():
+    """New summary header and an extra moved line per keyed method, no '!' on consistent methods."""
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "lbsim.py")
+    for change in (["--remove", "b3"], ["--add"]):
+        proc = subprocess.run([sys.executable, "-B", script, "--backends", "5", "--weights", "1,3,1,1,2", *change],
+                              capture_output=True, text=True, check=False)
+        out = proc.stdout.splitlines()
+        what = " ".join(change)
+        check(f"output {what}: exit code 0", 0, proc.returncode, 0, True)
+        # summary rows, split on whitespace (no column positions): method, dev, moved 95%, extra moved, P, note...
+        rows = {}
+        if "summary (theory)" in out:
+            for line in out[out.index("summary (theory)") + 1:]:
+                tok = line.split()
+                if tok and tok[0] in lbsim.METHODS:
+                    rows[tok[0]] = tok
+        check(f"output {what}: summary has a row for every method", 1, int(set(rows) == set(lbsim.METHODS)), 0, True)
+        rem = 2 if change[0] == "--remove" else None
+        tm = lbsim.theory("mod", [1, 3, 1, 1, 2], 254, remove=rem, add=rem is None)
+        lo, hi = tm["moved95"]
+        want = [f"{100 * lo:.1f}-{hi:.1%}", f"{tm['extra']:.1%}"]
+        check(f"output {what}: summary mod moved 95% / extra = theory {want}", 1,
+              int(rows.get("mod", [None] * 4)[2:4] == want), 0, True)
+        check(f"output {what}: summary rr moved 95% / extra = n/a n/a", 1,
+              int(rows.get("rr", [None] * 4)[2:4] == ["n/a", "n/a"]), 0, True)
+        for m in ("random", "ring1", "ring10", "ketama", "hrw"):
+            tr = lbsim.theory(m, [1, 3, 1, 1, 2], 254, remove=rem, add=rem is None)
+            lo, hi = tr["moved95"]
+            want = [f"{100 * lo:.1f}-{hi:.1%}", "0.0%"]
+            check(f"output {what}: summary {m} moved 95% = theory, extra 0.0%", 1,
+                  int(rows.get(m, [None] * 4)[2:4] == want), 0, True)
+        header = [line for line in out if "max share dev(95%)" in line]
+        check(f"output {what}: summary header has moved 95% and extra moved, no moved E", 1,
+              int(len(header) == 1 and "moved 95%" in header[0] and "extra moved" in header[0]
+                  and "moved E" not in header[0]), 0, True)
+        method, extra = None, {}
+        for line in out:
+            if line in lbsim.METHODS:
+                method = line
+            elif line.startswith("summary"):
+                method = None
+            elif method and line.startswith("  extra moved "):
+                extra[method] = line
+        for m in lbsim.METHODS:
+            if m == "rr":
+                check(f"output {what}: rr has no extra moved line", 1, int(m not in extra), 0, True)
+            elif m == "mod":
+                check(f"output {what}: mod has an extra moved line", 1, int(m in extra), 0, True)
+            else:
+                check(f"output {what}: {m} extra moved line present, 0, no '!'", 1,
+                      int(m in extra and extra[m].startswith("  extra moved 0/") and "!" not in extra[m]), 0, True)
+
+
 def main():
     t0 = time.monotonic()
     rng = random.Random(20261125)
@@ -497,6 +694,13 @@ def main():
     even_top_checks(rng)
 
     exact_range_checks()
+
+    # contract 4: extra moved and moved 95%
+    mod_extra_checks(key_hashes)
+    mod_extra95_checks()
+    consistent_extra_checks(rng)
+    moved95_coverage(rng)
+    output_checks()
 
     # hrw: the method as defined (score -w / ln u per key and backend), r = b2 (weight 3)
     r = 1
@@ -531,6 +735,12 @@ def main():
     for i, w in enumerate(WEIGHTS):
         check(f"rr share b{i + 1} = w/W", w / sum(WEIGHTS), th["share"][i], 1e-12)
     check("rr remove: moved is None (no key affinity)", 1, int(th["moved"] is None), 0, True)
+    for kw in ({"remove": r}, {"add": True}):
+        t = lbsim.theory("rr", list(WEIGHTS), 254, **kw)
+        check(f"rr {next(iter(kw))}: extra and extra95 are None", 1,
+              int(t["extra"] is None and t["extra95"] is None), 0, True)
+    t = lbsim.theory("ketama", list(WEIGHTS), 254)
+    check("no change: extra and extra95 are None", 1, int(t["extra"] is None and t["extra95"] is None), 0, True)
 
     width = max(len(item) for item, *_ in RESULTS)
     print(f"{'item':<{width}}  {'theory':>8}  {'MC':>8}  {'err':>8}  {'limit':>8}")
