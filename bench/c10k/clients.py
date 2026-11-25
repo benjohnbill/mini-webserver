@@ -19,6 +19,7 @@ import json
 import multiprocessing
 import os
 import ssl
+import subprocess
 import time
 
 SAMPLE_PERIOD = 0.1       # seconds between two samples of rproxy
@@ -26,6 +27,7 @@ START_DELAY = 1.0         # seconds for the worker processes to start
 READ_TIMEOUT = 30.0       # seconds for one reply
 CHUNK_MAX = 65536
 PAGE_BYTES = os.sysconf("SC_PAGE_SIZE")
+CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 
 
 def parse_args():
@@ -120,13 +122,17 @@ def worker_run(args, index, count, t0, go):
 
 
 def rproxy_sample(pid):
-    """Return (rss bytes, open fds, kernel TCP memory bytes, TCP in use)."""
+    """Return rss bytes, open fds, CPU seconds (user + system), kernel TCP
+    memory bytes, and TCP sockets in use."""
     rss = 0
     with open(f"/proc/{pid}/status") as status:
         for line in status:
             if line.startswith("VmRSS:"):
                 rss = int(line.split()[1]) * 1024
     fds = len(os.listdir(f"/proc/{pid}/fd"))
+    with open(f"/proc/{pid}/stat") as stat:
+        fields = stat.read().rsplit(")", 1)[1].split()
+    cpu = (int(fields[11]) + int(fields[12])) / CLOCK_TICKS
     tcp_mem = tcp_inuse = 0
     with open("/proc/net/sockstat") as sockstat:
         for line in sockstat:
@@ -135,8 +141,18 @@ def rproxy_sample(pid):
                 tcp_inuse = int(fields[fields.index("inuse") + 1])
                 tcp_mem = int(fields[fields.index("mem") + 1]) * PAGE_BYTES
 
-    return {"time": time.time(), "rss": rss, "fds": fds,
+    return {"time": time.time(), "rss": rss, "fds": fds, "cpu": cpu,
             "tcp_mem": tcp_mem, "tcp_inuse": tcp_inuse}
+
+
+def ss_measure():
+    """Time one `ss -tmnHO` call, as the demo dashboard makes it. Return
+    (milliseconds, sockets listed)."""
+    start = time.monotonic()
+    out = subprocess.run(["ss", "-tmnHO", "state", "established"],
+                         capture_output=True, text=True).stdout
+
+    return (time.monotonic() - start) * 1000, len(out.splitlines())
 
 
 def percentile(values, share):
@@ -154,7 +170,7 @@ def samples_at(samples, moment):
     return before[-1] if before else samples[0]
 
 
-def summary_make(args, results, samples, t0, go):
+def summary_make(args, results, samples, t0, go, ss_probe):
     connected = [r for r in results if r["connect_ms"] is not None]
     fetched = [r for r in results if r["latency_ms"] is not None]
     errors = {}
@@ -186,6 +202,9 @@ def summary_make(args, results, samples, t0, go):
                        "p99": percentile(latencies, 0.99),
                        "max": max(latencies, default=None)},
         "burst_s": (max(latencies) / 1000) if latencies else None,
+        "cpu_idle": idle["cpu"], "cpu_held": held["cpu"],
+        "ramp_s": go - t0,
+        "ss_ms": ss_probe[0], "ss_sockets": ss_probe[1],
         "rss_idle": idle["rss"], "rss_held": held["rss"],
         "rss_peak": max(s["rss"] for s in samples),
         "fds_held": held["fds"], "fds_peak": max(s["fds"] for s in samples),
@@ -203,16 +222,21 @@ def main():
                                           else 0)
               for i in range(args.procs)]
     samples = [rproxy_sample(args.pid)]
+    ss_probe = (None, 0)
     with multiprocessing.Pool(args.procs) as pool:
         pending = pool.starmap_async(
             worker_run,
             [(args, i, shares[i], t0, go) for i in range(args.procs)])
         while not pending.ready():
             samples.append(rproxy_sample(args.pid))
+            # Once, in the hold: all connections are open and idle.
+            if ss_probe[0] is None and time.time() >= go - args.hold / 2:
+                ss_probe = ss_measure()
             pending.wait(SAMPLE_PERIOD)
         results = [r for part in pending.get() for r in part]
     samples.append(rproxy_sample(args.pid))
-    print(json.dumps(summary_make(args, results, samples, t0, go)))
+    print(json.dumps(summary_make(args, results, samples, t0, go,
+                                  ss_probe)))
 
 
 if __name__ == "__main__":

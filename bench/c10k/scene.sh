@@ -7,7 +7,9 @@
 #
 # The file is small on purpose: the reply fits in the kernel socket buffers,
 # so rproxy holds no reply bytes. What is left is the cost of a connection.
-# Output: docs/measurements/<date>-c10k-<count>.md
+# CERT=rsa uses build/cert.pem (RSA-2048). CERT=ec uses an ECDSA P-256
+# certificate, to compare the handshake cost.
+# Output: docs/measurements/<date>-c10k-<count>-<cert>.md
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 
@@ -18,6 +20,7 @@ RAMP="${RAMP:-3}"       # seconds to open all connections
 HOLD="${HOLD:-0.5}"     # seconds of wait after the ramp; RAMP + HOLD < 5
 ORIGIN_PORT="${ORIGIN_PORT:-19180}"
 PROXY_PORT="${PROXY_PORT:-19543}"
+CERT="${CERT:-rsa}"      # rsa or ec
 FILE=www/bench/c10k.bin
 
 # rproxy and the Origin get the lower half of the CPUs, the clients the
@@ -70,6 +73,23 @@ port_wait() {
     return 1
 }
 
+# The certificate and key of rproxy for CERT.
+cert_pick() {
+    case "$CERT" in
+        rsa) CERT_FILE=build/cert.pem KEY_FILE=build/key.pem ;;
+        ec)
+            CERT_FILE=build/cert-ec.pem KEY_FILE=build/key-ec.pem
+            [ -f "$CERT_FILE" ] || openssl req -x509 -newkey ec \
+                -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+                -subj /CN=localhost \
+                -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+                -keyout "$KEY_FILE" -out "$CERT_FILE" 2>/dev/null ||
+                die "openssl could not make the ECDSA certificate"
+            ;;
+        *) die "CERT must be rsa or ec, not $CERT" ;;
+    esac
+}
+
 servers_start() {
     taskset -c "$SERVER_CPUS" ./server "$ORIGIN_PORT" www --model epoll \
         >"$WORK/origin.log" 2>&1 &
@@ -77,7 +97,7 @@ servers_start() {
     port_wait "$ORIGIN_PID" "$ORIGIN_PORT" ||
         { cat "$WORK/origin.log"; die "the Origin did not start"; }
     taskset -c "$SERVER_CPUS" ./rproxy --port "$PROXY_PORT" \
-        --cert build/cert.pem --key build/key.pem \
+        --cert "$CERT_FILE" --key "$KEY_FILE" \
         --origin "127.0.0.1:$ORIGIN_PORT" --cache off \
         --loops "$LOOPS" --connections $((COUNT + 1000)) \
         >"$WORK/rproxy.log" 2>&1 &
@@ -106,6 +126,9 @@ rows = [
     ("kernel TCP memory idle, held", f"{mib(r['tcp_mem_idle'])}, {mib(r['tcp_mem_held'])}"),
     ("kernel TCP memory for each open connection", per("tcp_mem_held", "tcp_mem_idle")),
     ("rproxy fds held, peak", f"{r['fds_held']}, {r['fds_peak']}"),
+    ("rproxy CPU during the ramp, for each open connection", f"{(r['cpu_held'] - r['cpu_idle']) * 1000 / max(1, r['connected']):.2f} ms"),
+    ("rproxy CPU during the ramp, as cores", f"{(r['cpu_held'] - r['cpu_idle']) / max(0.001, r['ramp_s']):.1f}"),
+    ("ss -tmnHO with the connections held: time, sockets", f"{ms(r['ss_ms'])}, {r['ss_sockets']}"),
     ("TLS connect p50, p99, max", f"{ms(r['connect_ms']['p50'])}, {ms(r['connect_ms']['p99'])}, {ms(r['connect_ms']['max'])}"),
     ("reply latency p50, p95, p99, max", f"{ms(r['latency_ms']['p50'])}, {ms(r['latency_ms']['p95'])}, {ms(r['latency_ms']['p99'])}, {ms(r['latency_ms']['max'])}"),
 ]
@@ -118,21 +141,22 @@ EOF
 nofile_check
 make -s server rproxy cert || die "build failed"
 file_make
+cert_pick
 servers_start
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo none)
-echo "c10k: $COUNT connections, $SIZE bytes, commit $COMMIT"
+echo "c10k: $COUNT connections, $SIZE bytes, cert $CERT, commit $COMMIT"
 taskset -c "$CLIENT_CPUS" python3 bench/c10k/clients.py --pid "$RPROXY_PID" \
     --port "$PROXY_PORT" --count "$COUNT" --procs "$PROCS" \
     --ramp "$RAMP" --hold "$HOLD" --size "$SIZE" >"$WORK/result.json" ||
     die "clients.py failed"
 kill -0 "$RPROXY_PID" 2>/dev/null || echo "c10k: rproxy died during the run"
 
-OUT="docs/measurements/$(date +%Y%m%d-%H%M)-c10k-$COUNT.md"
+OUT="docs/measurements/$(date +%Y%m%d-%H%M)-c10k-$COUNT-$CERT.md"
 {
-    echo "# c10k Scene, $COUNT connections"
+    echo "# c10k Scene, $COUNT connections, $CERT certificate"
     echo
     echo "- Date: $(date '+%Y-%m-%d %H:%M'). Commit: \`$COMMIT\`."
-    echo "- Command: \`COUNT=$COUNT SIZE=$SIZE PROCS=$PROCS RAMP=$RAMP HOLD=$HOLD bench/c10k/scene.sh\`."
+    echo "- Command: \`CERT=$CERT COUNT=$COUNT SIZE=$SIZE PROCS=$PROCS RAMP=$RAMP HOLD=$HOLD bench/c10k/scene.sh\`."
     echo "- rproxy: \`--loops $LOOPS --connections $((COUNT + 1000)) --cache off\`, CPUs $SERVER_CPUS. Origin: \`./server --model epoll\`, CPUs $SERVER_CPUS. Clients: CPUs $CLIENT_CPUS."
     echo "- Idle is before the first connection. Held is at the go time: all connections are open, after the TLS handshake, and no request is sent yet."
     echo
