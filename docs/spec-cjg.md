@@ -644,3 +644,37 @@ The screen is one terminal split in two: commands and `curl` on the left, the da
 3. Act 3, then the recording, then Act 5. If time is short, cut from the end of this list.
 
 Results (2026-11-25): Acts 1 to 4 run as the story table says. Act 5 ran for 12 s only, and its result is open. Act 1 dies at about 8 s, Act 4 peaks at about 88 MiB. The runs repeat closely, so the live demo is the main plan. See [`20261125-backpressure-demo.md`](measurements/20261125-backpressure-demo.md). The presenter flow is in [`bench/demo/README.md`](../bench/demo/README.md).
+
+### Revision: mixed Phone speeds (2026-11-25, second grilling)
+
+This revision replaces the stage, the values, and the flow above. The tables above stay as the record of the first design.
+
+Owner's goal: the demo shows a problem that can happen on a real server, and then its solution. Owner: "나름의 실전성을 고려했고, 그에 따라서 문제 해결의 과정을 보여주는 느낌을 연출하고 싶은 거거든." A value is real when it carries the message (the speed gap between the Origin and a Phone). A value is abstract when it does not (RTT, arrival bursts, packet loss).
+
+Decisions of the owner:
+
+- Act 3 leaves the talk. A teammate presents the theory before the demo, so the 2 minutes are the demo only. `demo.sh act 3` still runs.
+- Phones come in speed tiers. The slow tiers are the speed caps of Korean carriers after the data allowance: 400 kbps, 1 Mbps, 3 Mbps, and 5 Mbps. The shares are an assumption: 2 %, 3 %, and 10 % slow, 85 % fast.
+- The file is 50 MB. rproxy publishes the bytes of each connection (`--relay-stats`), and the dashboard shows the share of each tier from these measured bytes, not from an estimate.
+- The flow is `demo.sh present`: four Phases on Enter. The bystander `curl` runs at fixed points of each Phase.
+- No RTT emulation, and the arrival stays even. An arrival burst reads as "too many users", which is the message of the Act 3 that left the talk.
+- The live demo runs on the laptop of the owner, with no other programs open.
+- Act 4 ends with "nobody was cut", not "everybody finished": a 400 kbps Phone needs about 1000 s for 50 MB.
+- The lines of the presenter are open.
+
+Values (from the runs of 2026-11-25):
+
+| Value | Demo value | Why |
+|---|---|---|
+| Phones | 170 `fast` at 50 MB/s, 10 at 625 KB/s, 10 at 375 KB/s, 6 at 125 KB/s, 4 at 50 KB/s | At 20 MB/s, about 14 `fast` Phones held 50 MB each at the kill, and the slow share was only 53–55 % |
+| Arrival | 30 s for each tier | One `phones.py` process reads at most about 300–400 MB/s. The `fast` tier needs about 283 MB/s |
+| Memory limit | 1280 MiB | With 1536 MiB, rproxy did not die (peak 1370–1417 MiB) |
+| Origin `--timeout` | 60 s | With 5 s, the Origin cut the 1 Mbps Phones in Act 4. 60 s is the default of nginx `send_timeout` |
+| CPUs | Phones on the upper half, rproxy and the Origin on the lower half (`taskset`) | One machine runs the clients and the servers |
+
+Facts found in the runs:
+
+- `phones.py` read through asyncio buffers of several hundred KB. A 50 KB/s Phone then left its socket untouched for more than the 5 s client timeout of rproxy, and rproxy cut it at about 1 MB. Small read buffers fixed the Phone, and rproxy did not change. A real slow phone reads its socket all the time.
+- At the kill in Act 1, the sum of `--relay-stats` and the cgroup memory agree within 7 %.
+
+Acceptance: 3 runs of each Act passed. See [`bench/demo/README.md`](../bench/demo/README.md), section "Acceptance".
