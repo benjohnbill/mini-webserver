@@ -25,10 +25,11 @@ enum rate_key { RATE_KEY_IP, RATE_KEY_JA4 };
 /* How a reply moves from the Origin to the client (SPEC 12, "rproxy
    flags"). The first value is the default. */
 enum relay_mode {
-    RELAY_REPLY_CAP,   /* read the whole reply, 502 over ORIGIN_REPLY_MAX */
-    RELAY_UNBOUNDED,   /* read the whole reply, with no size limit */
-    RELAY_CONN_CAP,    /* 503 over relay_conns Origin exchanges */
-    RELAY_BACKPRESSURE /* read the Origin only when relay_buffer has room */
+    RELAY_REPLY_CAP,    /* read the whole reply, 502 over ORIGIN_REPLY_MAX */
+    RELAY_UNBOUNDED,    /* read the whole reply, with no size limit */
+    RELAY_CONN_CAP,     /* 503 over relay_conns Origin exchanges */
+    RELAY_BACKPRESSURE, /* read the Origin only when relay_buffer has room */
+    RELAY_MEMORY_CAP    /* 502 for a new exchange over relay_memory MiB */
 };
 
 struct rproxy_config {
@@ -60,6 +61,7 @@ struct rproxy_config {
     enum relay_mode relay_mode;
     int relay_conns;  /* RELAY_CONN_CAP: Origin exchanges in the process */
     int relay_buffer; /* RELAY_BACKPRESSURE: bytes for each connection */
+    int relay_memory; /* RELAY_MEMORY_CAP: MiB of replies in the process */
     /* Each loop writes loop-<N>.txt here: NULL when the stats are off. */
     const char *relay_stats_dir;
 };
@@ -89,6 +91,8 @@ struct rproxy {
     atomic_bool is_stopping;
     /* RELAY_CONN_CAP: the Origin exchanges in progress in all loops. */
     atomic_int origin_exchanges;
+    /* RELAY_MEMORY_CAP: the reply bytes that all loops hold. */
+    atomic_size_t reply_bytes_held;
 };
 
 #endif

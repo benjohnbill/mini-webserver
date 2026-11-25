@@ -49,6 +49,8 @@
 /* SPEC 12, "Values": the Act 3 limit and the Act 4 buffer. */
 #define DEFAULT_RELAY_CONNS 20
 #define DEFAULT_RELAY_BUFFER 65536
+#define DEFAULT_RELAY_MEMORY 1024 /* MiB */
+#define RELAY_MEMORY_MAX 1048576  /* MiB */
 /* One TLS record body, so that one send has bytes to give. */
 #define RELAY_BUFFER_MIN 16384
 #define RELAY_BUFFER_MAX 67108864
@@ -93,21 +95,22 @@ int main(int argc, char **argv)
 {
     struct rproxy rproxy;
     if (!rproxy_init_from_args(&rproxy, argc, argv)) {
-        fprintf(stderr,
-                "usage: ./rproxy --port P --cert FILE --key FILE "
-                "--origin HOST:PORT [--origin HOST:PORT ...] "
-                "[--origin-timeout S] [--loops N] [--connections N] "
-                "[--rate R] [--burst B] "
-                "[--rate-key ip|ja4] [--tarpit S] [--cache off|on] "
-                "[--cache-admit all|size|second] [--cache-object-max BYTES] "
-                "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
-                "[--cache-lock global|striped] [--block-list FILE] "
-                "[--ja4-list FILE] [--block-time S] [--block-key KEY ...] "
-                "[--pow-prefix PATH ...] [--pow-bits N] "
-                "[--pay-prefix PATH ...] [--bot-key FILE] "
-                "[--relay unbounded|reply-cap|conn-cap|backpressure] "
-                "[--relay-conns N] [--relay-buffer BYTES] "
-                "[--relay-stats DIR]\n");
+        fprintf(
+            stderr,
+            "usage: ./rproxy --port P --cert FILE --key FILE "
+            "--origin HOST:PORT [--origin HOST:PORT ...] "
+            "[--origin-timeout S] [--loops N] [--connections N] "
+            "[--rate R] [--burst B] "
+            "[--rate-key ip|ja4] [--tarpit S] [--cache off|on] "
+            "[--cache-admit all|size|second] [--cache-object-max BYTES] "
+            "[--cache-evict fifo|lru] [--cache-bytes N] [--cache-ttl S] "
+            "[--cache-lock global|striped] [--block-list FILE] "
+            "[--ja4-list FILE] [--block-time S] [--block-key KEY ...] "
+            "[--pow-prefix PATH ...] [--pow-bits N] "
+            "[--pay-prefix PATH ...] [--bot-key FILE] "
+            "[--relay unbounded|reply-cap|conn-cap|backpressure|memory-cap] "
+            "[--relay-conns N] [--relay-buffer BYTES] [--relay-memory MIB] "
+            "[--relay-stats DIR]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -134,12 +137,14 @@ static bool rproxy_init_from_args(struct rproxy *rproxy, int argc, char **argv)
                    .block_time = DEFAULT_BLOCK_TIME,
                    .pow_bits = DEFAULT_POW_BITS,
                    .relay_conns = DEFAULT_RELAY_CONNS,
-                   .relay_buffer = DEFAULT_RELAY_BUFFER},
+                   .relay_buffer = DEFAULT_RELAY_BUFFER,
+                   .relay_memory = DEFAULT_RELAY_MEMORY},
     };
     cache_options_init(&rproxy->config.cache_options);
     atomic_init(&rproxy->list.next, 0);
     atomic_init(&rproxy->is_stopping, false);
     atomic_init(&rproxy->origin_exchanges, 0);
+    atomic_init(&rproxy->reply_bytes_held, 0);
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc || !option_parse(rproxy, argv[i], argv[i + 1])) {
             return false;
@@ -241,6 +246,9 @@ static bool option_parse(struct rproxy *rproxy, const char *name,
         return number_parse(value, RELAY_BUFFER_MIN, RELAY_BUFFER_MAX,
                             &config->relay_buffer);
     }
+    if (strcmp(name, "--relay-memory") == 0) {
+        return number_parse(value, 1, RELAY_MEMORY_MAX, &config->relay_memory);
+    }
     if (strcmp(name, "--relay-stats") == 0) {
         config->relay_stats_dir = value;
         return true;
@@ -293,7 +301,7 @@ static bool relay_mode_parse(const char *text, enum relay_mode *relay_mode)
 {
     /* In the order of enum relay_mode. */
     static const char *const names[] = {"reply-cap", "unbounded", "conn-cap",
-                                        "backpressure"};
+                                        "backpressure", "memory-cap"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (strcmp(text, names[i]) == 0) {
             *relay_mode = (enum relay_mode)i;

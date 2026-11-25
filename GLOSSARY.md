@@ -121,7 +121,7 @@ The buffer of one client connection that holds the gap between `read()` from the
 _Avoid_: send buffer (the kernel buffer of the socket), ring, window
 
 **Relay mode**:
-The way the Reverse Proxy moves a reply from the Origin to the client: `unbounded`, `reply-cap`, `conn-cap`, or `backpressure`. The flag `--relay` selects it.
+The way the Reverse Proxy moves a reply from the Origin to the client: `unbounded`, `reply-cap`, `conn-cap`, `backpressure`, or `memory-cap`. The flag `--relay` selects it.
 _Avoid_: buffer mode, proxy mode
 
 **Act**:

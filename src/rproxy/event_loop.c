@@ -169,7 +169,8 @@ struct connection {
     size_t reply_len;
     size_t reply_capacity;
     struct relay_buffer relay;
-    bool holds_exchange_slot;             /* RELAY_CONN_CAP: until the close */
+    bool holds_exchange_slot;   /* RELAY_CONN_CAP: until the close */
+    size_t reply_bytes_counted; /* RELAY_MEMORY_CAP: in reply_bytes_held */
     char status_text[REPLY_TEXT_MAX * 2]; /* a reply of rproxy itself */
     struct reply_part parts[REPLY_PARTS_MAX];
     int part_count;
@@ -259,6 +260,9 @@ static void reply_plan_parts(struct connection *connection,
                              const char *cache_name);
 static enum step origin_exchange_start(struct connection *connection);
 static int exchange_slot_take(struct connection *connection);
+static int reply_memory_check(struct connection *connection);
+static void reply_memory_count(struct connection *connection, size_t length);
+static void reply_memory_release(struct connection *connection);
 static void client_send_buffer_cap(struct connection *connection);
 static bool origin_request_format(struct connection *connection);
 static enum step origin_connect_start(struct connection *connection);
@@ -1198,6 +1202,9 @@ static enum step origin_exchange_start(struct connection *connection)
 {
     struct rproxy *rproxy = connection->loop->rproxy;
     int status = exchange_slot_take(connection);
+    if (status == 0) {
+        status = reply_memory_check(connection);
+    }
     if (status == 0 && !origin_request_format(connection)) {
         status = 500;
     }
@@ -1232,6 +1239,24 @@ static int exchange_slot_take(struct connection *connection)
     connection->holds_exchange_slot = true;
 
     return 0;
+}
+
+/* RELAY_MEMORY_CAP (SPEC 12, Phase 2-A): when the replies that rproxy
+   holds reach --relay-memory MiB, a new exchange gets 502. An exchange that
+   already started reads its whole reply. Returns 0 or 502. */
+static int reply_memory_check(struct connection *connection)
+{
+    const struct rproxy *rproxy = connection->loop->rproxy;
+    if (rproxy->config.relay_mode != RELAY_MEMORY_CAP) {
+        return 0;
+    }
+    size_t limit = (size_t)rproxy->config.relay_memory * 1024 * 1024;
+    if (atomic_load(&rproxy->reply_bytes_held) < limit) {
+        return 0;
+    }
+    connection->exchange.cause = "memory-cap";
+
+    return 502;
 }
 
 /* Autotuning grows the kernel send buffer of conn_fd up to tcp_wmem
@@ -1570,6 +1595,7 @@ static enum step origin_read_step(struct connection *connection)
             return origin_exchange_end(connection, 502);
         }
         connection->reply_len += (size_t)length;
+        reply_memory_count(connection, (size_t)length);
         if (reply_is_over_cap(connection)) {
             connection->exchange.cause = "reply-cap";
             return origin_exchange_end(connection, 502);
@@ -1711,6 +1737,27 @@ static void connection_close(struct connection *connection)
     connection->state = STATE_CLOSED;
     connection->next = loop->closed;
     loop->closed = connection;
+}
+
+static void reply_memory_count(struct connection *connection, size_t length)
+{
+    struct rproxy *rproxy = connection->loop->rproxy;
+    if (rproxy->config.relay_mode != RELAY_MEMORY_CAP) {
+        return;
+    }
+    atomic_fetch_add(&rproxy->reply_bytes_held, length);
+    connection->reply_bytes_counted += length;
+}
+
+/* The reply is freed with the connection (loop_free_closed). */
+static void reply_memory_release(struct connection *connection)
+{
+    if (connection->reply_bytes_counted == 0) {
+        return;
+    }
+    atomic_fetch_sub(&connection->loop->rproxy->reply_bytes_held,
+                     connection->reply_bytes_counted);
+    connection->reply_bytes_counted = 0;
 }
 
 static void exchange_slot_release(struct connection *connection)
@@ -1954,6 +2001,7 @@ static void loop_free_closed(struct event_loop *loop)
     while (loop->closed != NULL) {
         struct connection *connection = loop->closed;
         loop->closed = connection->next;
+        reply_memory_release(connection);
         free(connection->buffer.data);
         free(connection->origin_request);
         free(connection->reply);

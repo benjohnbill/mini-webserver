@@ -603,6 +603,26 @@ got="$(fetch_big "$WORK/big_conn3")"
 [ "$got" = "200 $big_sum" ] && pass "conn-cap frees a slot when its download ends" \
     || fail "conn-cap frees a slot when its download ends: got '$got'"
 
+# One slow download holds 6 MiB of reply, over the 5 MiB limit. A new
+# exchange gets a 502. The exchange that started first reads its file whole.
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay memory-cap --relay-memory 5
+fetch_big "$WORK/big_mem1" --limit-rate 2M > "$WORK/mem1" &
+slow_pid=$!
+sleep 1
+got="$(fetch "$BASE/big.bin" | cut -d' ' -f1)"
+wait "$slow_pid"
+[ "$got" = "502" ] && pass "memory-cap gives 502 to a new exchange over --relay-memory" \
+    || fail "memory-cap gives 502 to a new exchange over --relay-memory: got '$got'"
+[ "$(cat "$WORK/mem1")" = "200 $big_sum" ] \
+    && pass "memory-cap serves the exchange that started before the limit whole" \
+    || fail "memory-cap serves the exchange that started before the limit whole: $(cat "$WORK/mem1")"
+grep -q ' 502 memory-cap$' "$WORK/rproxy.err" \
+    && pass "memory-cap logs the cause memory-cap" \
+    || fail "memory-cap logs the cause memory-cap"
+got="$(fetch_big "$WORK/big_mem2")"
+[ "$got" = "200 $big_sum" ] && pass "memory-cap frees the bytes when the connection closes" \
+    || fail "memory-cap frees the bytes when the connection closes: got '$got'"
+
 # 6 MiB at 1 MB/s takes about 6 s, longer than --origin-timeout 1.
 start_proxy --origin "$HOST:$EPOLL_PORT" --relay backpressure
 got="$(fetch_big "$WORK/big_slow" --limit-rate 1M)"
