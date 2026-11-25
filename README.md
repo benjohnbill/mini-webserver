@@ -2,119 +2,261 @@
 
 ## 개요
 
-C11과 POSIX 소켓으로 구현한 HTTP 웹 서버이자 리버스 프록시입니다. 정적 파일과 `POST /echo`는 직접 응답하고, 지정한 경로의 요청은 백엔드에 별도 TCP 연결을 열어 중계합니다. HTTP 요청 파싱과 응답 생성, 여러 연결의 동시 처리를 외부 HTTP 라이브러리 없이 구현했습니다.
+노트북 환경에서 C10K 문제에 대응하는 것을 목표로 설계한 웹 서버와 리버스 프록시입니다.
 
-## 서버 구조
-
-브라우저는 하나의 주소에 접속합니다. 서버는 요청 헤더를 읽은 뒤 **어디에서 응답을 만들지** 결정합니다. 아래는 정적 파일 루트가 `./public`이고 `/api`를 백엔드로 보내도록 설정한 경우입니다.
+## Architecture
 
 ```mermaid
 flowchart LR
-    browser["브라우저"] <-->|"클라이언트 TCP 연결"| router
+    browser[Browser] --> router
     subgraph server["mini-webserver"]
-        router["HTTP 파서와 경로 선택"]
-        router -->|"GET /"| file["정적 파일 읽기"]
-        router -->|"POST /echo"| echo["요청 본문 반환"]
-        router -->|"/api 경로"| proxy["리버스 프록시"]
+        router[Router] -->|"GET /"| files[Static Files]
+        router -->|"POST /echo"| echo[Echo]
+        router -->|"/api"| proxy[Reverse Proxy]
     end
-    proxy <-->|"백엔드 TCP 연결"| backend["백엔드 서버"]
+    proxy --> backend[Backend]
 ```
 
-### 요청 한 건의 처리 흐름
+### Requests
 
-서버는 `socket() → bind() → listen()`으로 리스닝 소켓을 만들고, `accept()`가 반환한 연결 소켓을 논블로킹으로 설정합니다. TCP에서는 헤더 한 줄도 여러 번의 `recv()`로 나뉠 수 있습니다. 그래서 파서는 빈 줄(`\r\n\r\n`)까지 누적한 뒤 메서드·경로·헤더를 해석하고, 본문 길이는 `Content-Length`로 정합니다. [소켓 설정](src/net.c) · [HTTP 파서](src/http.c)
+#### Static · `GET /`
 
-- **로컬 응답.** `GET /`이면 정적 파일 루트에서 `index.html`을 열어 상태 줄, 파일의 MIME 타입과 길이, 파일 내용을 보냅니다. 내장 경로인 `POST /echo`는 본문이 모두 도착하면 받은 바이트를 그대로 응답합니다. [파일 열기와 MIME 매핑](src/handlers.c) · [로컬 요청 처리](src/connection.c)
-- **프록시 응답.** `GET /api/items?id=7`이면 경로 요소 단위로 가장 길게 일치하는 규칙을 선택합니다. 백엔드에 전달할 때는 프록시가 TCP 클라이언트가 되어 새 연결을 열고, 경로와 쿼리를 유지한 채 `Host`를 백엔드 주소로 바꿉니다. 백엔드의 상태 코드와 본문은 원래 브라우저 소켓으로 돌려주고, 응답을 마치면 연결을 닫습니다. [라우팅과 헤더 변환](src/handlers.c) · [응답 중계](src/connection.c)
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant S as mini-webserver
+    participant F as File system
 
-### 여러 연결을 처리하는 방식
+    C->>S: Request
+    Note over C,S: GET / HTTP/1.1<br/>Host: localhost:8080
+    S->>F: Open index.html
+    F-->>S: File size · 366 bytes
+    S-->>C: Response headers
+    Note over C,S: HTTP/1.1 200 OK<br/>Content-Type: text/html#59; charset=utf-8<br/>Content-Length: 366<br/>Connection: close
+    S->>F: Read file
+    F-->>S: HTML bytes
+    S-->>C: HTML bytes
+```
 
-연결마다 `Connection`에 **다음에 읽거나 쓸 소켓, 현재 처리 단계, 아직 보내지 못한 바이트 수**를 보관합니다. 예를 들어 `POST /echo`의 5바이트 본문 중 `he`만 도착하면, 그 연결은 2바이트를 받은 상태에서 다음 읽기를 기다립니다. 응답을 마치거나 연결이 끊기면 해당 연결이 열어 둔 파일과 백엔드 소켓을 닫고 요청 버퍼를 해제합니다. [연결 상태와 자원 회수](src/connection.c)
+#### Echo · `POST /echo`
 
-같은 HTTP 처리 코드를 두고 연결을 맡는 방식을 선택할 수 있습니다. 기본 모델은 `pthread` **스레드 풀**입니다. 메인 스레드가 수락한 소켓을 대기 큐에 넣으면 미리 띄운 워커 4개가 하나씩 꺼내 응답을 마칠 때까지 담당합니다. 큐를 변경하는 동안만 뮤텍스를 잡고, 소켓 I/O는 잠금을 푼 뒤 수행합니다. `-m fork`에서는 자식 프로세스 하나가 연결 하나를 맡습니다. 이벤트 루프에서는 한 스레드가 여러 소켓을 감시하다가 준비된 연결의 다음 단계만 실행합니다. [스레드 풀과 프로세스 모델](src/main.c) · [이벤트 루프](src/event_loop.c)
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant S as mini-webserver
 
-## 설계 목표
+    C->>S: Request headers
+    Note over C,S: POST /echo HTTP/1.1<br/>Host: localhost:8080<br/>Content-Type: text/plain<br/>Content-Length: 5
+    C->>S: he
+    Note right of S: 2/5 bytes · wait
+    C->>S: llo
+    Note right of S: 5/5 bytes · ready
+    S-->>C: Response headers
+    Note over C,S: HTTP/1.1 200 OK<br/>Content-Type: application/octet-stream<br/>Content-Length: 5<br/>Connection: close
+    S-->>C: hello
+```
 
-웹 서버는 클라이언트의 요청에 직접 응답할 수 있습니다. 그렇다면 웹 서버 앞에 리버스 프록시를 두었을 때 어떤 부하를 줄일 수 있을까요?
+#### Proxy · `/api` (Cache Miss)
 
-우리 팀은 **리버스 프록시를 통해 다양한 상황에서 서버가 감당하는 부하를 줄이는 것**을 핵심 목표로 삼았습니다. 요청을 받아 응답을 돌려주기까지 세 가지 상황에 집중했습니다.
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant P as Reverse Proxy
+    participant K as Proxy Cache
+    participant B as Backend
 
-| 상황 | 설계 목표 |
-|---|---|
-| 같은 리소스를 반복해서 요청하거나 한 IP에서 요청이 몰릴 때 | 프록시에서 응답하거나 요청을 제한해 백엔드가 직접 처리하는 건수를 줄입니다. |
-| 여러 백엔드로 요청을 분산하다가 서버 수가 바뀔 때 | 각 서버가 트래픽을 나눠 처리하면서, 구성 변경으로 다른 서버에 재배정되는 클라이언트 IP를 최소화합니다. |
-| 클라이언트와 백엔드의 전송 속도가 다를 때 | 수신 측이 받아들일 수 있는 만큼 중계해, 프록시 메모리에 쌓이는 미전송 본문의 양을 제한합니다. |
+    C->>P: Request
+    Note over C,P: GET /api/items?id=7 HTTP/1.1<br/>Host: localhost:8080
+    P->>P: Select backend · Ketama
+    P->>K: Lookup
+    K-->>P: Miss
+    P->>B: Open TCP connection
+    P->>B: Forward request
+    Note over P,B: GET /api/items?id=7 HTTP/1.1<br/>Host: 127.0.0.1:8001<br/>Via: 1.1 mini-webserver<br/>Connection: close<br/>Content-Length: 0
+    B-->>P: Response headers
+    P-->>C: Response headers
+    Note over C,P: HTTP/1.1 200 OK<br/>Content-Type: application/json<br/>Cache-Control: public, max-age=30<br/>Content-Length: 8<br/>Connection: close
+    loop Until body complete
+        B-->>P: Read up to 8 KiB
+        P-->>C: Forward chunk
+    end
+```
 
-## 리버스 프록시의 특징
+#### Proxy · `/api` (Cache Hit)
+
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant P as Reverse Proxy
+    participant K as Proxy Cache
+
+    C->>P: Request
+    Note over C,P: GET /api/items?id=7 HTTP/1.1<br/>Host: localhost:8080
+    P->>P: Select backend · Ketama
+    P->>K: Lookup
+    K-->>P: Hit · headers and body
+    P-->>C: Response headers
+    Note over C,P: HTTP/1.1 200 OK<br/>Content-Type: application/json<br/>Cache-Control: public, max-age=30<br/>Content-Length: 8<br/>Connection: close<br/>Age: 0
+    P-->>C: {"id":7}
+```
+
+### Concurrency
+
+| 모델 | 처리 단위 | 백엔드 지연 시 |
+|---|---|---|
+| **Thread Pool** · 기본 | 워커 4개, 워커당 연결 1개 | 워커 4개 점유 시 다음 연결은 큐 대기 |
+| **Fork** | 연결당 자식 프로세스 1개 | 해당 자식만 대기 |
+| **Event Loop** | 스레드 1개, 연결 여러 개 | 다른 연결 처리 후 응답 도착 시 재개 |
+
+## Features
+
+해당 프로젝트는 리버스 프록시를 통해 다양한 상황에서 서버가 감당하는 부하를 줄이는 것을 핵심 목표로 삼았습니다.
+
+| 상황 | 설계 | 목표 |
+|---|---|---|
+| 반복 조회 · 특정 IP의 요청 집중 | 응답 캐시 · IP별 요청 제한 | 백엔드에 도달하는 요청 수 감소 |
+| 백엔드 추가·제거 | Ketama 일관 해싱 | 담당 백엔드가 바뀌는 클라이언트 IP 수 최소화 |
+| 클라이언트와 백엔드의 전송 속도 차이 | 양방향 백프레셔 | 프록시의 본문 중계 버퍼를 연결당 8 KiB로 제한 |
 
 ### 1. 응답 캐시와 IP별 요청 제한
 
-#### 도입 이유
-
-여러 클라이언트가 같은 공개 데이터를 조회하면 백엔드는 유효한 응답을 이미 생성했어도 같은 작업을 반복합니다. 또 한 클라이언트가 매번 다른 경로를 요청한다면 캐시 적중률이 낮아 그 요청이 그대로 백엔드에 도달합니다. 반복 작업을 줄이는 방법과 순간적으로 몰리는 요청을 제한하는 방법이 각각 필요했습니다.
-
-#### 적용 방식
-
-- 정적 파일은 프록시가 직접 읽어 응답합니다. 요청 제한을 켜면 백엔드로 라우팅할 요청에 **클라이언트 IP별 토큰 버킷**을 먼저 적용합니다. 토큰을 일정 속도로 보충하고 요청 한 건에 하나씩 사용합니다. 토큰이 없으면 백엔드에 연결하기 전에 `429 Too Many Requests`와 `Retry-After: 1`을 반환합니다.
-- 캐시를 켜면 토큰 검사를 통과한 GET은 **응답 캐시**를 조회합니다. 선택한 백엔드, 요청의 `Host`, 경로와 쿼리가 같고 응답이 아직 유효하면 프록시가 저장한 헤더와 본문으로 응답합니다. 캐시와 토큰 버킷은 워커 스레드와 `fork` 자식 프로세스 간에도 공유합니다.
-- 캐시에는 `Cache-Control: public, max-age=…`으로 재사용을 허용한 작은 `200 OK` 응답을 최대 64개 보관합니다. 항목당 본문은 8 KiB, 헤더는 2 KiB, 유효기간은 60초가 상한입니다. 인증·쿠키가 있는 요청이나 `private`, `no-store`, `Vary`가 있는 응답은 캐시를 우회합니다. [구현 코드](src/proxy_policy.c) · [CJG 브랜치의 응답 캐시](https://github.com/benjohnbill/mini-webserver/blob/8e54925e51dc91d694f5fcb64f43251a85a86775/src/cache.c) · [CJG 브랜치의 요청 제한](https://github.com/benjohnbill/mini-webserver/blob/8e54925e51dc91d694f5fcb64f43251a85a86775/src/rproxy/rate_limit.c)
+- **요청 제한** — 프록시 요청마다 IP별 토큰 1개 사용. 설정한 속도로 보충하며, 소진 시 백엔드 연결 전에 `429 Too Many Requests`와 `Retry-After: 1` 반환
+- **캐시 조회** — 토큰 검사 후 GET 요청의 백엔드·`Host`·경로·쿼리로 조회. 적중하면 저장된 헤더와 본문으로 응답
+- **저장 대상** — `Cache-Control: public, max-age=…`인 `200 OK` 응답. 인증·쿠키 요청과 `private`·`no-store`·`Vary` 응답은 제외
+- **저장 한도** — 최대 64개 항목. 항목당 헤더 2 KiB, 본문 8 KiB, 유효기간 최대 60초
+- **공유 범위** — 워커 스레드와 `fork` 자식 프로세스가 캐시·토큰 버킷 공유
 
 ### 2. Ketama 일관 해싱을 이용한 로드 밸런싱
 
-#### 도입 이유
+- **링 구성** — 경로별 해시 링에 백엔드당 가상 노드 160개 배치. `IP:포트-복제번호`의 MD5 해시로 위치 결정
+- **백엔드 선택** — 클라이언트 IP를 해시한 뒤 해당 값 이상의 첫 노드를 이진 탐색. 링 끝을 넘으면 첫 노드 선택
+- **서버 증설** — 새 백엔드가 맡는 구간의 IP만 재배정. 나머지 IP는 기존 백엔드 유지
+- **공인 IP 공유** — 같은 공인 IP의 요청은 한 백엔드에 집중. IP별 토큰 버킷으로 유입량 제한 가능
 
-`hash(IP) % 서버 수`로 백엔드를 정하면 같은 IP의 요청은 같은 서버로 갑니다. 그런데 서버를 두 대에서 세 대로 늘리면 나누는 수가 바뀌어 기존 1번 서버의 클라이언트가 기존 2번 서버로 옮겨가기도 합니다. 증설 시에는 새 서버가 맡게 될 구간의 IP만 이동하도록 Ketama를 선택했습니다.
+#### Hash Ring · Server B Removed
 
-#### 적용 방식
+**Client IP → MD5 → Ring position (`x` or `y`) → First server clockwise**
 
-- 시작할 때 경로별로 해시 링을 구성합니다. 각 백엔드에 대해 `IP:포트-복제번호`의 MD5 해시로 지점 160개를 만들고, 모든 백엔드의 지점을 하나로 모아 정렬합니다.
-- 요청이 들어오면 TCP 연결에서 얻은 클라이언트 IP를 해시합니다. 이 값 이상의 첫 지점을 이진 탐색하고, 링의 끝을 넘으면 첫 지점으로 돌아갑니다. 해당 지점을 소유한 백엔드에 요청을 전달합니다.
-- 여러 사용자가 같은 공인 IP를 공유하면 요청도 한 백엔드로 모입니다. 이 경우 앞단의 IP별 토큰 버킷으로 해당 백엔드에 전달되는 요청 수를 제한할 수 있습니다. [링 생성과 백엔드 선택](src/ketama.c) · [hjm 브랜치의 IP 기반 라우팅](https://github.com/benjohnbill/mini-webserver/blob/865872c3ff60334abceae48a98557524b0bdd5d3/src/route.c) · [Ketama 원본](https://github.com/RJ/ketama/blob/master/libketama/ketama.c)
+```mermaid
+block-beta
+    columns 11
+    space:2 beforeTitle["Before"] space:5 afterTitle["After"] space:2
+    space:2 a1(("A₁")) space:5 newA1(("A₁")) space:2
+    space a2(("A₂")) space x["x"] space:3 newA2(("A₂")) space newX["x"] space
+    y["y"] space clockwise["↻"] space b1(("B₁")) space newY["y"] space newClockwise["↻"] space oldB1(("B₁"))
+    space b2(("B₂")) space c1(("C₁")) space:3 oldB2(("B₂")) space newC1(("C₁")) space
+    space:2 c2(("C₂")) space:5 newC2(("C₂")) space:2
+    space beforeX["x → B₁"] space beforeY["y → A₂"] space:3 afterX["x → C₁"] space afterY["y → A₂"] space
 
-### 3. 양방향 백프레셔
+    a1 --> x
+    x --> b1
+    b1 --> c1
+    c1 --> c2
+    c2 --> b2
+    b2 --> y
+    y --> a2
+    a2 --> a1
 
-#### 도입 이유
+    newA1 --> newX
+    newX --> newC1
+    newC1 --> newC2
+    newC2 --> newY
+    newY --> newA2
+    newA2 --> newA1
 
-백엔드가 HTML을 빠르게 보내도 브라우저가 천천히 읽으면 **프록시 커널의 브라우저 쪽 소켓 송신 버퍼**가 찰 수 있습니다. 이때 프록시가 백엔드에서 계속 읽으면, 커널에 넘기지 못한 바이트를 프록시 프로세스가 보관해야 합니다. 업로드에서는 백엔드가 본문을 천천히 읽을 때 같은 문제가 생깁니다.
+    classDef a fill:#dbeafe,stroke:#3b82f6,color:#172554
+    classDef b fill:#ffedd5,stroke:#ea580c,color:#431407
+    classDef c fill:#dcfce7,stroke:#16a34a,color:#052e16
+    classDef ip fill:#f3e8ff,stroke:#9333ea,color:#3b0764
+    classDef removed fill:transparent,stroke:#94a3b8,stroke-dasharray:3 3
+    classDef label fill:transparent,stroke:transparent
+    class a1,a2,newA1,newA2 a
+    class b1,b2 b
+    class c1,c2,newC1,newC2 c
+    class x,y,newX,newY ip
+    class oldB1,oldB2 removed
+    class beforeTitle,afterTitle,beforeX,beforeY,afterX,afterY,clockwise,newClockwise label
+```
 
-#### 적용 방식
+- **서버 제거** — B가 맡던 IP만 재배정. `x`는 B₁에서 C₁로 이동하고, `y`는 A₂ 유지. 그림에서는 가상 노드를 서버당 2개만 표시
+- **현재 구현** — 장애 시 연결 오류 응답. 재배치는 설정에서 B를 빼고 프록시를 다시 시작할 때 적용
 
-프록시는 연결당 **8 KiB의 사용자 공간 버퍼** 하나로 본문을 중계합니다. 예를 들어 8 KiB를 읽고 `send()`가 3 KiB만 받아들이면, 남은 5 KiB의 위치를 기억한 채 브라우저 쪽 소켓이 쓰기 가능해지기를 기다립니다. 커널이 남은 5 KiB를 받아들인 뒤에야 백엔드에서 다음 조각을 읽습니다. TCP 수신 확인(ACK)과 각 소켓의 송수신 버퍼는 커널이 관리합니다.
+<img src="docs/images/ketama-hash-ring.png" alt="서버 3대의 Ketama 해시 링. 안쪽은 제거 전, 바깥쪽은 b3 제거 후." width="660">
+
+<img src="docs/images/ketama-remove-one-of-eight.png" alt="서버 8대 중 b8을 제거한 Ketama 시뮬레이션. 키 10,000개 중 b8이 맡던 1,239개만 이동." width="800">
+
+### 3. Backpressure
+
+- **Download** — Slow browser → pause backend reads
+- **Upload** — Slow backend → pause browser reads
+
+```mermaid
+flowchart TB
+    subgraph off["Backpressure OFF · 예시"]
+        direction LR
+        B1["Backend"] ==>|"읽기 5 MiB/s"| P1["Proxy<br/>매초 4 MiB씩 메모리에 누적"]
+        P1 -->|"쓰기 1 MiB/s"| C1["Slow Client"]
+    end
+
+    subgraph on["Backpressure ON"]
+        direction LR
+        B2["Backend"] -.->|"쓰기가 밀리면 읽기 중단"| P2["Proxy<br/>연결당 중계 버퍼 ≤ 8 KiB"]
+        P2 -->|"쓰기 1 MiB/s"| C2["Slow Client"]
+    end
+
+    off ~~~ on
+    style P1 fill:#fff1e8,stroke:#b45309,color:#431407
+    style P2 fill:#eaf7ee,stroke:#15803d,color:#14532d
+```
 
 ```mermaid
 sequenceDiagram
-    participant S as 서버
-    box 프록시
-        participant R as 커널 수신 버퍼
-        participant P as 프록시 코드
-        participant W as 커널 송신 버퍼
+    participant S as Backend
+    box Proxy
+        participant R as Kernel RX
+        participant P as Relay
+        participant W as Kernel TX
     end
-    participant B as 브라우저 측 TCP
+    participant B as Browser
 
-    S->>R: HTML 전송
-    R->>P: 최대 8 KiB 읽기
-    P->>W: 읽은 조각 쓰기
-    W->>B: HTML 전송
-    B-->>W: ACK + 윈도우 0 · 받았지만 더 받을 자리가 없음
-    P->>W: 다음 조각 쓰기 시도
-    W-->>P: 송신 버퍼도 차서 다 쓰지 못함
+    S->>R: HTML
+    R->>P: Read up to 8 KiB
+    P->>W: Write
+    W->>B: HTML
+    B-->>W: ACK · Win=0
+    Note over P,W: Example · 8 KiB read<br/>3 KiB accepted<br/>5 KiB pending
 
-    alt 프록시 백프레셔 있음
-        P->>P: 현재 조각만 보관하고 다음 읽기를 멈춤
-        S->>R: 수신 버퍼의 남은 자리까지 HTML 도착
-        R-->>S: 윈도우 0 · 더 받을 자리가 없음
-        S->>S: 새 데이터 전송을 멈춤
-    else 프록시 백프레셔 없음
-        loop 서버가 보낼 HTML이 남아 있는 동안
-            R->>P: 다음 조각을 계속 읽음
-            P->>P: 못 보낸 조각을 메모리 대기열에 추가
-            R-->>S: 읽어서 생긴 수신 여유를 알림
-            S->>R: 다음 HTML 전송
-        end
+    alt Backpressure OFF
+        R->>P: Keep reading
+        P->>P: Queue grows
+    else Backpressure ON
+        P->>P: Pause reads
+        R-->>S: Win=0 when full
+        B-->>W: Window update
+        P->>W: Flush 5 KiB
+        R->>P: Resume reads
     end
 ```
-
-프록시가 백엔드 소켓을 읽지 않는 동안 커널의 수신 버퍼까지 차면, 백엔드에 알리는 TCP 수신 윈도우도 줄어듭니다. 업로드에서는 방향이 바뀝니다. 요청 헤더가 완성되면 백엔드에 연결하고, 백엔드 소켓에 현재 조각을 다 쓴 뒤 클라이언트 본문 읽기를 재개합니다. [읽기·쓰기 상태 전환](src/connection.c)
 
 ## 지원 범위
 
@@ -125,67 +267,46 @@ sequenceDiagram
 | 크기와 시간 제한 | 요청 라인·헤더 합계 16 KiB, 요청 대상 4,096바이트, 요청 본문 1 MiB. 백엔드 연결 거부에는 `502`, 응답 헤더 대기 시간(5초) 초과에는 `504`를 반환합니다. |
 | 동시 연결과 종료 | 기본 스레드 풀은 워커 4개와 대기 큐 64칸을 사용합니다. 연결별 프로세스와 이벤트 루프 모드는 각각 최대 64개 연결을 처리합니다. `SIGINT`·`SIGTERM` 수신 시 새 연결 수락을 중단합니다. |
 
-## 데모와 검증 결과
+## Tests
 
-### 백엔드에는 몇 건이 도달하는가?
+통합본에서 확인할 테스트 조건과 기대 결과입니다.
 
-다음 데모는 C 프록시 한 대와 요청을 집계하는 백엔드 두 대를 로컬에서 실행합니다. 클라이언트 한 곳에서 초기 토큰 2개로 HTML, CSS, 같은 공개 데이터 세 건을 차례로 요청합니다.
-
-```sh
-make -B server
-python3 tests/demo_proxy.py
-```
-
-| 요청 | 클라이언트가 받은 응답 | 백엔드 누적 요청 |
-|---|---|---:|
-| `/`, `/style.css` 각 1회 | 로컬 파일에서 각각 `200` | 0건 |
-| `/shared/normal` 첫 요청 | Ketama가 선택한 백엔드에서 `200` | 1건 |
-| 같은 경로 두 번째 요청 | 프록시 캐시에서 `200`, `Age` 헤더 포함 | 1건 |
-| 토큰 보충 전 세 번째 요청 | 프록시에서 `429` | 1건 |
-
-### 서버를 추가하면 몇 개의 IP가 이동하는가?
-
-서로 다른 클라이언트 IP 1,024개를 백엔드 두 대에 배정한 뒤, 같은 주소 구성에 세 번째 백엔드를 추가해 링을 다시 만들었습니다. **351개가 새 서버로 이동했고 673개는 원래 서버에 남았습니다.** 기존 두 서버 사이를 이동한 IP는 0개였습니다. 백엔드 목록을 역순으로 지정해도 결과가 같았습니다. [Ketama 단위 테스트](tests/unit.c)
-
-### 업로드가 밀릴 때 프록시 메모리는 얼마나 늘어나는가?
-
-이전 구현은 요청의 `Content-Length`만큼 메모리를 할당하고 본문 전체를 받은 뒤 백엔드에 연결했습니다. 아래는 같은 크기의 업로드 64개를 동시에 보냈을 때 **프록시 프로세스의 최대 상주 메모리(RSS)**입니다.
-
-| 요청당 본문 | 본문 전체 수신 후 전달 | 8 KiB씩 중계 |
-|---|---:|---:|
-| 4 KiB | 5.73 MiB | 5.48 MiB |
-| 1 MiB | 69.73 MiB | 5.48 MiB |
-
-1 MiB 업로드에서는 최대 RSS가 **64.25 MiB(92.1%)** 줄었습니다. 캐시와 요청 제한을 추가하기 전인 2026년 11월 24일, macOS `poll` 모드에서 백엔드가 모든 요청 헤더를 받고 250 ms 뒤에 본문을 읽도록 한 실험입니다. 표는 조건별 3회 측정의 중앙값입니다. [측정 방법](docs/benchmarks/upload-memory/README.md) · [원시 측정값](docs/benchmarks/upload-memory/results.csv)
-
-### 동시성 모델과 예외 처리
-
-백엔드가 요청 네 건을 받아 응답을 보류한 상태에서 다섯 번째 클라이언트가 로컬 HTML을 요청했습니다. 스레드 풀은 네 워커가 모두 점유되어 **백엔드 응답을 푼 뒤** HTML을 보냈습니다. 연결별 `fork`와 이벤트 루프는 다른 연결을 진행할 수 있어 **백엔드를 풀기 전** HTML 전송을 마쳤습니다.
-
-짧은 정적 파일만 요청한 macOS 실험에서는 스레드 풀 **45,816건/초**, `poll` **40,225건/초**, `fork` **4,567건/초**였습니다. 동시 연결 16개로 `GET /` 300건을 세 번 보낸 중앙값입니다. [모델별 측정 조건과 결과](docs/concurrency-models.md)
-
-| 테스트 조건 | 확인한 결과 |
-|---|---|
-| 한 IP에서 초기 토큰 2개로 동시 요청 5건 | `200` 2건, `429` 3건. 토큰 보충 후 다음 요청 성공 |
-| 캐시 만료 또는 성공한 프록시 POST 이후 같은 GET | 백엔드에서 새 응답 수신 |
-| 업로드와 다운로드 각각 수신 중단 후 재개 | 양방향 모두 512 KiB 본문이 원본과 바이트 단위로 일치 |
-| `POST /echo` 본문을 `he`와 `llo`로 나누어 전송 | 나머지 본문을 기다리는 동안 다른 연결의 `GET /` 40건 성공. 완성된 에코 본문은 `hello` |
-| 백엔드 연결 거부 또는 응답 헤더 시간 초과 | 각각 `502`, `504` 반환. 이어진 정적 파일 요청은 `200` |
-
-[HTTP 파서 단위 테스트](tests/unit.c) · [양방향 중계 테스트](tests/proxy_flow.c) · [모델별 통합 테스트](tests/integration.py)
-
-## 실행
-
-macOS 또는 Linux에서 C11 컴파일러와 Make로 빌드합니다. 다음 설정은 `/api`를 두 백엔드에 분산하고, 응답 캐시와 IP당 초당 10건·순간 최대 20건의 요청 제한을 켭니다.
-
-```sh
-make
-./server -c -r 10 -B 20 8080 ./public '/api@ketama=127.0.0.1:8001,127.0.0.1:8002'
-```
-
-기본 바인드 주소는 `127.0.0.1`, 기본 동시성 모델은 `pthread`입니다. `-b`로 바인드 주소, `-m`으로 모델을 바꿉니다. `epoll`은 Linux, `kqueue`는 macOS·FreeBSD에서 지원합니다. `-c`와 `-r`은 선택 사항이며, 한 대만 지정하는 기존 형식 `/api=127.0.0.1:8001`도 사용할 수 있습니다.
-
-```sh
-make test       # C 단위 테스트와 Python 3 통합 테스트
-make sanitize   # 같은 테스트를 AddressSanitizer와 UndefinedBehaviorSanitizer로 실행
-```
+| 구분 | 테스트 | 검증 조건 | 기대 결과 |
+|---|---|---|---|
+| HTTP | 요청 파싱 | 정상 GET·POST와 여러 번에 나뉘어 도착하는 헤더·본문 | 헤더가 완성될 때까지 기다린 뒤 메서드·경로·본문 파싱 |
+| HTTP | 잘못된 요청 | 잘못된 요청 줄·헤더, HTTP/1.1의 `Host` 오류, 미지원 버전 | 형식·`Host` 오류는 `400`, 미지원 버전은 `505` |
+| HTTP | 길이 경계 | URI·헤더·본문을 각각 한도와 한도 +1바이트로 전송 | 한도까지 처리, 초과 시 각각 `414`·`431`·`413` |
+| HTTP | 본문 길이 검증 | 값이 다른 `Content-Length`를 중복 전송하거나 본문 완료 전에 송신 방향을 닫음 | `400` 반환, 미완성 요청 정리 |
+| HTTP | 미지원 요청 | 처리하지 않는 메서드 또는 전송 인코딩으로 요청 | 오류 응답, 요청 본문은 upstream으로 전달되지 않음 |
+| HTTP | 정적 파일 | HTML·CSS·이미지 및 없는 파일 요청 | 올바른 MIME 타입과 파일 길이, 누락 파일은 `404` |
+| HTTP | 경로 검증 | 잘못된 퍼센트 인코딩, 정적 루트 밖을 가리키는 경로·심볼릭 링크 | 정적 루트 밖의 파일 접근 차단, 잘못된 인코딩은 오류 응답 |
+| HTTP | 동적 응답 | POST 에코, 시간 API, CGI 쿼리·표준 입력 | 에코 바이트 일치, 시간 JSON 반환, CGI에 쿼리·본문 전달 |
+| HTTP | 응답 헤더 | 정상·오류 응답과 HEAD 요청 | 상태 줄과 `Content-Length` 확인, `405`에 `Allow`, HEAD 본문 0바이트 |
+| HTTP | 연결 재사용 | HTTP/1.0·1.1의 `Connection` 설정과 한 소켓의 파이프라인 요청 2건 | 연결 유지·종료 규칙 적용, 파이프라인 응답 2건 순서대로 반환 |
+| HTTP | 느린 연결·종료 | 분할 POST, 느린 다운로드, 무응답 연결, 시그널 종료 | 다른 연결 처리, 무응답 연결 만료, 종료 시 열린 연결 정리 |
+| Proxy | 라우팅 | 겹치는 경로 규칙, 비슷한 경로명, 잘못된 호스트·포트 | 가장 긴 경로 접두사와 경로 경계 적용, 잘못된 설정 거부 |
+| Proxy | 요청 전달 | 쿼리·POST 본문과 연결 전용 헤더가 있는 요청 | 메서드·경로·쿼리·본문 유지, hop-by-hop 헤더 제거, 전달 헤더 확인 |
+| Proxy | 응답·오류 | 백엔드 정상 응답, 중간 `1xx`, 연결 거부, 응답 시간 초과 | 최종 응답 중계, 연결 거부는 `502`, 시간 초과는 `504` |
+| Proxy | Forward Proxy | 전체 URI로 원 서버 지정, 연결 불가한 원 서버 지정 | 대상 호스트·포트·경로로 요청 전달, 연결 거부는 `502` |
+| Cache | Hit·Miss | 같은 공개 GET 반복, 쿼리만 바꿔 GET | 동일 요청은 첫 호출만 백엔드에 도달, 다른 쿼리는 별도 캐시 항목 |
+| Cache | 제외·만료 | 인증·쿠키·Range 요청, `private`·`no-store`·`Vary` 응답, 크기 초과·중간 종료·TTL 만료 | 재사용 조건을 충족하지 못한 응답은 캐시에서 제공되지 않음 |
+| Cache | 교체·무효화 | 캐시 용량 초과, 성공한 POST 뒤 같은 GET | 설정한 교체 정책으로 퇴출, 변경된 리소스의 새 응답 수신 |
+| Cache | ETag | 동일·상이·약한 ETag, 목록·와일드카드로 조건부 GET | 일치 시 본문 없는 `304`, 불일치 시 `200`과 본문 |
+| Cache | 요청 제한 | 한 클라이언트에 토큰 2개로 요청 5건 동시 전송, 다른 키로 추가 요청 | `200` 2건, `429` 3건과 `Retry-After`, 토큰 보충 후 성공, 키별 한도 독립 |
+| Load Balancing | Round-Robin | 동일 가중치·서로 다른 가중치로 요청 분산 | 동일 가중치는 교대 배정, 가중치가 높으면 더 많은 요청 배정 |
+| Load Balancing | Ketama | IP 1,024개로 서버 추가, IP 10,000개로 서버 제거·가중치 조정 | 추가·제거된 서버의 구간만 재배정, 백엔드 목록 순서에 독립, 가중치에 맞춰 분산 |
+| Load Balancing | 장애·복구 | 백엔드 연결 실패 또는 헬스 체크 실패·성공 반복 | 살아 있는 후보로 우회, 실패·복구 기준에 따라 DOWN·UP 전환 |
+| Load Balancing | 백엔드 포화 | 한 서버가 동시 요청 한도에 도달한 뒤 모든 서버를 포화시킴 | 여유 백엔드로 우회, 전부 포화 시 `503`과 `Retry-After`, 로컬 정적 요청은 `200` |
+| Load Balancing | 대기 큐 | 큐 포화, 큐에서 허용 대기 시간 초과 | 각 경우 `503`과 `Retry-After`, 해당 카운터 증가 |
+| Load Balancing | 상태 출력 | 연결 한도에 도달하거나 한도를 끄고 `/_lb/status` 조회 | UP·FULL 및 카운터 표시, 열 정렬 유지, 로컬 요청에만 응답 |
+| Backpressure | 양방향 중계 | 업로드·다운로드 각각 512 KiB를 수신 중단 후 재개 | 양방향 모두 원본과 바이트 단위 일치 |
+| Backpressure | 스트리밍 업로드 | 1 MiB 본문 중 첫 3바이트만 전송해 대기하거나 중간 종료 | 첫 조각부터 백엔드에 전달, 중간 종료 시 백엔드 연결 정리 |
+| Backpressure | 응답·연결 한도 | 6 MiB 다운로드, 응답 크기·동시 중계 한도 초과 | 스트리밍 응답 해시 일치, 응답 크기 초과는 `502`, 연결 한도 초과는 `503`, 완료 후 슬롯 회수 |
+| Backpressure | 느린 TLS 다운로드 | 느린 다운로드 20건 동시 수신 | 전송 완료, 최대 RSS 40 MiB 미만, 연결별 중계 바이트 집계 |
+| Concurrency | 부하·연결 격리 | 백엔드 요청 4건 대기, TLS 연결 40개, 정적 파일 2,000건·동시 50 | 워커 포화와 이벤트 루프의 처리 순서 확인, TLS·정적 파일 요청 실패 0건 |
+| TLS | ClientHello·JA4 | 정상·분할·손상 ClientHello, 여러 TLS 버전·SNI·ALPN | 입력 유형 구분, GREASE 제외 및 정렬 규칙에 따른 참조 지문 일치 |
+| TLS | 연결 정책 | IPv4·IPv6 CIDR, JA4 라벨, 차단 목록과 만료 | 목록 규칙에 따른 연결 판단, 잘못된 설정 시작 시 거부 |
+| TLS | 요청 정책 | 요청 시간창, 반복 오류, 차단 정책, 함정 경로 | 요청·응답 카운터 분리·만료, 정책에 따른 지연·거부 |
+| TLS | Proof of Work | 챌린지 누락·오류·유효 응답, 만료 nonce | 오류·누락 시 `401`, 유효 응답은 `200`, nonce의 유효 시간·클라이언트 범위 검사 |
+| TLS | Bot Auth | 유효·변조·만료 서명, 알 수 없는 키와 미인증 요청 | 인증 여부와 정책에 따라 `200`·`402`·`403` |
+| TLS | 이벤트 루프·타이머 | 타이머 만료·재등록·제거, 느린 연결, 대형 POST, 중복 바인드 | 타이머 순서 유지, 다른 TLS 요청 처리, POST 전달, 중복 바인드 거부 및 종료 시 정리 |
