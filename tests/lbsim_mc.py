@@ -44,9 +44,16 @@ def check_mean(item, theory, samples):
     check(item, theory, mean(samples), max(3 * se, 1e-12))
 
 
-def check_sd(item, theory_sd, samples):
-    """Sample sd vs theory sd, within 10% (relative)."""
-    check(item, theory_sd, sd(samples), 0.10 * theory_sd)
+def check_sd(item, theory_sd, samples, rel=0.10):
+    """Sample sd vs theory sd, within rel (relative): 4% for the large uniform runs, 10% for hashed."""
+    check(item, theory_sd, sd(samples), rel * theory_sd)
+
+
+def check_concentration(item, model, conc, tops):
+    """P(>=80%) within 3 binomial SE of the MC trials, top within 0.03 (contract-3 sections 6 and 9)."""
+    p = model["p_concentrated"]
+    check(f"{item}: P(>=80%)", p, mean(conc), 3 * math.sqrt(max(p * (1 - p), 1e-12) / len(conc)))
+    check(f"{item}: top share", model["top_share"], mean(tops), 0.03)
 
 
 def check_rate(item, target, hits, n, tol):
@@ -130,7 +137,7 @@ def ring_checks(rng, method, points_per_weight, reps):
             conc.append(1.0 if top >= 0.8 else 0.0)
     for i in range(n):
         check_mean(f"{method} uniform arc mean b{i + 1}", th["share"][i], shares[i])
-        check_sd(f"{method} uniform arc sd b{i + 1}", theory_sd_beta(pts[i], total), shares[i])
+        check_sd(f"{method} uniform arc sd b{i + 1}", theory_sd_beta(pts[i], total), shares[i], 0.04)
         check_rate(f"{method} arc95 coverage b{i + 1}", 0.95, inside[i], reps, 0.02)
         # Per member: an exact discrete range covers a bit more than 95% (contract section 7).
         check_rate(f"{method} keys({nkeys}) share95 coverage b{i + 1} (0.93..0.995)", 0.9625,
@@ -141,17 +148,40 @@ def ring_checks(rng, method, points_per_weight, reps):
             if j != r:
                 check_mean(f"{method} remove b{r + 1} (m={pts[r]}): redistribution to b{j + 1}",
                            tr["redistribution"][j], per_j[j])
-        # Limits from contract-3 section 6: m_r <= 64 has the exact formula for P (3 binomial SE over
-        # the placements) and a near-exact top (0.03); m_r > 64 keeps the binomial approximation (0.10).
+        # Contract-3 section 9: the exact formula for every m_r, so P within 3 SE and top within 0.03.
         m = pts[r]
-        exact = m == 1               # one arc: everything goes to one server, always
-        p = tr["p_concentrated"]
-        p_limit = 3 * math.sqrt(max(p * (1 - p), 1e-12) / reps) if m <= 64 else 0.10
-        check(f"{method} remove b{r + 1} (m={m}): P(>=80%)", p, mean(conc), p_limit, exact)
-        check(f"{method} remove b{r + 1} (m={m}): top share", tr["top_share"], mean(tops),
-              0.03 if m <= 64 else 0.10, exact)
-        if exact:
+        if m == 1:                   # one arc: everything goes to one server, always
+            check(f"{method} remove b{r + 1} (m=1): P(>=80%)", tr["p_concentrated"], mean(conc), 0, True)
+            check(f"{method} remove b{r + 1} (m=1): top share", tr["top_share"], mean(tops), 0, True)
             check(f"{method} remove b{r + 1}: MC itself is 1", 1.0, mean(conc), 0.0, True)
+        else:
+            check_concentration(f"{method} remove b{r + 1} (m={m})", tr, conc, tops)
+
+
+def ring_remove_mc(rng, method, weights, points_per_weight, r, reps):
+    """Concentration and top of removing r, on uniform placements of an arbitrary weight list."""
+    n = len(weights)
+    pts = [points_per_weight * w for w in weights]
+    conc, tops = [], []
+    for _ in range(reps):
+        pos, own = uniform_placement(rng, pts)
+        frac = removed_arcs(pos, own, n, r)
+        top = max(frac[j] for j in range(n) if j != r)
+        tops.append(top)
+        conc.append(1.0 if top >= 0.8 else 0.0)
+    tr = lbsim.theory(method, list(weights), 254, remove=r)
+    check_concentration(f"{method} {','.join(map(str, weights))} remove b{r + 1} (m={pts[r]})", tr, conc, tops)
+
+
+def ring_add_mc(rng, method, points_per_weight, reps):
+    """--add by simulation: a new weight-1 backend's arc share is the moved fraction."""
+    pts = [points_per_weight * w for w in WEIGHTS] + [points_per_weight]
+    moved = []
+    for _ in range(reps):
+        pos, own = uniform_placement(rng, pts)
+        moved.append(arc_shares(pos, own, len(pts))[-1])
+    check_mean(f"{method} add (uniform placements): moved", lbsim.theory(method, list(WEIGHTS), 254, add=True)["moved"],
+               moved)
 
 
 # --- hashed rings: lbsim.build_ring with host names that change per seed ------------------------
@@ -227,7 +257,10 @@ def hrw_score(key_host_hash, w):
 def hrw_hashes(key, hosts):
     """ring_hashstr(f"{key}|{host}") for every host, sharing the FNV-1a pass over the common prefix
     (the hash is defined in contract-3 section 5; lbsim.ring_hashstr is checked against it below)."""
-    prefix = os.path.commonprefix(hosts)
+    prefix = hosts[0]
+    for host in hosts[1:]:
+        while not host.startswith(prefix):
+            prefix = prefix[:-1]
     h = 2166136261
     for byte in f"{key}|{prefix}".encode():
         h = ((h ^ byte) * 16777619) & 0xFFFFFFFF
@@ -333,17 +366,135 @@ def keyed_checks(name, pick_before, pick_after, nkeys, r):
                   3 * math.sqrt(q * (1 - q) / len(from_r)))
 
 
+def local_hosts(count):
+    return [f"127.0.0.1:{8001 + i}" for i in range(count)]
+
+
+def keyed_concentration_checks(rng, key_hashes, trials=3000, hrw_trials=2000, nkeys=254):
+    """Concentration and top of mod / hrw / random when r leaves (contract-3 section 9.3).
+    mod: exact over hashed keys. hrw / random: trials of K keys, conditioned on r having keys."""
+    for weights, r in (((3, 1, 1), 1), ((1, 1, 4, 1, 1), 0)):
+        n = len(weights)
+        rest = [j for j in range(n) if j != r]
+        what = f"{','.join(map(str, weights))} remove b{r + 1}"
+        # mod over 200k hashed keys: where r's keys go is fixed by the slot lists, so top is a fraction.
+        slots = [i for i, w in enumerate(weights) for _ in range(w)]
+        after = [i for i, w in enumerate(weights) if i != r for _ in range(w)]
+        dest = [after[h % len(after)] for h in key_hashes if slots[h % len(slots)] == r]
+        top = max(dest.count(j) for j in rest) / len(dest)
+        th = lbsim.theory("mod", list(weights), nkeys, remove=r)
+        check(f"mod {what}: top share (200k hashed keys)", th["top_share"], top, 0.01)
+        check(f"mod {what}: P(>=80%) (0 or 1)", th["p_concentrated"], float(top >= 0.8), 0, True)
+
+        def trial_stats(pick_dests, count=trials):
+            conc, tops = [], []
+            for _ in range(count):
+                d = pick_dests()
+                if not d:            # r had no key in this sample: excluded (conditional on n > 0)
+                    continue
+                t = max(d.count(j) for j in rest) / len(d)
+                tops.append(t)
+                conc.append(1.0 if t >= 0.8 else 0.0)
+            return conc, tops
+
+        # hrw, pure model: every key draws u ~ U(0,1) per backend and scores -w / ln u, with fresh draws in
+        # every trial. This checks the formula alone; that the real hash behaves like U(0,1) is checked
+        # separately on 200k hashed keys (hrw share / moved / redistribution below). Resampling a fixed
+        # pool of hashed keys is not an independent sample: the pool's own error in where r's keys go is
+        # amplified ~5x in P(>=80%) (it gave 0.247 against the exact 0.220 for 3,1,1).
+        rnd = rng.random
+
+        def hrw_dests():
+            out = []
+            for _ in range(nkeys):
+                score = [-w / math.log(1.0 - rnd()) for w in weights]
+                if max(range(n), key=score.__getitem__) == r:
+                    out.append(max(rest, key=score.__getitem__))
+            return out
+        conc, tops = trial_stats(hrw_dests, hrw_trials)
+        check_concentration(f"hrw {what} (K={nkeys}, {len(conc)} trials)", lbsim.theory("hrw", list(weights), nkeys, remove=r),
+                            conc, tops)
+        # random: each key draws by weight; r's keys draw again among the rest by weight.
+        rest_w = [weights[j] for j in rest]
+
+        def random_dests():
+            hit = rng.choices(range(n), weights, k=nkeys).count(r)
+            return rng.choices(rest, rest_w, k=hit) if hit else []
+        conc, tops = trial_stats(random_dests)
+        check_concentration(f"random {what} (K={nkeys}, {len(conc)} trials)",
+                            lbsim.theory("random", list(weights), nkeys, remove=r), conc, tops)
+
+
+def even_top_checks(rng, nkeys=254):
+    """hrw / random top when q is even (1x8, remove b1). The theory's top is the independent-binomial
+    approximation (≈), known to come out low; check the direction and the size of that bias."""
+    weights, r = [1] * 8, 0
+    n = len(weights)
+    rest = list(range(1, n))
+    rnd = rng.random
+
+    def hrw_dests():                 # pure model, as in keyed_concentration_checks
+        out = []
+        for _ in range(nkeys):
+            score = [-w / math.log(1.0 - rnd()) for w in weights]
+            if max(range(n), key=score.__getitem__) == r:
+                out.append(max(rest, key=score.__getitem__))
+        return out
+
+    def random_dests():
+        hit = rng.choices(range(n), weights, k=nkeys).count(r)
+        return rng.choices(rest, k=hit) if hit else []
+
+    for method, dests, trials in (("hrw", hrw_dests, 300), ("random", random_dests, 1500)):
+        tops = []
+        for _ in range(trials):
+            d = dests()
+            if d:                    # conditional on r having keys
+                tops.append(max(d.count(j) for j in rest) / len(d))
+        approx = lbsim.theory(method, weights, nkeys, remove=r)["top_share"]
+        mc = mean(tops)
+        what = f"{method} 1x8 remove b1 (K={nkeys}, {len(tops)} trials): top"
+        check(f"{what}: approximation <= MC (biased low)", 1, int(approx <= mc), 0, True)
+        check(f"{what}: MC - approximation <= 0.05", approx, mc, 0.05)
+
+
+def keyed_add_checks(rng, nkeys=60_000):
+    """--add by simulation for hrw (a new host joins the race). The random row is a tautology on purpose:
+    lbsim defines random --add as "the new server takes each key with probability 1/(W+1)", so drawing
+    that only re-checks the definition against theory's number, not an independent property."""
+    hosts = [f"h:{i + 1}" for i in range(len(WEIGHTS) + 1)]
+    weights = list(WEIGHTS) + [1]
+    moved = 0
+    for i in range(nkeys):
+        score = [hrw_score(x, w) for x, w in zip(hrw_hashes(f"a{i}", hosts), weights)]
+        moved += max(range(len(weights)), key=score.__getitem__) == len(WEIGHTS)
+    p = lbsim.theory("hrw", list(WEIGHTS), 254, add=True)["moved"]
+    check(f"hrw add ({nkeys // 1000}k hashed keys): moved", p, moved / nkeys, 3 * math.sqrt(p * (1 - p) / nkeys))
+    total = sum(WEIGHTS) + 1
+    moved = sum(rng.randrange(total) == 0 for _ in range(nkeys))
+    p = lbsim.theory("random", list(WEIGHTS), 254, add=True)["moved"]
+    check(f"random add ({nkeys // 1000}k draws of its own 1/(W+1) rule, definition check): moved", p,
+          moved / nkeys, 3 * math.sqrt(p * (1 - p) / nkeys))
+
+
 def main():
     t0 = time.monotonic()
     rng = random.Random(20261125)
     for method, ppw, reps in (("ring1", 1, 4000), ("ring10", 10, 3000), ("ketama", 160, 2000)):
         ring_checks(rng, method, ppw, reps)
-    for method, ppw, reps in (("ring1", 1, 1500), ("ring10", 10, 800), ("ketama", 160, 250)):
+    for method, ppw, reps in (("ring1", 1, 1000), ("ring10", 10, 600), ("ketama", 160, 250)):
         hashed_ring_checks(rng, method, ppw, reps)
+    ring_remove_mc(rng, "ketama", [1] * 8, 160, 0, 600)        # m_r = 160: the old approximation's range
+    for method, ppw, reps in (("ring1", 1, 3000), ("ring10", 10, 2000), ("ketama", 160, 800)):
+        ring_add_mc(rng, method, ppw, reps)
 
     nkeys = 200_000
     keys = [f"k{i}" for i in range(nkeys)]
-    mod_checks([lbsim.ring_hashstr(k) for k in keys])
+    key_hashes = [lbsim.ring_hashstr(k) for k in keys]
+    mod_checks(key_hashes)
+    keyed_concentration_checks(rng, key_hashes)
+    keyed_add_checks(rng)
+    even_top_checks(rng)
 
     exact_range_checks()
 
@@ -351,7 +502,9 @@ def main():
     r = 1
     sample = [hrw_hashes(k, HOSTS) == [lbsim.ring_hashstr(f"{k}|{h}") for h in HOSTS] for k in keys[:2000]]
     check("hrw: shared-prefix hash = lbsim.ring_hashstr (2000 keys)", 1, int(all(sample)), 0, True)
-    scores = [[hrw_score(x, w) for x, w in zip(hrw_hashes(k, HOSTS), WEIGHTS)] for k in keys]
+    # Host names only need to differ; short ones make the 200k x 5 hashes cheaper (same hash, same rule).
+    short = [f"h:{i + 1}" for i in range(len(WEIGHTS))]
+    scores = [[hrw_score(x, w) for x, w in zip(hrw_hashes(k, short), WEIGHTS)] for k in keys]
     keyed_checks("hrw", lambda k: max(range(len(WEIGHTS)), key=scores[k].__getitem__),
                  lambda k, old: max((j for j in range(len(WEIGHTS)) if j != r), key=scores[k].__getitem__),
                  nkeys, r)

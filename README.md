@@ -5,16 +5,56 @@
 
 Status: active
 
+## 처음 온 개발자용 요약
+
+| 항목 | 내용 | 근거 |
+|---|---|---|
+| 목적 | POSIX 소켓만으로 만든 멀티스레드 C 웹 서버입니다. 정적 파일, CGI, Forward/Reverse Proxy, 로드 밸런싱(Round-Robin, Ketama), 헬스 체크, back-pressure를 구현합니다. | 이 문서 |
+| 설치 | Linux: `build-essential curl apache2-utils python3 netcat-openbsd`. Windows: Docker Desktop과 **Git Bash**. 이미지(`mini-webserver-tools`)는 `scripts/dev.sh`가 처음 실행될 때 자동으로 만듭니다. | `tools/Dockerfile`, `scripts/dev.sh` |
+| 빌드 | `make`를 실행하면 `./webserver`가 생깁니다. 중간 파일은 `build/`에 쌓입니다. | `Makefile` |
+| 로컬 실행 | 아래 "실행" 절의 백엔드 2대 + front 예시를 봅니다. LB 데모 전체를 띄우려면 `bash scripts/lb.sh up`을 씁니다(아래 "LB 데모"). | `scripts/lb.sh` |
+| 테스트 | `make test`(단위), `make asan`(ASan/UBSan), `bash scripts/functional_test.sh`(e2e·부하). Windows에서는 각 명령 앞에 `bash scripts/dev.sh`를 붙입니다. | `Makefile`, `scripts/functional_test.sh` |
+| 배포 | 정해진 배포 절차가 없습니다. 로컬과 컨테이너에서만 실행합니다. | 저장소에 배포 설정 없음 |
+| 환경 변수 | 아래 "환경 변수" 절을 봅니다. | `scripts/lb.sh`, `Makefile` |
+| 먼저 볼 파일 | `src/main.c` → `src/server.c`(요청 분배) → `src/route.c`(로드 밸런싱) → `src/proxy.c` → `src/health.c`. 데모는 `scripts/lb.sh`에서 시작합니다. 전체 목록은 아래 "Map" 절에 있습니다. | 이 문서 |
+
+자주 막히는 곳:
+- **Windows PowerShell의 `bash`는 WSL입니다.** 기본 배포판이 `docker-desktop`이면 `herdr-app`이나 `pwd -W`를 찾지 못해 스크립트가 실패합니다. Git Bash를 직접 실행합니다.
+  ```powershell
+  & "C:\Program Files\Git\bin\bash.exe" scripts/dev.sh make test
+  ```
+- **`make asan` 뒤의 `./webserver`는 ASan 빌드입니다.** `make`는 이 바이너리를 최신으로 보고 다시 빌드하지 않습니다. 일반 빌드가 필요하면 `make clean all`을 실행합니다.
+- **다른 환경(예: devcontainer)에서 빌드한 `./webserver`는 glibc 버전이 달라** `GLIBC_2.38 not found`로 실행되지 않을 수 있습니다. 이때도 `make clean all`을 실행합니다.
+- **포트가 겹칩니다.** `functional_test.sh`와 `lb.sh`는 둘 다 `:8080`을 씁니다. 같은 컨테이너에서 실행하려면 먼저 `scripts/lb.sh down`을 실행합니다. `scripts/dev.sh`는 실행할 때마다 새 컨테이너를 쓰므로 이 문제가 없습니다.
+- **Windows 호스트에서는 서버에 접속할 수 없습니다.** 서버는 컨테이너 안에서 돌고, `/_lb/status`는 localhost에서 온 요청에만 응답합니다. 그래서 `curl`, `loadgen.py`, `mini-web`은 컨테이너 안에서 실행합니다.
+
+## 환경 변수
+
+| 변수 | 기본값 | 쓰는 곳 | 의미 |
+|---|---|---|---|
+| `LB_BACKENDS` | 3 | `lb.sh up` | 처음 띄울 백엔드 수(1..8). 멤버 목록(`.lb/backends`)이 없을 때만 씁니다. |
+| `LB_WEIGHTS` | 모두 1 | `lb.sh up` | 백엔드별 가중치(예: `1,3,1`, 각 1..4) |
+| `LB_CAP` | 2 | `lb.sh` front | 백엔드당 동시 프록시 요청 상한(`-B`, 0 = 끔) |
+| `LB_WAIT` | 2000 | `lb.sh` front | 대기 큐 503 기준(ms, `-W`, 0 = 끔) |
+| `LB_TIMEOUT` | 1000 | `lb.sh` front | 프록시 타임아웃(ms, `-T`). `bp_demo.sh`는 3000으로 실행합니다. |
+| `LB_THREADS` | 8 | `lb.sh` front | 워커 스레드 수(`-t`) |
+| `LB_STRATEGY` | `ketama` | `lb.sh` front | `ketama` 또는 `rr` |
+| `LB_TEST_IN_COPY` | (없음) | `lb_test.sh` | 1이어야 실행됩니다. 저장소 복사본에서만 돌리기 위한 안전장치입니다. |
+| `CC`, `CFLAGS` | `cc`, `-std=c11 -O2 -g ...` | `Makefile` | 컴파일러와 플래그 |
+| `MSYS_NO_PATHCONV` | (없음) | Git Bash | 1이면 Git Bash가 `/src` 같은 인자를 Windows 경로로 바꾸지 않습니다. `docker` 명령을 직접 실행할 때 붙입니다. |
+
+비밀 값(토큰, 비밀번호)은 쓰지 않습니다.
+
 ## 실행
 
-Linux(또는 WSL2, Docker)에서 빌드합니다. Windows 호스트에서는 `scripts/dev.sh`가 Ubuntu 컨테이너 안에서 명령을 실행합니다.
+Linux(또는 WSL2, Docker)에서 빌드합니다. Windows 호스트에서는 `scripts/dev.sh`가 Ubuntu 컨테이너 안에서 명령을 실행합니다. 이 컨테이너는 명령이 끝나면 지워지므로, 서버를 띄워 두고 직접 접속해 보려면 `scripts/herdr_lab.sh`(herdr 앱 필요)나 `docker run -it`으로 셸을 엽니다.
 
 ```sh
 make                      # ./webserver 빌드
-make test                 # 단위 테스트 (파서, MIME, 라우팅, 프록시)
-make asan                 # AddressSanitizer + LeakSanitizer 빌드로 테스트
-bash scripts/functional_test.sh   # curl / nc / ab 기능·부하 테스트
-# Windows: bash scripts/dev.sh make test
+make test                 # 단위 테스트 (tests/test_*.c: config, health, http, mime, proxy, reload, route)
+make asan                 # AddressSanitizer + UndefinedBehaviorSanitizer 빌드로 다시 빌드하고 테스트
+bash scripts/functional_test.sh   # curl / nc / ab 기능·부하 테스트, reload 검사, 시뮬레이터 검증
+# Windows(Git Bash): bash scripts/dev.sh make test
 ```
 
 ```sh
@@ -41,7 +81,7 @@ curl -x http://127.0.0.1:8080 http://127.0.0.1:8001/          # Forward Proxy
 
 ## LB 데모
 
-`scripts/lb.sh`가 프론트 `:8080`(`/echo@ketama`)과 백엔드 b1..b3(`:8001..:8003`)을 띄웁니다. pid 파일과 로그는 `.lb/`에 둡니다.
+`scripts/lb.sh`가 프론트 `:8080`(`/echo@ketama`)과 백엔드(기본 b1..b3, `:8001..:8003`; bN은 `:8000+N`)를 띄웁니다. pid 파일과 로그는 `.lb/`에 둡니다. 아래 예시의 "moved 약 1/3"이나 라우팅 순서는 기본값(가중치 1인 백엔드 3개) 기준입니다.
 
 ```sh
 bash scripts/lb.sh up        # 전부 시작
@@ -102,7 +142,7 @@ mini-web client stop
 | `mod` | `hash % 슬롯 수`(가중치만큼 슬롯을 펼침). 서버 수가 바뀌면 키 대부분이 이동합니다. |
 | `rr` | 가중치를 반영한 원형 리스트(라운드 로빈). 키 고정이 없어 키 단위 이동이 정의되지 않습니다. |
 | `random` | 키마다 한 번 가중치 비례 확률로 서버를 정해 두는 배치(`--seed N`, 기본 1). |
-| `ring1`, `ring10` | 서버당 점 1개 또는 10개 × weight인 ring. 점이 적으면 몫이 불균형합니다. 빠진 서버의 arc는 저마다 ring에서 다음 생존 점의 서버로 가므로 목적지가 여러 서버로 나뉠 수 있습니다. 전부 한 서버로 가는 것이 보장되는 경우는 빠진 서버의 arc가 하나일 때(ring1, 가중치 1)뿐입니다. |
+| `ring1`, `ring10` | 서버당 점 1개 또는 10개 × weight인 ring. 점이 적으면 몫이 불균형합니다. 빠진 서버의 arc는 저마다 ring에서 다음 생존 점의 서버로 가므로 목적지가 여러 서버로 나뉠 수 있습니다. 전부 한 서버로 가는 것이 보장되는 경우는 빠진 서버의 arc가 하나일 때(ring1, 가중치 1)와 남는 서버가 하나일 때뿐입니다. |
 | `ketama` | 현재 front와 같은 구현(같은 해시, 서버당 160 × weight 점). |
 | `hrw` | 가중 rendezvous 해싱. |
 
@@ -119,19 +159,22 @@ mini-web client stop
 | 방식 | 몫 | 제거 시 이동(moved) | 재분배·쏠림 |
 |---|---|---|---|
 | `rr` | 정확히 p_i, 편차 0 | 정의 안 됨(키 고정 없음) | 정확히 q_j. 쏠림은 max q_j ≥ 0.8이면 1 |
-| `random` | p_i, keys sd √(p(1−p)/K) | p_r, sd √(p_r(1−p_r)/K) | 키마다 q_j. P(쏠림) = Σ_j P(Bin(n, q_j) ≥ ⌈0.8n⌉), n = round(K·p_r). 요청마다 새로 뽑으면 같은 키의 두 요청이 다른 서버로 갈 확률은 1 − Σp_i² |
+| `random` | p_i, keys sd √(p(1−p)/K) | p_r, sd √(p_r(1−p_r)/K) | 키마다 q_j. r의 키 수 n은 Binomial(K, p_r)이므로 P(쏠림) = Σ_{n≥1} Bin(n; K, p_r)·Σ_j P(Bin(n, q_j) ≥ ⌈0.8n⌉)을 n ≥ 1의 질량으로 나눈 값(r에 키가 있을 때의 조건부 확률, 정확). 요청마다 새로 뽑으면 같은 키의 두 요청이 다른 서버로 갈 확률은 1 − Σp_i² |
 | `mod` | p_i, keys sd √(p(1−p)/K) | **정확**: 0..lcm(S, S′)−1의 나머지를 전부 세어 owner(x mod S) ≠ owner′(x mod S′)인 비율 | 같은 전수 계산으로 정확 |
-| `ring1`/`ring10`/`ketama` (점 m_i = P·w_i, M = P·W) | arc 몫 ~ Beta(m_i, M−m_i): 기대 p_i, 분산 m(M−m)/(M²(M+1)), 95%는 Beta 분위수. keys 개수는 정확히 BetaBinomial(K, m_i, M−m_i)(분산 = 배치 분산 + (p(1−p) − 배치 분산)/K), 95%는 그 분위수 | 기대 p_r | 기대는 정확히 q_j(점 주인의 순서가 무작위라 r의 각 arc는 다음 점의 주인 j에게 확률 m_j/(M−m_r)로 감). 쏠림: r의 arc 중 j에게 가는 개수 c_j ~ BetaBinomial(m_r, n_j, N−n_j)(N = M−m_r, n_j = P·w_j; 연속된 r 점은 함께 다음 서버로 감), arc 크기는 Dirichlet라 j의 몫 F_j ~ Beta(c_j, m_r−c_j)(양 끝: c_j = 0이면 F_j = 0, c_j = m_r이면 F_j = 1). P(쏠림) = Σ_j P(F_j ≥ 0.8)로 정확. m_r > 64이면 계산량 때문에 Σ_j P(Bin(m_r, q_j) ≥ ⌈0.8·m_r⌉)로 근사(≈). r의 각 arc는 다음 생존 점의 서버로 따로 가므로 목적지가 나뉠 수 있고, **m_r = 1일 때만 정확히 1**(arc가 하나라 전부 한 서버로 감) |
+| `ring1`/`ring10`/`ketama` (점 m_i = P·w_i, M = P·W) | arc 몫 ~ Beta(m_i, M−m_i): 기대 p_i, 분산 m(M−m)/(M²(M+1)), 95%는 Beta 분위수. keys 개수는 정확히 BetaBinomial(K, m_i, M−m_i)(분산 = 배치 분산 + (p(1−p) − 배치 분산)/K), 95%는 그 분위수 | 기대 p_r | 기대는 정확히 q_j(점 주인의 순서가 무작위라 r의 각 arc는 다음 점의 주인 j에게 확률 m_j/(M−m_r)로 감). 쏠림: r의 arc 중 j에게 가는 개수 c_j ~ BetaBinomial(m_r, n_j, N−n_j)(N = M−m_r, n_j = P·w_j; 연속된 r 점은 함께 다음 서버로 감), arc 크기는 Dirichlet라 j의 몫 F_j ~ Beta(c_j, m_r−c_j)(양 끝: c_j = 0이면 F_j = 0, c_j = m_r이면 F_j = 1). P(쏠림) = Σ_j P(F_j ≥ 0.8)로 정확. 이 식을 모든 m_r에 씁니다. r의 각 arc는 다음 생존 점의 서버로 따로 가므로 목적지가 나뉠 수 있고, **m_r = 1이거나 남는 서버가 하나일 때만 정확히 1**(arc가 하나이거나 받을 서버가 하나뿐이라 전부 한 서버로 감) |
 | `hrw` | 정확히 p_i(지수 경주) | p_r(r의 키만 움직임) | 키마다 q_j. 쏠림은 `random`과 같은 식 |
 
 "가장 많이 떠안는 서버의 몫"(top)은 경우에 따라 정확하기도 하고 근사(`≈`)이기도 합니다.
 - 정확: `mod`(전수 계산한 재분배의 최댓값), `rr`(max q_j), 남는 서버가 하나이거나 m_r = 1인 ring(100%).
-- 중점 적분(`≈`), ring에서 m_r ≤ 64: top = ∫₀¹ P(max F ≥ t) dt를 100개 중점으로 계산합니다. t ≥ 0.5 구간은 Σ_j P(F_j ≥ t)로 정확하고, t < 0.5 구간은 min(1, Σ_j P(F_j ≥ t))라는 상한을 씁니다.
-- 독립 이항 근사(`≈`), ring에서 m_r > 64와 `hrw`/`random`: X_j ~ Bin(n, q_j)를 서로 독립으로 보고 E[max_j X_j]/n으로 계산합니다(ring은 n = m_r, hrw/random은 n = round(K·p_r)).
+- 중점 적분(`≈`), ring(모든 m_r): top = ∫₀¹ P(max F ≥ t) dt를 100개 중점으로 계산합니다. t ≥ 0.5 구간은 Σ_j P(F_j ≥ t)로 정확하고, t < 0.5 구간은 min(1, Σ_j P(F_j ≥ t))라는 상한을 씁니다.
+- 독립 이항 근사(`≈`), `hrw`/`random`: n개 키에서 X_j ~ Bin(n, q_j)를 서로 독립으로 보고 E[max_j X_j]/n을 구한 뒤, n ~ Binomial(K, p_r)(n ≥ 1)에 대해 평균합니다.
+  - 이 근사는 실제보다 **낮게** 나오고, r의 키 수 n(≈ K·p_r)이 작을수록 차이가 커집니다. 실제로는 X_j의 합이 n으로 묶여 있어 서로 독립이 아니기 때문입니다. 예: 가중치 1×8에서 b1 제거는 K = 254일 때 근사 0.23 대 MC 0.24, `--keys 10`일 때 근사 0.57 대 MC 0.77입니다.
+  - 남는 서버가 하나면 top = P(쏠림) = 100%로 정확합니다(`≈` 없음).
+  - `--keys`가 매우 크면(10⁶ 이상) hrw/random의 이론 계산(n에 대한 합)이 수 초에서 수십 초 걸립니다(가중치 1,3,1, `--keys 1000000`에서 약 60초).
 
 처음에는 ring 쏠림도 "arc를 같은 크기의 독립 배정"으로 근사했습니다. 그런데 몬테카를로에서 ring1, w=3 제거의 P(쏠림)이 근사 0.088 대 실제 0.46으로 크게 틀려, 위의 정확식으로 바꿨습니다.
 
-이 식들은 `tests/lbsim_mc.py`가 lbsim의 식을 쓰지 않는 독립 몬테카를로로 검증합니다(고정 시드, 단독 약 13초, `functional_test.sh`가 실행). 확인하는 항목은 다음과 같습니다.
+이 식들은 `tests/lbsim_mc.py`가 lbsim의 식을 쓰지 않는 독립 몬테카를로로 검증합니다(고정 시드, 단독 약 20초, `functional_test.sh` 안에서는 서버와 함께 돌아 약 27초). 확인하는 항목은 다음과 같습니다.
 - 무작위 ring 배치 수천 개의 arc 몫 평균, sd, 멤버별 arc 95%·keys 95% 적중률.
 - 해시로 만든 ring의 arc 몫, 그리고 키 254개 keys 몫의 sd.
 - 작은 K(7, 20)에서 keys·moved 95% 범위가 따로 계산한 정확한 Binomial/BetaBinomial 분위수와 완전히 같은지.
@@ -155,6 +198,10 @@ bash scripts/bp_demo.sh --backends 5 --target b4 --weights 1,2,1,3,1 --scenarios
 ```
 
 `scripts/lb_test.sh`는 lb.sh/mini-web/bp_demo 회귀 검사입니다. `.lb/`와 :8001..:8080을 쓰므로 저장소 복사본 컨테이너에서만 실행합니다(`LB_TEST_IN_COPY=1`이 없으면 거부, 명령은 파일 머리말 참고).
+
+`bp_demo.sh`도 실행할 때마다 `lb.sh down`/`up`을 반복하므로, 같은 컨테이너에서 돌고 있던 LB 데모는 꺼집니다.
+
+### back-pressure 수동 데모
 
 백엔드당 프록시 요청을 2개로 제한한 상태에서 b2를 일시 정지합니다. 부하가 계속되는 동안 b2는 `UP`, `2/2 FULL`로 표시되고 `SHED`가 증가합니다. `GET /`은 `200`을 반환하며, b2의 슬롯이 가득 차면 해당 키의 요청은 다음 백엔드로 넘어갑니다.
 

@@ -142,24 +142,57 @@ def beta_quantile(a: int, b: int, q: float) -> float:
 
 
 def top_expected(n, probabilities):
-    if len(probabilities) == 1:
-        return 1.0
     # Hoeffding bounds the omitted tails of the maximum below float precision.
-    mean = n * max(probabilities)
-    radius = math.sqrt(n * math.log(1e17 * len(probabilities)) / 2)
+    highest = max(probabilities)
+    bound = math.log(1e17 * len(probabilities))
+    gap = math.sqrt(2 * bound / n)
+    # Destinations far below the largest mean cannot overtake it to this precision.
+    groups = Counter(p for p in probabilities if highest - p <= gap)
+    if sum(groups.values()) == 1:
+        return highest
+    mean = n * highest
+    radius = math.sqrt(n * bound / 2)
     lo = max(0, math.floor(mean - radius))
     hi = min(n - 1, math.ceil(mean + radius))
-    cdf = [1 - binomial_tail(n, p, lo) for p in probabilities]
-    log_mass = [log_binomial_mass(n, p, lo) for p in probabilities]
-    log_odds = [math.log(p) - math.log1p(-p) for p in probabilities]
+    cdf = [1 - binomial_tail(n, p, lo) for p in groups]
+    log_mass = [log_binomial_mass(n, p, lo) for p in groups]
+    log_odds = [math.log(p) - math.log1p(-p) for p in groups]
+    multiplicities = list(groups.values())
     total = lo
     for k in range(lo, hi + 1):
         step = math.log((n - k) / (k + 1))
+        combined = 1.0
         for i, odds in enumerate(log_odds):
             cdf[i] = min(1.0, cdf[i] + math.exp(log_mass[i]))
             log_mass[i] += step + odds
-        total += 1 - math.prod(cdf)
+            combined *= cdf[i] ** multiplicities[i]
+        total += 1 - combined
     return total / n
+
+
+@lru_cache(maxsize=256)
+def keyed_concentration(keys, removed_share, probabilities):
+    lo, hi = 1, keys
+    if keys > 512:
+        mean = keys * removed_share
+        radius = 8 * math.sqrt(mean * (1 - removed_share))
+        lo = max(lo, math.floor(mean - radius))
+        hi = min(hi, math.ceil(mean + radius))
+    log_mass = log_binomial_mass(keys, removed_share, lo)
+    log_odds = math.log(removed_share) - math.log1p(-removed_share)
+    groups = Counter(probabilities)
+    mass = concentrated = top = 0.0
+    for n in range(lo, hi + 1):
+        weight = math.exp(log_mass)
+        threshold = (4 * n + 4) // 5
+        conditional = sum(copies * binomial_tail(n, p, threshold) for p, copies in groups.items())
+        mass += weight
+        concentrated += weight * conditional
+        top += weight * top_expected(n, probabilities)
+        if n < hi:
+            log_mass += math.log((keys - n) / (n + 1)) + log_odds
+    # Normalize after excluding zero removed keys and truncating the outer tails.
+    return min(1.0, concentrated / mass), top / mass
 
 
 def ring_concentration(removed, remaining_points):
@@ -178,14 +211,15 @@ def ring_concentration(removed, remaining_points):
 
     def sum_tails(t):
         # Beta(c, removed - c) survival is Bin(removed - 1, t) CDF at c - 1.
-        term = (1 - t) ** (removed - 1)
-        odds = t / (1 - t)
+        log_failure = math.log1p(-t)
+        log_term = (removed - 1) * log_failure
+        log_odds = math.log(t) - log_failure
         cdf = 0.0
         total = mass[-1]  # c == removed has all the arc mass.
         for c, probability in enumerate(mass[:-1], 1):
-            cdf += term
+            cdf += math.exp(log_term)
             total += probability * cdf
-            term *= (removed - c) / c * odds
+            log_term += math.log((removed - c) / c) + log_odds
         return min(1.0, total)
 
     top = math.fsum(sum_tails((i + 0.5) / 100) for i in range(100)) / 100
@@ -315,21 +349,16 @@ def theory(method: str, weights: list[int], keys: int,
             result.update(top_share=top, p_concentrated=float(top >= 0.8))
             return result
         result.update(moved=share[remove], moved95=share95[remove])
-        n = points * weights[remove] if points else round(keys * share[remove])
-        if (points and n == 1) or (len(probabilities) == 1 and n > 0):
+        if len(probabilities) == 1 or points * weights[remove] == 1:
             result.update(top_share=1.0, p_concentrated=1.0)
-        elif points and n <= 64:
-            remaining_points = [points * w for i, w in enumerate(weights) if i != remove]
-            concentration, top = ring_concentration(n, remaining_points)
+        else:
+            if points:
+                remaining_points = [points * w for i, w in enumerate(weights) if i != remove]
+                concentration, top = ring_concentration(points * weights[remove], remaining_points)
+            else:
+                concentration, top = keyed_concentration(keys, share[remove], tuple(sorted(probabilities)))
             result.update(p_concentrated=concentration, top_share=top)
             result["approx"].add("top_share")
-        elif n:
-            threshold = (4 * n + 4) // 5
-            concentration = sum(binomial_tail(n, p, threshold) for p in probabilities)
-            result.update(p_concentrated=min(1.0, concentration), top_share=top_expected(n, probabilities))
-            result["approx"].add("top_share")
-            if points:
-                result["approx"].add("p_concentrated")
     elif add and method != "rr":
         moved = 1 / (total + 1)
         moved95 = (beta_binomial_interval(keys, points, points * total) if points
@@ -491,8 +520,9 @@ def compare(method, before, after, nkeys, remove, seed):
                     fraction = received / removed if removed else 0
                     mark = " <- concentrated" if fraction >= 0.8 else ""
                     print(f"    {backend.name}  {received} ({fraction:.1%}){mark}  E {expected:.1%}")
+            condition = " | removed has keys" if method in ("hrw", "random") else ""
             print(f"  E top {theory_value(model, 'top_share')}  "
-                  f"P(≥80%) {theory_value(model, 'p_concentrated')}")
+                  f"P(≥80%{condition}) {theory_value(model, 'p_concentrated')}")
     print()
     return model
 
@@ -556,7 +586,9 @@ def self_test():
     concentration, top = ring_concentration(2, [1, 1])
     assert math.isclose(concentration, 0.8) and math.isclose(top, 11 / 12)
     assert theory("ring10", [3, 1, 2], 254, remove=0)["approx"] == {"top_share"}
-    assert theory("ketama", [3, 1, 2], 254, remove=0)["approx"] == {"p_concentrated", "top_share"}
+    assert theory("ketama", [3, 1, 2], 254, remove=0)["approx"] == {"top_share"}
+    concentration, top = keyed_concentration(1, 0.2, (0.5, 0.5))
+    assert math.isclose(concentration, 1) and math.isclose(top, 0.75)
     for method in POINTS:
         model = theory(method, [1, 2], 254, remove=1)
         assert model["top_share"] == model["p_concentrated"] == 1
