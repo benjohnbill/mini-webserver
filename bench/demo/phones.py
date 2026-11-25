@@ -5,8 +5,12 @@ Each Phone opens one TLS connection to rproxy, sends one GET, and reads the
 body at a fixed speed. The Phones start one by one over the arrival time.
 The program writes the state of each Phone to a JSON status file.
 
+demo.sh starts one process for each speed tier. --tier names the tier in the
+status file, and each Phone records its local port, so the dashboard can join
+the Phones to the relay buffer stats of rproxy.
+
 Usage: bench/demo/phones.py [--host H] [--port P] [--count N]
-       [--arrival S] [--rate KBPS] [--path P] [--status FILE]
+       [--arrival S] [--rate KBPS] [--tier NAME] [--path P] [--status FILE]
 """
 import argparse
 import asyncio
@@ -46,6 +50,7 @@ class Phone:
         self.length = None      # Content-Length of the reply
         self.status = None      # HTTP status code
         self.error = None       # short text of the failure
+        self.port = None        # local port of the connection
         self.samples = []       # (time, bytes) for the speed
 
     def speed(self, now):
@@ -62,7 +67,7 @@ class Phone:
         speed = self.speed(now) if self.state == State.RECEIVING else 0
         return {"state": self.state.value, "bytes": self.bytes,
                 "length": self.length, "status": self.status,
-                "speed": speed, "error": self.error}
+                "speed": speed, "error": self.error, "port": self.port}
 
 
 def parse_args():
@@ -74,6 +79,8 @@ def parse_args():
                         help="seconds to start all Phones")
     parser.add_argument("--rate", type=float, default=400.0,
                         help="KB/s that each Phone reads")
+    parser.add_argument("--tier", default="",
+                        help="label of the speed tier, for the status file")
     parser.add_argument("--path", default="/update.bin")
     parser.add_argument("--status", default="bench/demo/run/status.json")
     parser.add_argument("--stall", type=float, default=30.0,
@@ -101,9 +108,15 @@ async def phone_connect(phone, args, context):
     except OSError:
         sock.close()
         raise
+    phone.port = sock.getsockname()[1]
+    # Small read buffers: with the default ones, asyncio reads several
+    # hundred KB ahead, so a slow Phone leaves its kernel socket untouched
+    # for more than the 5 s client timeout of rproxy and is cut.
+    reader, writer = await asyncio.open_connection(
+        sock=sock, ssl=context, server_hostname="localhost", limit=CHUNK_MAX)
+    writer.transport.set_read_buffer_limits(high=CHUNK_MAX)
 
-    return await asyncio.open_connection(
-        sock=sock, ssl=context, server_hostname="localhost", limit=RCVBUF)
+    return reader, writer
 
 
 async def phone_read_head(phone, reader, stall):
@@ -170,7 +183,7 @@ def status_write(path, phones, args, start, finished):
         totals[phone.state.value] += 1
     status = {
         "start": start, "now": now, "finished": finished,
-        "count": args.count, "arrival": args.arrival,
+        "tier": args.tier, "count": args.count, "arrival": args.arrival,
         "rate": args.rate * 1000, "path": args.path,
         "totals": totals,
         "bytes": sum(phone.bytes for phone in phones),
@@ -204,7 +217,7 @@ async def main():
     totals = {}
     for phone in phones:
         totals[phone.state.value] = totals.get(phone.state.value, 0) + 1
-    print(f"phones: {totals} in {time.time() - start:.1f} s")
+    print(f"phones {args.tier}: {totals} in {time.time() - start:.1f} s")
 
 
 if __name__ == "__main__":

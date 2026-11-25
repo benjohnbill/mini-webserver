@@ -2,15 +2,19 @@
 """The terminal dashboard of the Back pressure demo (SPEC 12).
 
 It reads the run directory that demo.sh writes:
-  act.json     the Act: number, Relay mode, rproxy pid, cgroup, memory limit
-  status.json  the Phones (bench/demo/phones.py)
-  rproxy.exit  the exit code of rproxy, or "oom-kill", when it stopped
+  act.json            the Act: number, Relay mode, rproxy pid, cgroup,
+                      memory limit, and the speed tiers of the Phones
+  status-TIER.json    the Phones of one tier (bench/demo/phones.py)
+  relay/loop-*.txt    the buffer bytes of each client connection, if rproxy
+                      has --relay-stats: "<client_port> <heap> <kernel>"
+  rproxy.exit         the exit code of rproxy, or "oom-kill", when it stopped
 It reads the memory of rproxy from memory.current of its cgroup (the number
 that the OOM killer uses) and the CPU from /proc/<pid>/stat.
 
 Usage: bench/demo/dashboard.py [--run DIR] [--once [--watch S] [--width N]]
 """
 import argparse
+import glob
 import json
 import os
 import time
@@ -22,12 +26,13 @@ from rich.text import Text
 POLL_PERIOD = 0.2          # seconds between two frames
 CHART_ROWS = 8
 CHART_SECONDS_PER_COLUMN = 0.5
-GRID_COLUMNS = 40
-SPEED_BARS = 5
-SPEED_BAR_WIDTH = 30
+CHART_AXIS = 8             # columns of the axis labels
+TIER_PREFIX = 14           # columns of " <label> <count> " before the grid
+LIMIT_LABEL = " server memory (scaled) "
 MIB = 1024 * 1024
 BLOCKS = " ▁▂▃▄▅▆▇█"
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
+FOOTNOTE = " speed tiers = KR carrier QoS caps; tier shares = assumption"
 
 ACT_TITLES = {
     1: "Act 1  No limit",
@@ -37,17 +42,19 @@ ACT_TITLES = {
     5: "Act 5  Back pressure, pool Origin",
 }
 
-# state: (live style, glyph for plain output)
-STATE_STYLES = {
-    "waiting": ("on grey23", "."),
-    "receiving": ("on blue", "r"),
-    "done": ("on green", "D"),
-    "http_502": ("on red", "2"),
-    "http_503": ("on red", "3"),
-    "http_other": ("on red", "?"),
-    "cut": ("on red", "x"),
-    "refused": ("on red", "R"),
+# A state shows by color and by glyph, for a dim projector or a color-blind
+# viewer. The failed states share one glyph; the counter line splits them.
+STATE_GLYPHS = {
+    "waiting": ("·", "grey50"),
+    "receiving": ("▶", "bold bright_blue"),
+    "done": ("●", "bold green"),
+    "http_502": ("✗", "bold red"),
+    "http_503": ("✗", "bold red"),
+    "http_other": ("✗", "bold red"),
+    "cut": ("✗", "bold red"),
+    "refused": ("✗", "bold red"),
 }
+FAILED_STATES = ("http_502", "http_503", "http_other", "cut", "refused")
 
 
 def parse_args():
@@ -92,6 +99,7 @@ class Monitor:
         self.death = None         # seconds since act start when rproxy died
         self.cpu_last = None      # (time, ticks)
         self.cpu = 0.0
+        self.relay = {}           # last relay stats: port -> heap + kernel
 
     def poll(self, run_dir):
         start = self.act.get("started", time.time())
@@ -104,6 +112,7 @@ class Monitor:
             else:
                 self.death = self.death_time(run_dir, start, now)
                 self.cpu = 0.0
+        self.poll_relay(run_dir)
         exit_code = read_text(os.path.join(run_dir, "rproxy.exit"))
 
         return exit_code
@@ -127,8 +136,17 @@ class Monitor:
         cgroup = self.act.get("cgroup")
         if not cgroup:
             return
+        events = read_text(os.path.join(cgroup, "memory.events")) or ""
+        for line in events.splitlines():
+            name, _, value = line.partition(" ")
+            if name == "oom_kill":
+                self.oom_kills = int(value)
+        # After the OOM kill the kernel frees the memory before the process
+        # is gone. Keep the last value before the kill, not the drop to 0.
+        if self.oom_kills:
+            return
         current = read_text(os.path.join(cgroup, "memory.current"))
-        if current is not None:
+        if current is not None and int(current) > 0:
             self.memory.append((now, int(current)))
             self.peak = max(self.peak, int(current))
         stat = read_text(os.path.join(cgroup, "memory.stat")) or ""
@@ -136,11 +154,6 @@ class Monitor:
             name, _, value = line.partition(" ")
             if name in ("anon", "sock"):
                 self.parts[name] = int(value)
-        events = read_text(os.path.join(cgroup, "memory.events")) or ""
-        for line in events.splitlines():
-            name, _, value = line.partition(" ")
-            if name == "oom_kill":
-                self.oom_kills = int(value)
 
     def poll_cpu(self, pid):
         stat = read_text(f"/proc/{pid}/stat")
@@ -156,18 +169,74 @@ class Monitor:
                             / (now - last_time) * 100)
         self.cpu_last = (now, ticks)
 
+    def poll_relay(self, run_dir):
+        """Keep the last snapshot that has data: the files stay after rproxy
+        dies, and a read can meet a file that rproxy is writing."""
+        snapshot = {}
+        for path in glob.glob(os.path.join(run_dir, "relay", "loop-*.txt")):
+            for line in (read_text(path) or "").splitlines():
+                fields = line.split()
+                if len(fields) != 3 or line.startswith("#"):
+                    continue
+                try:
+                    port, heap, kernel = (int(field) for field in fields)
+                except ValueError:
+                    continue
+                snapshot[port] = snapshot.get(port, 0) + heap + kernel
+        if snapshot:
+            self.relay = snapshot
 
-def render(monitor, status, exit_code, width, plain):
-    act = monitor.act
-    parts = [render_title(act, width), Text("")]
-    parts += render_grid(status, plain)
-    parts.append(render_legend(status))
+
+class Tier:
+    """One speed tier: its place in act.json and its status file."""
+
+    def __init__(self, label, rate, count, status):
+        self.label = label
+        self.rate = rate                    # bytes per second
+        self.count = count
+        self.status = status
+        phones = (status or {}).get("phones", [])
+        self.phones = phones[:count]
+        self.states = [phone["state"] for phone in self.phones]
+        self.states += ["waiting"] * (count - len(self.states))
+
+    def total(self, *states):
+        return sum(1 for state in self.states if state in states)
+
+
+def tiers_read(run_dir, act):
+    """The tiers of the Act, slowest first, joined to their status files."""
+    statuses = {}
+    started = (act or {}).get("started", 0)
+    for path in glob.glob(os.path.join(run_dir, "status-*.json")):
+        status = read_json(path)
+        if not status or status.get("start", 0) < started:
+            continue                        # left from the last Act
+        statuses[status.get("tier", "")] = status
+    specs = [(tier["label"], tier["rate"] * 1000, tier["count"])
+             for tier in (act or {}).get("tiers", [])]
+    if not specs:
+        specs = [(label, status.get("rate", 0), status.get("count", 0))
+                 for label, status in statuses.items()]
+    tiers = [Tier(label, rate, count, statuses.get(label))
+             for label, rate, count in specs]
+
+    return sorted(tiers, key=lambda tier: tier.rate)
+
+
+def render(monitor, tiers, exit_code, width, plain):
+    parts = [render_title(monitor.act, width), Text("")]
+    parts += render_grid(tiers, width, plain)
+    parts.append(render_legend(tiers))
     parts.append(Text(""))
     parts += render_chart(monitor, exit_code, width - 2)
     parts.append(Text(""))
-    parts += render_speeds(status)
+    parts += render_buffer_share(monitor, tiers, width)
     parts.append(Text(""))
-    parts.append(render_counters(monitor, status, exit_code))
+    parts += render_progress(monitor, tiers, width)
+    parts.append(Text(""))
+    parts.append(render_counters(monitor, tiers, exit_code))
+    parts.append(Text(FOOTNOTE, style="dim"))
 
     return Group(*parts)
 
@@ -187,39 +256,39 @@ def render_title(act, width):
     return text
 
 
-def render_grid(status, plain):
-    phones = (status or {}).get("phones", [])
-    count = (status or {}).get("count", len(phones)) or 200
+def render_grid(tiers, width, plain):
+    columns = max(1, (width - TIER_PREFIX - 1) // 2)
     rows = []
-    for row_start in range(0, count, GRID_COLUMNS):
-        row = Text(" ")
-        for i in range(row_start, min(row_start + GRID_COLUMNS, count)):
-            state = phones[i]["state"] if i < len(phones) else "waiting"
-            style, glyph = STATE_STYLES.get(state, STATE_STYLES["cut"])
-            if plain:
-                row.append(glyph + " ")
+    for tier in tiers:
+        for row_start in range(0, max(tier.count, 1), columns):
+            if row_start == 0:
+                row = Text(f" {tier.label:>8} {tier.count:>3}  ", style="bold")
             else:
-                row.append(" ", style=style)
+                row = Text(" " * TIER_PREFIX)
+            for state in tier.states[row_start:row_start + columns]:
+                glyph, style = STATE_GLYPHS.get(state, STATE_GLYPHS["cut"])
+                row.append(glyph, style=None if plain else style)
                 row.append(" ")
-        rows.append(row)
+            rows.append(row)
 
     return rows
 
 
-def render_legend(status):
-    totals = (status or {}).get("totals", {})
+def render_legend(tiers):
     text = Text(" ")
-    for label, style, key in (("waiting", "grey50", "waiting"),
-                              ("receiving", "blue", "receiving"),
-                              ("done", "green", "done")):
-        text.append(f"{label} {totals.get(key, 0)}", style=style)
+    for state, label in (("done", "done"), ("receiving", "receiving"),
+                         ("cut", "failed"), ("waiting", "waiting")):
+        states = FAILED_STATES if state == "cut" else (state,)
+        glyph, style = STATE_GLYPHS[state]
+        count = sum(tier.total(*states) for tier in tiers)
+        text.append(f"{glyph} {label} {count}", style=style)
         text.append("   ")
-    failed = sum(totals.get(key, 0) for key in
-                 ("http_502", "http_503", "http_other", "cut", "refused"))
-    text.append(f"failed {failed}", style="red")
-    if status and status.get("finished"):
-        elapsed = status["now"] - status["start"]
-        text.append(f"   all ended at {elapsed:.0f} s", style="bold")
+    statuses = [tier.status for tier in tiers]
+    if statuses and all(status and status.get("finished")
+                        for status in statuses):
+        elapsed = (max(status["now"] for status in statuses)
+                   - min(status["start"] for status in statuses))
+        text.append(f"all ended at {elapsed:.0f} s", style="bold")
 
     return text
 
@@ -227,7 +296,7 @@ def render_legend(status):
 def render_chart(monitor, exit_code, width):
     limit = monitor.act.get("memory_max", 1024 * MIB)
     top = limit * 1.2
-    columns = width - 8                     # 8 columns of axis labels
+    columns = width - CHART_AXIS
     buckets = chart_buckets(monitor, columns)
     death_column = None
     if monitor.death is not None:
@@ -235,29 +304,54 @@ def render_chart(monitor, exit_code, width):
                            columns - 1)
         death_column -= chart_offset(monitor, columns)
     limit_row = int(limit / top * CHART_ROWS)          # rows from the bottom
-    current = monitor.memory[-1][1] if monitor.memory else 0
-    header = Text(" rproxy memory  ", style="bold")
-    header.append(f"{current / MIB:.0f} MiB", style="bold yellow")
-    if monitor.parts and monitor.death is None:
-        header.append(f"  = heap {monitor.parts.get('anon', 0) / MIB:.0f}"
-                      f" + TCP buffers {monitor.parts.get('sock', 0) / MIB:.0f}"
-                      " + other", style="dim")
-    header.append(f"   peak {monitor.peak / MIB:.0f}", style="dim")
-    lines = [header]
+    lines = [chart_header(monitor)]
     for row in range(CHART_ROWS - 1, -1, -1):
-        label = chart_label(row, limit_row, limit, top)
-        line = Text(label.rjust(7) + " ", style="dim")
+        label = chart_label(row, limit_row, limit)
+        cells = []
         for column in range(columns):
             if column == death_column:
-                line.append("X" if row == CHART_ROWS - 1 else "|",
-                            style="bold red")
+                cells.append(("X" if row == CHART_ROWS - 1 else "|",
+                              "bold red"))
                 continue
             value = buckets[column] if column < len(buckets) else None
-            line.append(*chart_cell(value, row, limit_row, top))
+            cells.append(chart_cell(value, row, limit_row, top))
+        if row == limit_row:
+            chart_label_limit(cells)
+        line = Text(label.rjust(CHART_AXIS - 1) + " ", style="dim")
+        for cell in cells:
+            line.append(*cell)
         lines.append(line)
     lines.append(chart_footer(monitor, exit_code, columns))
 
     return lines
+
+
+def chart_header(monitor):
+    header = Text(" rproxy memory  ", style="bold")
+    if not monitor.memory:
+        header.append("no sample", style="dim")
+        return header
+    current = monitor.memory[-1][1]
+    header.append(f"{current / MIB:.0f} MiB", style="bold yellow")
+    if monitor.death is not None:
+        header.append("  before it died", style="bold red")
+    elif monitor.parts:
+        header.append(f"  = heap {monitor.parts.get('anon', 0) / MIB:.0f}"
+                      f" + TCP buffers {monitor.parts.get('sock', 0) / MIB:.0f}"
+                      " + other", style="dim")
+    header.append(f"   peak {monitor.peak / MIB:.0f}", style="dim")
+
+    return header
+
+
+def chart_label_limit(cells):
+    """Write the name of the limit on the dashed limit line, at its right."""
+    start = len(cells) - len(LIMIT_LABEL) - 1
+    if start < 0:
+        return
+    for i, char in enumerate(LIMIT_LABEL):
+        if cells[start + i][0] == "-":
+            cells[start + i] = (char, "red")
 
 
 def chart_offset(monitor, columns):
@@ -285,14 +379,20 @@ def chart_buckets(monitor, columns):
     return buckets
 
 
-def chart_label(row, limit_row, limit, top):
+def chart_label(row, limit_row, limit):
     if row == limit_row:
-        return f"{limit / MIB / 1024:.0f} GiB" if limit >= 1024 * MIB \
-            else f"{limit / MIB:.0f} MiB"
+        return mib_text(limit)
     if row == 0:
         return "0"
 
     return ""
+
+
+def mib_text(value):
+    if value >= 1024 * MIB:
+        return f"{value / MIB / 1024:.3g} GiB"
+
+    return f"{value / MIB:.0f} MiB"
 
 
 def chart_cell(value, row, limit_row, top):
@@ -318,7 +418,7 @@ def chart_cell(value, row, limit_row, top):
 
 
 def chart_footer(monitor, exit_code, columns):
-    text = Text(" " * 8)
+    text = Text(" " * CHART_AXIS)
     seconds = (chart_offset(monitor, columns) + columns) \
         * CHART_SECONDS_PER_COLUMN
     text.append(f"time, {seconds:.0f} s across", style="dim")
@@ -340,42 +440,84 @@ def death_word(monitor, exit_code):
     return f"exited ({exit_code})"
 
 
-def render_speeds(status):
-    phones = (status or {}).get("phones", [])
-    rate = (status or {}).get("rate", 400000)
-    receiving = [(i, phone) for i, phone in enumerate(phones)
-                 if phone["state"] == "receiving"]
-    lines = [Text(" speed of receiving Phones", style="bold")]
-    for i, phone in receiving[:SPEED_BARS]:
-        speed = phone.get("speed", 0)
-        filled = min(SPEED_BAR_WIDTH,
-                     round(speed / (rate * 1.25) * SPEED_BAR_WIDTH))
-        line = Text(f" #{i:03d} ")
-        line.append("━" * filled, style="blue")
-        line.append("━" * (SPEED_BAR_WIDTH - filled), style="grey23")
-        length = phone.get("length")
-        progress = (f"{phone['bytes'] / 1e6:4.1f}/{length / 1e6:.1f} MB"
-                    if length else f"{phone['bytes'] / 1e6:4.1f} MB")
-        line.append(f" {speed / 1000:4.0f} KB/s  {progress}")
+def render_buffer_share(monitor, tiers, width):
+    """The relay buffer bytes of rproxy (heap + kernel), summed by tier."""
+    lines = [Text(" buffer share in rproxy (heap + kernel)", style="bold")]
+    sums = buffer_sums(monitor.relay, tiers)
+    total = sum(sums.values())
+    if not total:
+        lines.append(Text("   no data", style="dim"))
+        return lines
+    lines[0].append(f"   total {total / MIB:.1f} MiB", style="dim")
+    bar_width = max(10, width - 35)
+    labels = [tier.label for tier in tiers] + ["other"]
+    for label in labels:
+        if label not in sums:
+            continue
+        share = sums[label] / total
+        filled = round(share * bar_width)
+        line = Text(f" {label:>8}  ")
+        line.append("█" * filled, style="magenta")
+        line.append("·" * (bar_width - filled), style="grey23")
+        line.append(f" {sums[label] / MIB:7.1f} MiB {share * 100:4.0f}%")
         lines.append(line)
-    if len(receiving) > SPEED_BARS:
-        lines.append(Text(f"      and {len(receiving) - SPEED_BARS} more",
-                          style="dim"))
-    while len(lines) < SPEED_BARS + 2:
-        lines.append(Text(""))
 
     return lines
 
 
-def render_counters(monitor, status, exit_code):
-    totals = (status or {}).get("totals", {})
+def buffer_sums(relay, tiers):
+    """Join the relay stats to the tiers by the local port of each Phone.
+    A port that no Phone has (the bystander, an old port) is "other"."""
+    tier_of = {}
+    for tier in tiers:
+        for phone in tier.phones:
+            port = phone.get("port")
+            if port and (port not in tier_of or phone["state"] == "receiving"):
+                tier_of[port] = tier.label
+    sums = {}
+    for port, size in relay.items():
+        label = tier_of.get(port, "other")
+        sums[label] = sums.get(label, 0) + size
+    if set(sums) == {"other"}:
+        return {}                           # no match: no data
+
+    return sums
+
+
+def render_progress(monitor, tiers, width):
+    file_bytes = monitor.act.get("file_bytes")
+    lines = [Text(" progress of each tier (average Phone)", style="bold")]
+    bar_width = max(10, width - 50)
+    for tier in tiers:
+        received = sum(phone.get("bytes", 0) for phone in tier.phones)
+        average = received / tier.count if tier.count else 0
+        speeds = [phone.get("speed", 0) for phone in tier.phones
+                  if phone["state"] == "receiving"]
+        line = Text(f" {tier.label:>8}  ")
+        filled = round(average / file_bytes * bar_width) if file_bytes else 0
+        filled = min(bar_width, filled)
+        line.append("━" * filled, style="blue")
+        line.append("·" * (bar_width - filled), style="grey23")
+        speed = (f"{sum(speeds) / len(speeds) / 1000:6.0f} KB/s"
+                 if speeds else "      - KB/s")
+        size = f"{file_bytes / 1e6:.0f}" if file_bytes else "?"
+        line.append(f" {speed}  {average / 1e6:5.1f}/{size} MB")
+        line.append(f"  cap {tier.rate / 1000:.0f}", style="dim")
+        lines.append(line)
+
+    return lines
+
+
+def render_counters(monitor, tiers, exit_code):
+    def total(*states):
+        return str(sum(tier.total(*states) for tier in tiers))
+
     text = Text(" ")
     pairs = (("CPU", f"{monitor.cpu:.0f}%", "bold"),
-             ("done", str(totals.get("done", 0)), "bold green"),
-             ("502", str(totals.get("http_502", 0)), "bold red"),
-             ("503", str(totals.get("http_503", 0)), "bold red"),
-             ("cut", str(totals.get("cut", 0) + totals.get("refused", 0)
-                         + totals.get("http_other", 0)), "bold red"))
+             ("done", total("done"), "bold green"),
+             ("502", total("http_502"), "bold red"),
+             ("503", total("http_503"), "bold red"),
+             ("cut", total("cut", "refused", "http_other"), "bold red"))
     for label, value, style in pairs:
         text.append(label + " ", style="dim")
         text.append(value, style=style)
@@ -397,7 +539,6 @@ def act_key(act):
 def main():
     args = parse_args()
     act_path = os.path.join(args.run, "act.json")
-    status_path = os.path.join(args.run, "status.json")
     monitor = Monitor(read_json(act_path))
 
     def frame(plain, width):
@@ -406,11 +547,9 @@ def main():
         if act_key(act) != act_key(monitor.act):
             monitor = Monitor(act)                 # a new Act: reset
         exit_code = monitor.poll(args.run)
-        status = read_json(status_path)
-        if status and act and status.get("start", 0) < act.get("started", 0):
-            status = None                          # left from the last Act
+        tiers = tiers_read(args.run, act)
 
-        return render(monitor, status, exit_code, width, plain)
+        return render(monitor, tiers, exit_code, width, plain)
 
     if args.once:
         end = time.time() + args.watch
