@@ -67,6 +67,8 @@ struct epoll_loop {
     struct work_pool *pool; /* NULL in the epoll model */
 };
 
+#define ACCEPT_BURST 64
+
 static struct connection wake_mark;
 
 static int epoll_serve(int listen_fd, const struct config *config,
@@ -87,6 +89,7 @@ static int loop_handle_input(struct epoll_loop *loop,
                              const struct epoll_event *event);
 static void loop_sweep_timeouts(struct epoll_loop *loop);
 static void loop_close(struct epoll_loop *loop);
+static bool loop_accept_one(struct epoll_loop *loop);
 static void plan_build(struct connection *connection,
                        const struct config *config);
 static void connection_start_send(struct epoll_loop *loop,
@@ -124,6 +127,12 @@ static int epoll_serve(int listen_fd, const struct config *config,
     loop.epoll_fd = epoll_create1(0);
     if (loop.epoll_fd < 0) {
         perror("epoll_create1");
+        return 1;
+    }
+    int listen_flags = fcntl(listen_fd, F_GETFL);
+    if (listen_flags < 0 ||
+        fcntl(listen_fd, F_SETFL, listen_flags | O_NONBLOCK) < 0) {
+        perror("fcntl");
         return 1;
     }
     struct epoll_event listen_event = {.events = EPOLLIN, .data.ptr = NULL};
@@ -284,12 +293,26 @@ static void connection_unlink(struct epoll_loop *loop,
     }
 }
 
-/* Listen socket readable: one new client. Registers it for EPOLLIN. */
+/* Listen socket readable: up to ACCEPT_BURST new clients. One accept for
+   each turn was too slow: with thousands of open sends in the same turn,
+   the backlog grew and rproxy gave 504 to 4427 of 10000 Phones (demo Act
+   4, 2026-11-26). */
 static void loop_accept(struct epoll_loop *loop)
+{
+    for (int i = 0; i < ACCEPT_BURST; i++) {
+        if (!loop_accept_one(loop)) {
+            return;
+        }
+    }
+}
+
+/* Returns false when the backlog is empty (the listen socket does not
+   block) or on an error. Registers the client for EPOLLIN. */
+static bool loop_accept_one(struct epoll_loop *loop)
 {
     int conn_fd = accept(loop->listen_fd, NULL, NULL);
     if (conn_fd < 0) {
-        return; /* EINTR, or the client left: the next event tries again */
+        return false; /* EAGAIN, EINTR, or the client left */
     }
     int flags = fcntl(conn_fd, F_GETFL);
     struct connection *connection = calloc(1, sizeof(*connection));
@@ -297,7 +320,7 @@ static void loop_accept(struct epoll_loop *loop)
         connection == NULL) {
         free(connection);
         close(conn_fd);
-        return;
+        return true;
     }
     connection->conn_fd = conn_fd;
     connection->last_active = clock_get_seconds();
@@ -305,7 +328,7 @@ static void loop_accept(struct epoll_loop *loop)
     if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_ADD, conn_fd, &event) < 0) {
         free(connection);
         close(conn_fd);
-        return;
+        return true;
     }
     connection->next = loop->connections;
     if (loop->connections != NULL) {
@@ -313,6 +336,8 @@ static void loop_accept(struct epoll_loop *loop)
     }
     loop->connections = connection;
     loop->connection_count++;
+
+    return true;
 }
 
 /* Full request in the buffer: build the plan, then wait for EPOLLOUT. In
