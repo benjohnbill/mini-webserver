@@ -38,9 +38,11 @@ PHONE_RATE_1="${PHONE_RATE_1:-200}"
 PHONES_PER_PROC="${PHONES_PER_PROC:-1000}" # one phones.py has at most this many
 FILE_BYTES="${FILE_BYTES:-1000000}"   # size of www/update.bin
 FILE_PATH="${FILE_PATH:-/update.bin}"
-MEMORY_MAX="${MEMORY_MAX:-3G}"        # memory limit of the rproxy scope
+MEMORY_MAX="${MEMORY_MAX:-4G}"        # memory limit of the rproxy scope (Q35)
 CONNECTIONS="${CONNECTIONS:-12000}"   # rproxy --connections
-RELAY_MEMORY="${RELAY_MEMORY:-2560}"  # Act 2 limit, MiB of replies
+# Act 2 limit, MiB of replies. With 2560 the base cost of the connections
+# came on top, and rproxy died at 4G anyway (2026-11-26).
+RELAY_MEMORY="${RELAY_MEMORY:-2048}"
 RELAY_CONNS="${RELAY_CONNS:-2000}"    # Act 3 limit
 RELAY_QUEUE="${RELAY_QUEUE:-60}"      # Act 3: seconds in the queue, then 503
 RELAY_BUFFER="${RELAY_BUFFER:-16384}" # Act 4 and 5 buffer
@@ -53,6 +55,10 @@ CERT="${CERT:-ec}"                    # ec (ECDSA P-256) or rsa
 # rproxy waits this long for a client. The 5 s default cut the Phones under
 # about 20 KB/s. 60 s is the default of nginx send_timeout.
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-60}"
+# rproxy waits this long for the first Origin bytes. Under the 10k load the
+# Origin Workers share the CPUs with rproxy, and 5 s gave 504s. 60 s is the
+# default of nginx proxy_read_timeout.
+PROXY_ORIGIN_TIMEOUT="${PROXY_ORIGIN_TIMEOUT:-60}"
 # The kernel send buffer of each Origin socket. With autotuning the Origin
 # puts a whole 1 MB reply into the kernel and closes at once.
 ORIGIN_SEND_BUFFER="${ORIGIN_SEND_BUFFER:-16384}"
@@ -329,6 +335,7 @@ act_run() {
         "$ROOT/rproxy" --port "$PROXY_PORT" \
         $(cert_files) --connections "$CONNECTIONS" \
         --client-timeout "$CLIENT_TIMEOUT" \
+        --origin-timeout "$PROXY_ORIGIN_TIMEOUT" \
         --origin "127.0.0.1:$ORIGIN_PORT" --cache off \
         $(relay_flags "$relay") $(relay_stats_flags) $RPROXY_ARGS \
         >"$RUN/rproxy.log" 2>&1 &
