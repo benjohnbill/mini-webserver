@@ -127,6 +127,7 @@ tests/
 bench/
   scene.sh        scene.sh <S2|S2b|S3> <model>
   cache/run.sh    the cache Scenes: rproxy in front of a slow Origin
+  c10k/scene.sh   the c10k Scene: 10k open TLS connections, then a small file each
 www/              index.html, style.css, app.js, image.png, large.bin
 docs/measurements/
 ```

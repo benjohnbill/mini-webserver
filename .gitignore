@@ -8,3 +8,4 @@
 /rproxy-asan
 /www/update.bin
 /bench/demo/run/
+/bench/c10k/run/
