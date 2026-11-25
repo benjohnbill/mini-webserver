@@ -14,7 +14,7 @@
 # run/actN.marks.json. `dry` writes none.
 #
 # Each value is a variable, so a rehearsal can change it:
-#   MIX="fast:50000:100 1mbps:125:20" ARRIVAL=15 bench/demo/demo.sh act 4 dry
+#   MIX="fast:50000:100 1mbps:125:20" PHONE_RATE=100 bench/demo/demo.sh act 4 dry
 #   PRESENT_PAUSE=20 bench/demo/demo.sh present    # no keyboard: sleep 20 s
 set -euo pipefail
 
@@ -25,14 +25,27 @@ RUN="${RUN:-$DEMO/run}"
 # The speed tiers of the Phones: label:KB/s:count. The 400 kbps, 1 Mbps,
 # 3 Mbps, and 5 Mbps tiers are the speed caps that Korean carriers put on a
 # phone after its data allowance (QoS). The share of each tier is an
-# assumption, not a measurement.
-MIX="${MIX:-fast:50000:170 5mbps:625:10 3mbps:375:10 1mbps:125:6 400kbps:50:4}"
-ARRIVAL="${ARRIVAL:-30}"              # seconds to start the Phones of a tier
-FILE_BYTES="${FILE_BYTES:-50000000}"  # size of www/update.bin
+# assumption, not a measurement. FINAL-10k: most Phones are slow.
+MIX="${MIX:-fast:50000:500 5mbps:625:500 3mbps:375:1000 1mbps:125:3000 400kbps:50:5000}"
+# Phones per second that start, for all tiers together. Act 1 is slower, so
+# that the memory line has time to climb before the kill.
+PHONE_RATE="${PHONE_RATE:-500}"
+PHONE_RATE_1="${PHONE_RATE_1:-200}"
+PHONES_PER_PROC="${PHONES_PER_PROC:-1000}" # one phones.py has at most this many
+FILE_BYTES="${FILE_BYTES:-1000000}"   # size of www/update.bin
 FILE_PATH="${FILE_PATH:-/update.bin}"
-MEMORY_MAX="${MEMORY_MAX:-1280M}"     # memory limit of the rproxy scope
-RELAY_CONNS="${RELAY_CONNS:-20}"      # Act 3 limit
-RELAY_BUFFER="${RELAY_BUFFER:-65536}" # Act 4 and 5 buffer
+MEMORY_MAX="${MEMORY_MAX:-3G}"        # memory limit of the rproxy scope
+CONNECTIONS="${CONNECTIONS:-12000}"   # rproxy --connections
+RELAY_MEMORY="${RELAY_MEMORY:-2560}"  # Act 2 limit, MiB of replies
+RELAY_CONNS="${RELAY_CONNS:-2000}"    # Act 3 limit
+RELAY_QUEUE="${RELAY_QUEUE:-60}"      # Act 3: seconds in the queue, then 503
+RELAY_BUFFER="${RELAY_BUFFER:-16384}" # Act 4 and 5 buffer
+# The Origin: epoll-pool, ORIGIN_WORK ms of CPU for each answer (the Handler
+# time). Act 5 is the same load on a pool Origin, for the comparison.
+ORIGIN_MODEL="${ORIGIN_MODEL:-epoll-pool}"
+ORIGIN_WORKERS="${ORIGIN_WORKERS:-8}"
+ORIGIN_WORK="${ORIGIN_WORK:-5}"
+CERT="${CERT:-ec}"                    # ec (ECDSA P-256) or rsa
 # The Origin closes a connection after this many seconds with no progress.
 # In Act 4 the Origin sends only as fast as a slow Phone reads, so its send
 # queue drains slowly and the 5 s default cuts the 1 Mbps Phones. 60 s is
@@ -58,6 +71,13 @@ SERVER_CPUS="${SERVER_CPUS:-0-$((CPU_HALF - 1))}"
 PHONE_CPUS="${PHONE_CPUS:-$((CPU_COUNT > 1 ? CPU_HALF : 0))-$((CPU_COUNT - 1))}"
 
 die() { echo "demo: $*" >&2; exit 1; }
+
+# 10k Phones need two sockets each in rproxy. Raise the soft limit to the
+# hard limit.
+NOFILE_NEED=$((CONNECTIONS * 2 + 1000))
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+[[ "$(ulimit -n)" == unlimited || "$(ulimit -n)" -ge "$NOFILE_NEED" ]] \
+    || die "ulimit -n is $(ulimit -n) (hard $(ulimit -Hn)); the demo needs $NOFILE_NEED"
 
 now_ms() { date +%s%3N; }
 
@@ -101,7 +121,7 @@ origin_stop() {
 relay_for_act() {
     case "$1" in
         1) echo unbounded ;;
-        2) echo reply-cap ;;
+        2) echo memory-cap ;;
         3) echo conn-cap ;;
         4 | 5) echo backpressure ;;
         *) die "no Act $1 (1 to 5)" ;;
@@ -141,6 +161,10 @@ prepare() {
     mkdir -p "$RUN"
     [[ -x "$ROOT/server" && -x "$ROOT/rproxy" ]] || make -C "$ROOT" all
     [[ -f "$ROOT/build/cert.pem" ]] || make -C "$ROOT" cert
+    [[ -f "$ROOT/build/cert-ec.pem" ]] || openssl req -x509 -newkey ec \
+        -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 -subj /CN=localhost \
+        -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+        -keyout "$ROOT/build/key-ec.pem" -out "$ROOT/build/cert-ec.pem" 2>/dev/null
     local file="$ROOT/www${FILE_PATH}"
     if [[ ! -f "$file" || "$(stat -c %s "$file")" != "$FILE_BYTES" ]]; then
         head -c "$FILE_BYTES" /dev/urandom >"$file"
@@ -150,11 +174,11 @@ prepare() {
     fi
 }
 
-# Start the Origin once. Act 5 needs a `pool` Origin, the others `epoll`.
-# A change of the model, the timeout, or the CPUs starts a new Origin.
+# Start the Origin once. Act 5 needs a `pool` Origin, the others
+# ORIGIN_MODEL. A change of a value starts a new Origin.
 origin_start() {
     local model="$1" key pid
-    key="$model $ORIGIN_TIMEOUT $SERVER_CPUS"
+    key="$model $ORIGIN_TIMEOUT $SERVER_CPUS $ORIGIN_WORKERS $ORIGIN_WORK"
     pid="$(pid_read origin)"
     if pid_is_alive "$pid" && [[ "$(cat "$RUN/origin.key" 2>/dev/null)" == "$key" ]]; then
         return
@@ -162,6 +186,8 @@ origin_start() {
     origin_stop
     (cd "$ROOT" && setsid taskset -c "$SERVER_CPUS" ./server "$ORIGIN_PORT" \
         www --model "$model" --timeout "$ORIGIN_TIMEOUT" \
+        --workers "$ORIGIN_WORKERS" --work "$ORIGIN_WORK" \
+        --stats "$RUN/origin.stats" \
         >"$RUN/origin.log" 2>&1 </dev/null & echo $! >"$RUN/origin.pid")
     echo "$model" >"$RUN/origin.model"
     echo "$key" >"$RUN/origin.key"
@@ -180,7 +206,8 @@ relay_flags() {
         return
     fi
     case "$1" in
-        conn-cap) echo "--relay conn-cap --relay-conns $RELAY_CONNS" ;;
+        conn-cap) echo "--relay conn-cap --relay-conns $RELAY_CONNS --relay-queue $RELAY_QUEUE" ;;
+        memory-cap) echo "--relay memory-cap --relay-memory $RELAY_MEMORY" ;;
         backpressure) echo "--relay backpressure --relay-buffer $RELAY_BUFFER" ;;
         *) echo "--relay $1" ;;
     esac
@@ -206,36 +233,69 @@ oom_check() {
     done
 }
 
+cert_files() {
+    case "$CERT" in
+        ec) echo "--cert $ROOT/build/cert-ec.pem --key $ROOT/build/key-ec.pem" ;;
+        rsa) echo "--cert $ROOT/build/cert.pem --key $ROOT/build/key.pem" ;;
+        *) die "CERT is ec or rsa, not $CERT" ;;
+    esac
+}
+
+# Phones per second of Act $1.
+phone_rate() {
+    [[ "$1" == 1 ]] && echo "$PHONE_RATE_1" || echo "$PHONE_RATE"
+}
+
+# Seconds to start all Phones of Act $1.
+arrival_for_act() {
+    python3 -c "print(round($(mix_total) / $(phone_rate "$1"), 2))"
+}
+
 # Write run/act.json. The dashboard resets when its "started" changes.
 # $6 is "true" while `present` holds the Phones (Phase 0).
 act_json_write() {
     local act="$1" relay="$2" mode="$3" rproxy_pid="$4" cgroup="$5"
-    local held="${6:-false}"
+    local held="${6:-false}" arrival
+    arrival="$(arrival_for_act "$act")"
     cat >"$RUN/act.tmp" <<EOF
 {"act": $act, "relay": "$relay", "origin_model": "$(cat "$RUN/origin.model")",
  "rproxy_pid": $rproxy_pid, "cgroup": "$cgroup",
  "memory_max": $(numfmt --from=iec "$MEMORY_MAX"),
- "phones": $(mix_total), "tiers": $(mix_json), "arrival": $ARRIVAL,
+ "phones": $(mix_total), "tiers": $(mix_json), "arrival": $arrival,
+ "phone_rate": $(phone_rate "$act"),
  "file_bytes": $FILE_BYTES, "proxy_port": $PROXY_PORT,
  "origin_port": $ORIGIN_PORT, "relay_conns": $RELAY_CONNS,
+ "relay_memory": $RELAY_MEMORY, "relay_queue": $RELAY_QUEUE,
+ "relay_buffer": $RELAY_BUFFER, "origin_workers": $ORIGIN_WORKERS,
+ "origin_work": $ORIGIN_WORK, "cert": "$CERT",
  "mode": "$mode", "held": $held, "started": $(date +%s.%N)}
 EOF
     mv "$RUN/act.tmp" "$RUN/act.json"
 }
 
-# Start one phones.py for each tier, as children of this shell (so `wait`
-# sees them), and add their pids to the array that $1 names.
+# Start phones.py processes, as children of this shell (so `wait` sees
+# them), and add their pids to the array that $1 names. A tier of more than
+# PHONES_PER_PROC Phones gets several processes. All processes start their
+# Phones over the same arrival time, so the rate of each tier stays even.
 phones_start() {
     local -n pids="$1"
-    local tiers tier label rate count
+    local arrival="$2" tiers tier label rate count part left index
     mapfile -t tiers < <(mix_tiers)
     for tier in "${tiers[@]}"; do
         read -r label rate count <<<"$tier"
-        taskset -c "$PHONE_CPUS" python3 "$DEMO/phones.py" \
-            --port "$PROXY_PORT" --count "$count" --arrival "$ARRIVAL" \
-            --rate "$rate" --tier "$label" --path "$FILE_PATH" \
-            --status "$RUN/status-$label.json" >>"$RUN/phones.log" 2>&1 &
-        pids+=("$!")
+        left="$count"
+        index=0
+        while ((left > 0)); do
+            part=$((left < PHONES_PER_PROC ? left : PHONES_PER_PROC))
+            taskset -c "$PHONE_CPUS" python3 "$DEMO/phones.py" \
+                --port "$PROXY_PORT" --count "$part" --arrival "$arrival" \
+                --rate "$rate" --tier "$label" --path "$FILE_PATH" \
+                --status "$RUN/status-$label-$index.json" \
+                >>"$RUN/phones.log" 2>&1 &
+            pids+=("$!")
+            left=$((left - part))
+            index=$((index + 1))
+        done
     done
 }
 
@@ -255,7 +315,7 @@ act_run() {
     taskset -c "$SERVER_CPUS" systemd-run --user --scope --quiet \
         -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 \
         "$ROOT/rproxy" --port "$PROXY_PORT" \
-        --cert "$ROOT/build/cert.pem" --key "$ROOT/build/key.pem" \
+        $(cert_files) --connections "$CONNECTIONS" \
         --origin "127.0.0.1:$ORIGIN_PORT" --cache off \
         $(relay_flags "$relay") $(relay_stats_flags) $RPROXY_ARGS \
         >"$RUN/rproxy.log" 2>&1 &
@@ -285,7 +345,7 @@ act_run() {
     t0="$(now_ms)"
     mark "start"
 
-    phones_start phone_pids
+    phones_start phone_pids "$(arrival_for_act "$act")"
     printf '%s\n' "${phone_pids[@]}" >"$RUN/phones.pid"
 
     # Mark the first of: rproxy stops, all Phones end. Then the other.
@@ -331,7 +391,7 @@ act_run() {
 }
 
 act_start() {
-    local act="$1" mode="${2:-dry}" hold="${3:-}" model=epoll
+    local act="$1" mode="${2:-dry}" hold="${3:-}" model="$ORIGIN_MODEL"
     [[ "$mode" == dry || "$mode" == rec ]] || die "mode is dry or rec"
     relay_for_act "$act" >/dev/null
     mix_tiers >/dev/null
