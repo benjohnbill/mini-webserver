@@ -9,6 +9,10 @@
    Does not close conn_fd. */
 void conn_serve(int conn_fd, const struct config *config);
 
+/* --send-buffer: caps the kernel send buffer of conn_fd, so that a slow
+   client holds the connection for its whole download. 0 does nothing. */
+void conn_send_buffer_cap(int conn_fd, const struct config *config);
+
 /* --work: burns MS milliseconds of CPU time of this thread. The Handler
    time of a real Origin, for the demo. 0 does nothing. */
 void conn_work_burn(int work_ms);

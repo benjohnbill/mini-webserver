@@ -24,6 +24,8 @@
 #define DELAY_MAX 10000
 #define WORK_MAX 10000
 #define STATS_PERIOD_MS 200
+#define SEND_BUFFER_MIN 4096
+#define SEND_BUFFER_MAX 67108864
 #define CACHE_BUCKETS 1024
 /* A multiple of CACHE_BUCKETS, so a key and its seen slot have the same
    stripe. */
@@ -66,6 +68,7 @@ struct config {
     int delay_ms;           /* sleep before each answer: a slow Origin */
     int work_ms;            /* CPU time before each answer: the Handler time */
     const char *stats_path; /* --stats: epoll models write it, or NULL */
+    int send_buffer;        /* --send-buffer: SO_SNDBUF, 0: autotuning */
 };
 
 #endif

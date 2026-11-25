@@ -324,6 +324,7 @@ static bool loop_accept_one(struct epoll_loop *loop)
     }
     connection->conn_fd = conn_fd;
     connection->last_active = clock_get_seconds();
+    conn_send_buffer_cap(conn_fd, loop->config);
     struct epoll_event event = {.events = EPOLLIN, .data.ptr = connection};
     if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_ADD, conn_fd, &event) < 0) {
         free(connection);

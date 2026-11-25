@@ -33,7 +33,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: ./server <port> <root> [--model "
                 "iter|fork|pool|epoll|epoll-pool] [--workers N] [--timeout S] "
-                "[--log] [--delay MS] [--work MS] [--stats FILE]\n");
+                "[--log] [--delay MS] [--work MS] [--stats FILE] "
+                "[--send-buffer BYTES]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -56,6 +57,7 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
         .delay_ms = 0,
         .work_ms = 0,
         .stats_path = NULL,
+        .send_buffer = 0,
     };
     if (argc < 3 || !number_parse(argv[1], 1, PORT_MAX, &config->port)) {
         return false;
@@ -103,6 +105,10 @@ static bool option_parse(struct config *config, const char *name, char *value)
     }
     if (strcmp(name, "--delay") == 0) {
         return number_parse(value, 0, DELAY_MAX, &config->delay_ms);
+    }
+    if (strcmp(name, "--send-buffer") == 0) {
+        return number_parse(value, SEND_BUFFER_MIN, SEND_BUFFER_MAX,
+                            &config->send_buffer);
     }
     if (strcmp(name, "--stats") == 0) {
         config->stats_path = value;

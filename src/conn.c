@@ -39,6 +39,7 @@ void conn_serve(int conn_fd, const struct config *config)
     struct conn_buffer buffer = {0};
     struct timeval timeout = {.tv_sec = config->timeout, .tv_usec = 0};
     setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    conn_send_buffer_cap(conn_fd, config);
 
     while (!stop_requested) {
         size_t request_len = 0;
@@ -51,6 +52,14 @@ void conn_serve(int conn_fd, const struct config *config)
         buffer.used = 0;
     }
     free(buffer.data);
+}
+
+void conn_send_buffer_cap(int conn_fd, const struct config *config)
+{
+    if (config->send_buffer > 0) {
+        setsockopt(conn_fd, SOL_SOCKET, SO_SNDBUF, &config->send_buffer,
+                   sizeof(config->send_buffer));
+    }
 }
 
 void conn_work_burn(int work_ms)
