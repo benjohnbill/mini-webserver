@@ -26,6 +26,10 @@ RUN="${RUN:-$DEMO/run}"
 # 3 Mbps, and 5 Mbps tiers are the speed caps that Korean carriers put on a
 # phone after its data allowance (QoS). The share of each tier is an
 # assumption, not a measurement. FINAL-10k: most Phones are slow.
+# SPEED_SCALE divides every speed: the Python Phones of one laptop cannot
+# read 10k Phones at the real speeds (they took 100 % CPU at about 1.3 GB/s,
+# 2026-11-26). The ratios between the tiers stay.
+SPEED_SCALE="${SPEED_SCALE:-10}"
 MIX="${MIX:-fast:50000:500 5mbps:625:500 3mbps:375:1000 1mbps:125:3000 400kbps:50:5000}"
 # Phones per second that start, for all tiers together. Act 1 is slower, so
 # that the memory line has time to climb before the kill.
@@ -46,6 +50,12 @@ ORIGIN_MODEL="${ORIGIN_MODEL:-epoll-pool}"
 ORIGIN_WORKERS="${ORIGIN_WORKERS:-8}"
 ORIGIN_WORK="${ORIGIN_WORK:-5}"
 CERT="${CERT:-ec}"                    # ec (ECDSA P-256) or rsa
+# rproxy waits this long for a client. The 5 s default cut the Phones under
+# about 20 KB/s. 60 s is the default of nginx send_timeout.
+CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-60}"
+# The kernel send buffer of each Origin socket. With autotuning the Origin
+# puts a whole 1 MB reply into the kernel and closes at once.
+ORIGIN_SEND_BUFFER="${ORIGIN_SEND_BUFFER:-16384}"
 # The Origin closes a connection after this many seconds with no progress.
 # In Act 4 the Origin sends only as fast as a slow Phone reads, so its send
 # queue drains slowly and the 5 s default cuts the 1 Mbps Phones. 60 s is
@@ -133,10 +143,10 @@ mix_tiers() {
     local tier label rate count
     for tier in $MIX; do
         IFS=: read -r label rate count <<<"$tier"
-        [[ "$label" =~ ^[A-Za-z0-9_.-]+$ && "$rate" =~ ^[0-9]+$ \
+        [[ "$label" =~ ^[A-Za-z0-9_.-]+$ && "$rate" =~ ^[0-9]+(\.[0-9]+)?$ \
             && "$count" =~ ^[0-9]+$ ]] \
             || die "bad tier '$tier' in MIX (label:KB/s:count)"
-        echo "$label $rate $count"
+        echo "$label $(python3 -c "print($rate / $SPEED_SCALE)") $count"
     done
 }
 
@@ -178,7 +188,7 @@ prepare() {
 # ORIGIN_MODEL. A change of a value starts a new Origin.
 origin_start() {
     local model="$1" key pid
-    key="$model $ORIGIN_TIMEOUT $SERVER_CPUS $ORIGIN_WORKERS $ORIGIN_WORK"
+    key="$model $ORIGIN_TIMEOUT $SERVER_CPUS $ORIGIN_WORKERS $ORIGIN_WORK $ORIGIN_SEND_BUFFER"
     pid="$(pid_read origin)"
     if pid_is_alive "$pid" && [[ "$(cat "$RUN/origin.key" 2>/dev/null)" == "$key" ]]; then
         return
@@ -187,6 +197,7 @@ origin_start() {
     (cd "$ROOT" && setsid taskset -c "$SERVER_CPUS" ./server "$ORIGIN_PORT" \
         www --model "$model" --timeout "$ORIGIN_TIMEOUT" \
         --workers "$ORIGIN_WORKERS" --work "$ORIGIN_WORK" \
+        --send-buffer "$ORIGIN_SEND_BUFFER" \
         --stats "$RUN/origin.stats" \
         >"$RUN/origin.log" 2>&1 </dev/null & echo $! >"$RUN/origin.pid")
     echo "$model" >"$RUN/origin.model"
@@ -268,6 +279,7 @@ act_json_write() {
  "relay_memory": $RELAY_MEMORY, "relay_queue": $RELAY_QUEUE,
  "relay_buffer": $RELAY_BUFFER, "origin_workers": $ORIGIN_WORKERS,
  "origin_work": $ORIGIN_WORK, "cert": "$CERT",
+ "speed_scale": $SPEED_SCALE, "client_timeout": $CLIENT_TIMEOUT,
  "mode": "$mode", "held": $held, "started": $(date +%s.%N)}
 EOF
     mv "$RUN/act.tmp" "$RUN/act.json"
@@ -316,6 +328,7 @@ act_run() {
         -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 \
         "$ROOT/rproxy" --port "$PROXY_PORT" \
         $(cert_files) --connections "$CONNECTIONS" \
+        --client-timeout "$CLIENT_TIMEOUT" \
         --origin "127.0.0.1:$ORIGIN_PORT" --cache off \
         $(relay_flags "$relay") $(relay_stats_flags) $RPROXY_ARGS \
         >"$RUN/rproxy.log" 2>&1 &
