@@ -10,6 +10,7 @@ It reads the run directory that demo.sh writes:
   rproxy.log          the "cause" lines: why a reply failed
   rproxy.exit         the exit code of rproxy, or "oom-kill", when it stopped
   scores.json         one row for each Act that ended (this file writes it)
+  bystander.json      the last bystander curl (bench/demo/bystander.sh)
 It reads the memory of rproxy from memory.current of its cgroup, and the
 kernel buffers of each socket from `ss -tmnHO`.
 
@@ -59,6 +60,8 @@ STATE_ORDER = ("done", "receiving", "http_502", "http_503", "http_other",
                "cut", "refused", "waiting")
 
 # The talk calls each Act a Phase; the screen uses the Phase and the mode.
+# Phase 0 is Act 1 before the Phones start.
+PHASE_ZERO = ("Phase 0", "평소", "rproxy up, no Phones yet")
 PHASES = {
     1: ("Phase 1", "unbounded", "no limit"),
     2: ("Phase 2-A", "reply-cap", "the 4 MiB limit we had"),
@@ -316,8 +319,10 @@ def causes_read(run_dir):
     return counts
 
 
-def render(monitor, tiers, exit_code, causes, scores, width, plain):
-    parts = [render_title(monitor, exit_code, width, plain)]
+def render(monitor, tiers, exit_code, causes, scores, bystander, width,
+           plain):
+    parts = [render_title(monitor, exit_code, width, plain),
+             render_bystander(monitor, bystander, width, plain)]
     parts += render_chart(monitor, width)
     parts.append(Text(""))
     parts += render_pipe(monitor, tiers, width, plain)
@@ -335,6 +340,8 @@ def render(monitor, tiers, exit_code, causes, scores, width, plain):
 def render_title(monitor, exit_code, width, plain):
     phase, mode, note = PHASES.get(monitor.act.get("act"),
                                    ("Waiting", "-", ""))
+    if monitor.act.get("held"):         # `present` holds the Phones
+        phase, mode, note = PHASE_ZERO
     text = Text(f" {phase}  ", style="bold")
     text.append(mode, style="bold cyan")
     text.append(f"   {note}", style="dim")
@@ -344,9 +351,27 @@ def render_title(monitor, exit_code, width, plain):
                   f" at {monitor.death:.1f} s ")
         style = "bold black on green3" if monitor.death is None \
             else "bold white on red3"
-        text.append(" " * max(2, width - len(text) - len(status) - 8))
+        text.append(" " * max(2, width - text.cell_len - len(status) - 8))
         text.append("rproxy ")
         text.append(status, style="" if plain else style)
+    text.truncate(width)
+
+    return text
+
+
+def render_bystander(monitor, bystander, width, plain):
+    """The last bystander curl of this Act, so the audience sees a small
+    page pass or fail next to the Phones."""
+    text = Text(" bystander  GET /index.html  ", style="bold")
+    started = monitor.act.get("started", 0)
+    if not bystander or bystander.get("time", 0) < started:
+        text.append("-", style="dim")
+        return text
+    style = "bold black on green3" if bystander.get("ok") \
+        else "bold white on red3"
+    text.append(f" {bystander.get('line', '?')} ",
+                style="" if plain else style)
+    text.append(f"  at {bystander['time'] - started:.0f} s", style="dim")
     text.truncate(width)
 
     return text
@@ -699,7 +724,7 @@ def score_row(monitor, tiers):
     """The row of this Act for the score table, as it is now."""
     act = monitor.act
     number = act.get("act")
-    if not number or not tiers:
+    if not number or not tiers or act.get("held"):
         return None
     counts = {state: sum(tier.total(state) for tier in tiers)
               for state in STATE_ORDER}
@@ -760,6 +785,13 @@ def scores_save(run_dir, monitor):
     os.replace(temp, path)
 
 
+def scores_clear(run_dir):
+    try:
+        os.remove(os.path.join(run_dir, "scores.json"))
+    except FileNotFoundError:
+        pass
+
+
 def mib(value):
     if value >= 10 * MIB:
         return f"{value / MIB:.0f} MiB"
@@ -800,7 +832,11 @@ def main():
         nonlocal monitor
         act = read_json(act_path)
         if act_key(act) != act_key(monitor.act):
-            scores_save(args.run, monitor)
+            if (act or {}).get("held"):
+                # Phase 0 starts a new `present`: the table starts empty.
+                scores_clear(args.run)
+            else:
+                scores_save(args.run, monitor)
             monitor = Monitor(act)                 # a new Act: reset
         exit_code = monitor.poll(args.run)
         tiers = tiers_read(args.run, act)
@@ -811,8 +847,10 @@ def main():
             os.path.join(args.run, "scores.json")) or []
             if row.get("act") != (act or {}).get("act")]
 
+        bystander = read_json(os.path.join(args.run, "bystander.json"))
+
         return render(monitor, monitor.tiers, exit_code,
-                      causes_read(args.run), scores, width, plain)
+                      causes_read(args.run), scores, bystander, width, plain)
 
     if args.once:
         end = time.time() + args.watch

@@ -45,6 +45,9 @@ PRESENT_PAUSE="${PRESENT_PAUSE:-}"    # seconds; replaces each Enter of `present
 PRESENT_DEATH_WAIT=60                 # Phase 1: the longest wait for the kill
 PRESENT_ACT4_WAIT=10                  # Phase 3: seconds before the bystander
 PRESENT_2A_WAIT="${PRESENT_2A_WAIT:-12}"   # Phase 2-A: seconds of reply-cap
+# Phase 2-A: seconds before the bystander. Early, so that the dashboard shows
+# "/index.html 200" next to the 502s for the rest of 2-A.
+PRESENT_2A_BYSTANDER="${PRESENT_2A_BYSTANDER:-4}"
 PRESENT_2B_WAIT="${PRESENT_2B_WAIT:-30}"   # Phase 2-B: seconds of conn-cap (measured: 503s pile up after 15-30 s)
 
 # The Phones get the upper half of the CPUs, rproxy and the Origin the lower
@@ -204,8 +207,10 @@ oom_check() {
 }
 
 # Write run/act.json. The dashboard resets when its "started" changes.
+# $6 is "true" while `present` holds the Phones (Phase 0).
 act_json_write() {
     local act="$1" relay="$2" mode="$3" rproxy_pid="$4" cgroup="$5"
+    local held="${6:-false}"
     cat >"$RUN/act.tmp" <<EOF
 {"act": $act, "relay": "$relay", "origin_model": "$(cat "$RUN/origin.model")",
  "rproxy_pid": $rproxy_pid, "cgroup": "$cgroup",
@@ -213,7 +218,7 @@ act_json_write() {
  "phones": $(mix_total), "tiers": $(mix_json), "arrival": $ARRIVAL,
  "file_bytes": $FILE_BYTES, "proxy_port": $PROXY_PORT,
  "origin_port": $ORIGIN_PORT, "relay_conns": $RELAY_CONNS,
- "mode": "$mode", "started": $(date +%s.%N)}
+ "mode": "$mode", "held": $held, "started": $(date +%s.%N)}
 EOF
     mv "$RUN/act.tmp" "$RUN/act.json"
 }
@@ -268,7 +273,8 @@ act_run() {
         return 1
     fi
     cgroup="/sys/fs/cgroup$(cut -d: -f3 "/proc/$rproxy_pid/cgroup")"
-    act_json_write "$act" "$relay" "$mode" "$rproxy_pid" "$cgroup"
+    act_json_write "$act" "$relay" "$mode" "$rproxy_pid" "$cgroup" \
+        "$([[ -n "$hold" ]] && echo true || echo false)"
     if [[ -n "$hold" ]]; then
         while [[ ! -f "$RUN/go" ]] && pid_is_alive "$rproxy_pid"; do
             sleep 0.1
@@ -358,7 +364,7 @@ act_start() {
 # One bystander curl, printed as a large plain banner.
 present_bystander() {
     local line word
-    line="$("$DEMO/bystander.sh" "$PROXY_PORT")"
+    line="$(RUN="$RUN" "$DEMO/bystander.sh" "$PROXY_PORT")"
     case "$line" in
         *"HTTP 200"*) word="HTTP 200" ;;
         *"connection refused"*) word="연결 거부" ;;
@@ -425,8 +431,10 @@ print(round(exit_time - act["started"], 1))' \
     # 2-A the 4 MiB whole-reply limit we had, 2-B a connection limit.
     present_header "Phase 2-A  reply-cap: the 4 MiB limit we had"
     act_start 2 dry
-    sleep "$PRESENT_2A_WAIT"
+    sleep "$PRESENT_2A_BYSTANDER"
     present_bystander
+    sleep $((PRESENT_2A_WAIT > PRESENT_2A_BYSTANDER ?
+        PRESENT_2A_WAIT - PRESENT_2A_BYSTANDER : 0))
     present_header "Phase 2-B  conn-cap: a connection limit, set for memory"
     act_start 3 dry
     sleep "$PRESENT_2B_WAIT"

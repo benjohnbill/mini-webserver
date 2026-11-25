@@ -40,13 +40,13 @@ bench/demo/demo.sh present
 
 ## The flow
 
-`demo.sh present` has four Phases; Phase 2 runs two Acts. Each Enter starts the next Phase. The bystander is one `curl` of `/index.html` through rproxy. The flow runs it at the end of each Phase and prints the result as a large banner. The lines in quotes are a draft. The owner decides the lines later.
+`demo.sh present` has four Phases; Phase 2 runs two Acts. Each Enter starts the next Phase. The bystander is one `curl` of `/index.html` through rproxy. The flow runs it at the end of each Phase (in Phase 2-A, `PRESENT_2A_BYSTANDER` = 4 s after the start) and prints the result as a large banner. It also writes `run/bystander.json`, and the dashboard shows the last result of the current Phase under the title. The lines in quotes are a draft. The owner decides the lines later.
 
 | Phase | What the flow does | Bystander | Say |
 |---|---|---|---|
-| 0 평소 | Starts rproxy in the mode of Act 1 (`unbounded`). No Phones yet | `HTTP 200` | "앱 업데이트가 나온 날입니다. 휴대폰 200대가 50 MB 파일을 받습니다. 대부분은 빠르고, 몇 대는 데이터를 다 써서 느려진 휴대폰입니다." |
+| 0 평소 | Starts rproxy in the mode of Act 1 (`unbounded`). No Phones yet. The dashboard title is `Phase 0  평소`, and the score table starts empty | `HTTP 200` | "앱 업데이트가 나온 날입니다. 휴대폰 200대가 50 MB 파일을 받습니다. 대부분은 빠르고, 몇 대는 데이터를 다 써서 느려진 휴대폰입니다." |
 | 1 Act 1 | Starts the Phones. It waits until rproxy dies (60 s at most) | `연결 거부` | "빠른 휴대폰은 금방 끝나지만, 느린 휴대폰의 몫은 Reverse Proxy 메모리에 쌓입니다. 서버가 죽었고, 첫 페이지만 보려던 저까지 끊겼습니다." |
-| 2 Act 2, then Act 3 | Starts Act 2 (`reply-cap`, the 4 MiB limit we had), waits `PRESENT_2A_WAIT` (12 s), runs the bystander, then starts Act 3 (`conn-cap` 20) and waits `PRESENT_2B_WAIT` (30 s). One Enter | `HTTP 200`, then the observed result (503 in the measured run) | 2-A: "그래서 연결 하나가 쌓는 양에 4 MB 상한을 뒀습니다. 지금 저희 코드가 실제로 이렇습니다. 서버는 살지만, 파일이 50 MB라서 아무도 받지 못합니다." 2-B: the owner writes it |
+| 2 Act 2, then Act 3 | Starts Act 2 (`reply-cap`, the 4 MiB limit we had), runs the bystander after 4 s, waits until `PRESENT_2A_WAIT` (12 s), then starts Act 3 (`conn-cap` 20) and waits `PRESENT_2B_WAIT` (30 s). One Enter | `HTTP 200`, then the observed result (503 in the measured run) | 2-A: "그래서 연결 하나가 쌓는 양에 4 MB 상한을 뒀습니다. 지금 저희 코드가 실제로 이렇습니다. 서버는 살지만, 파일이 50 MB라서 아무도 받지 못합니다." 2-B: the owner writes it |
 | 3 Act 4 | Starts Act 4 (`backpressure`). The bystander runs about 10 s later | `HTTP 200` | "쌓는 속도를 받는 속도에 맞췄습니다. 버퍼가 차면 Origin에서 읽기를 멈추고, 휴대폰이 가져가면 다시 읽습니다. 메모리는 평평하고, 빠른 휴대폰은 끝났고, 느린 휴대폰도 끊기지 않고 받고 있습니다." |
 | end | The last Enter stops rproxy, the Phones, and the Origin | | "막아야 할 것은 크기도 사람 수도 아니고, 속도였습니다." |
 
@@ -83,7 +83,7 @@ MIX="fast:50000:100 1mbps:125:20" ARRIVAL=15 bench/demo/demo.sh act 4 dry
 PRESENT_PAUSE=10 bench/demo/demo.sh present    # each Enter becomes a 10 s sleep
 ```
 
-The variables: `MIX` (the tiers, `label:KB/s:count`), `ARRIVAL`, `FILE_BYTES`, `MEMORY_MAX`, `ORIGIN_TIMEOUT`, `RELAY_CONNS`, `RELAY_BUFFER`, `ORIGIN_PORT`, `PROXY_PORT`, `RPROXY_ARGS`, `PHONE_CPUS`, `SERVER_CPUS`, `PRESENT_PAUSE`.
+The variables: `MIX` (the tiers, `label:KB/s:count`), `ARRIVAL`, `PRESENT_2A_WAIT`, `PRESENT_2A_BYSTANDER`, `PRESENT_2B_WAIT`, `FILE_BYTES`, `MEMORY_MAX`, `ORIGIN_TIMEOUT`, `RELAY_CONNS`, `RELAY_BUFFER`, `ORIGIN_PORT`, `PROXY_PORT`, `RPROXY_ARGS`, `PHONE_CPUS`, `SERVER_CPUS`, `PRESENT_PAUSE`.
 
 By default the Phones run on the upper half of the CPUs, and rproxy and the Origin on the lower half. One `phones.py` process reads at most about 300 to 400 MB/s, so `demo.sh` starts one process for each tier.
 
