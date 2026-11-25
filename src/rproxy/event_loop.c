@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -143,7 +144,10 @@ struct connection {
     uint32_t client_events; /* what conn_fd waits for: EPOLLIN or EPOLLOUT */
     uint32_t origin_events; /* what origin_fd waits for: 0 is nothing */
     struct timer timer;     /* the deadline of the current state */
-    size_t hello_len;       /* the bytes of the last ClientHello peek */
+    /* SIOCOUTQ of conn_fd at the last reply deadline. LONG_MAX after a
+       write, so the first deadline after a write always moves once. */
+    long send_queue;
+    size_t hello_len; /* the bytes of the last ClientHello peek */
     /* NULL before the handshake, and after the close_notify */
     struct tls_session *session;
     struct request_buffer buffer;
@@ -286,6 +290,7 @@ static bool relay_stats_format(const struct connection *connection, FILE *file);
 static long socket_get_queue(int fd, unsigned long request);
 static void connection_expire(struct connection *connection);
 static void relay_expire(struct connection *connection);
+static bool send_queue_has_drained(struct connection *connection);
 static void exchange_slot_release(struct connection *connection);
 static void loop_free_closed(struct event_loop *loop);
 static void loop_close_all(struct event_loop *loop);
@@ -518,6 +523,7 @@ static void connection_open(struct event_loop *loop, int conn_fd)
         .client_end = {.connection = connection, .is_origin = false},
         .origin_end = {.connection = connection, .is_origin = true},
         .client_events = EPOLLIN,
+        .send_queue = LONG_MAX,
         .frame = HTTP_INCOMPLETE,
         .exchange = {
             .verdict_name = "-", .cache_name = "-", .origin_index = -1}};
@@ -1608,6 +1614,7 @@ static enum step reply_step(struct connection *connection)
             return connection_wait_tls(connection, status);
         }
         connection_set_deadline(connection, CLIENT_TIMEOUT);
+        connection->send_queue = LONG_MAX; /* a write: a new start */
         reply_advance(connection, count);
     }
 
@@ -1839,6 +1846,12 @@ static void connection_expire(struct connection *connection)
     case STATE_RELAY:
         relay_expire(connection);
         return;
+    case STATE_REPLY:
+        if (send_queue_has_drained(connection)) {
+            connection_set_deadline(connection, CLIENT_TIMEOUT);
+            return;
+        }
+        break;
     default:
         break;
     }
@@ -1855,6 +1868,19 @@ static void relay_expire(struct connection *connection)
         return;
     }
     connection_close(connection);
+}
+
+/* A slow client empties the kernel send queue, but EPOLLOUT comes only
+   when a large part of the queue is free. At 50 KB/s that is more than
+   CLIENT_TIMEOUT. So the bytes move although rproxy writes none: a queue
+   that is smaller than at the last deadline is progress. */
+static bool send_queue_has_drained(struct connection *connection)
+{
+    long queue = socket_get_queue(connection->conn_fd, SIOCOUTQ);
+    bool has_drained = queue < connection->send_queue;
+    connection->send_queue = queue;
+
+    return has_drained;
 }
 
 static void loop_free_closed(struct event_loop *loop)

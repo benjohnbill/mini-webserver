@@ -52,15 +52,17 @@ bench/demo/demo.sh present
 
 Act 3 (`conn-cap`) is not in the talk. `demo.sh act 3` still runs it.
 
-## Acceptance (2026-11-25, 3 runs of each Act)
+## Acceptance (2026-11-25, 3 runs of each Act; Act 1 again after the send queue fix)
 
 | Act | Condition | Result of the 3 runs |
 |---|---|---|
-| 1 | OOM kill in 15–30 s. At the kill, the slow tiers hold 60 % or more of the relay bytes | Killed at 24.2, 24.3, and 24.4 s. Slow share 75, 75, and 78 %. Peak 1216–1221 MiB |
+| 1 | OOM kill in 15–30 s. At the kill, the slow tiers hold 60 % or more of the relay bytes | Killed at 18.2, 18.2, and 16.4 s. Slow share 76, 73, and 75 %. Peak 1260–1261 MiB |
 | 2 | All Phones get 502. rproxy stays alive | All 200 got 502 in each run. Peak 122–134 MiB |
 | 4 | No Phone cut in 60 s. All `fast` Phones done. Peak under 1/10 of Act 1 | 0 cut, 170 `fast` done, 30 slow Phones receiving. Peak 24–25 MiB |
 
 The relay-stats sum and the cgroup memory agree within 7 % in Act 1 (for example 1155.6 and 1165 MiB). In Act 4 the relay-stats sum is about 8 MiB of 23 MiB: the rest is the TLS buffers and the base memory of rproxy.
+
+The first runs of Act 1 hid a fault of rproxy. A slow Phone fills the kernel send queue (about 2.5 MB). EPOLLOUT comes only when a large part of the queue is free: at 50 KB/s that takes about 25 s, and at 125 KB/s about 10 s. rproxy wrote nothing in that time, so `CLIENT_TIMEOUT` (5 s) closed the connection, and its 48 MB reply left the memory. The Phone then read the rest of the kernel queue and failed. So in Act 1, the 400 kbps and 1 Mbps Phones held almost nothing, and the kill came at about 24 s. Now a reply deadline moves when the send queue is smaller than at the last deadline. Each slow Phone holds its reply, and the kill comes at 16–18 s. Acts 2 and 4 pass again after the fix, and `tests/rproxy_func.sh` passes.
 
 Two values came from these runs. With `fast` at 20 MB/s, about 14 `fast` Phones held 50 MB each at the kill, and the slow share was only 53–55 %. At 50 MB/s, fewer `fast` Phones hold a reply at the same time. With 1536 MiB and `fast` at 50 MB/s, rproxy did not die (peak 1370–1417 MiB), so the limit is 1280 MiB.
 
