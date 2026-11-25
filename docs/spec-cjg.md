@@ -575,19 +575,19 @@ Definition (from a teammate, to confirm with the team): `rproxy` reads from the 
 
 ### Stage and story
 
-The stage is an app update day: many phones on slow networks download one large file at the same time. The real case is 500 phones, 100 MB, 33 minutes. The demo uses the same ratios at a small size and says so. Each Act runs the same load with one Relay mode. The Acts form one chain: each fix leaves a new problem, and the next Act starts from it. Owner: "고민을 많이 했음이 그렇게 스토리와 서사로 드러나면 더 재미있지 않을까."
+The stage is an app update day: many phones on slow networks download one large file at the same time. The demo values (200 Phones, 8 MB, 400 KB/s) are a small model of this stage. They do not keep the ratios of a real case, and the talk does not say that they do. Each Act runs the same load with one Relay mode. The Acts form one chain: each fix leaves a new problem, and the next Act starts from it. Owner: "고민을 많이 했음이 그렇게 스토리와 서사로 드러나면 더 재미있지 않을까."
 
 | Act | Relay mode | Limit | Server | Phones | Bystander `curl` | What the presenter says |
 |---|---|---|---|---|---|---|
 | 1 | `unbounded` | nothing | killed by the OOM killer | all fail | connection refused | "With no limit, this happens." |
 | 2 | `reply-cap` | reply size (4 MiB, the current code) | alive | all get 502 | 200 | "Our code is like this now." |
-| 3 | `conn-cap` | connections that hold a reply (20) | alive, CPU idle | 20 finish, the rest get 503 | 503 | "The branch of a teammate is like this." |
+| 3 | `conn-cap` | connections that hold a reply (20) | alive, CPU idle | 20 finish, the rest get 503 | 503 | "What if we serve only 20 at a time?" |
 | 4 | `backpressure` | speed: a 64 KB buffer for each connection | alive, flat memory | all finish at their own speed | 200 | "The real cause was speed." |
-| 5 (epilogue, optional) | `backpressure`, Origin `--model pool` | as Act 4 | alive | only 4 move | 200 | "Now slow phones hold the Origin." |
+| 5 (epilogue, optional) | `backpressure`, Origin `--model pool` | as Act 4 | alive | a few move, the others wait | 200 | "Now slow phones hold the Origin." |
 
 Time plan: stage 0–10 s, Act 1 10–35 s, Act 2 35–50 s, Act 3 50–65 s, Act 4 65–110 s, end 110–120 s. Acts 2 and 3 are short because their ending is the same: the server lives and the users fail. Act 5 goes in only if a rehearsal leaves time.
 
-"We had this" applies only to Acts 2 and 3. Act 2 is the code of `CJG` now (`ORIGIN_REPLY_MAX`). Act 3 is the 503 queue of the branch `hjm`. Act 1 is a build with the limit removed.
+"We had this" applies only to Act 2, the code of `CJG` now (`ORIGIN_REPLY_MAX`). Act 3 is not the branch `hjm`: with its defaults (8 threads, a queue of 256), `hjm` rejects none of 200 Phones. Act 1 is a build with the limit removed.
 
 The presenter runs the demo live on the laptop of the owner. A recording is the backup only. Owner: "백업이 될 수 있는 걸로."
 
@@ -643,4 +643,4 @@ The screen is one terminal split in two: commands and `curl` on the left, the da
 2. `demo.sh` and a full run of Acts 1, 2, and 4.
 3. Act 3, then the recording, then Act 5. If time is short, cut from the end of this list.
 
-Results (2026-11-25): all five Acts run as the story table says. Act 1 dies at about 8 s, Act 4 peaks at about 88 MiB. The runs repeat closely, so the live demo is the main plan. See [`20261125-backpressure-demo.md`](measurements/20261125-backpressure-demo.md). The presenter flow is in [`bench/demo/README.md`](../bench/demo/README.md).
+Results (2026-11-25): Acts 1 to 4 run as the story table says. Act 5 ran for 12 s only, and its result is open. Act 1 dies at about 8 s, Act 4 peaks at about 88 MiB. The runs repeat closely, so the live demo is the main plan. See [`20261125-backpressure-demo.md`](measurements/20261125-backpressure-demo.md). The presenter flow is in [`bench/demo/README.md`](../bench/demo/README.md).
