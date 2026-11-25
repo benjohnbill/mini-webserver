@@ -119,8 +119,11 @@ int lb_status_render(char *out, size_t size, const server_config *cfg,
             snprintf(v[2], vs, "%u", b->weight);
             snprintf(v[3], vs, "%.1f%%", route_share(r, j) * 100);
             unsigned inf = __atomic_load_n(&b->inflight, __ATOMIC_RELAXED);
-            snprintf(v[4], vs, "%u/%u%s", inf, cfg->backend_cap,
-                     inf >= cfg->backend_cap ? " FULL" : "");
+            if (cfg->backend_cap == 0)
+                snprintf(v[4], vs, "%u/-", inf);
+            else
+                snprintf(v[4], vs, "%u/%u%s", inf, cfg->backend_cap,
+                         inf >= cfg->backend_cap ? " FULL" : "");
             snprintf(v[5], vs, "%lu", __atomic_load_n(&b->shed, __ATOMIC_RELAXED));
             snprintf(v[6], vs, "%u", __atomic_load_n(&b->fails, __ATOMIC_RELAXED));
             snprintf(v[7], vs, "%lu", __atomic_load_n(&b->req_ok, __ATOMIC_RELAXED));
@@ -136,9 +139,11 @@ int lb_status_render(char *out, size_t size, const server_config *cfg,
                 if ((int)strlen(v[c]) > w[c])
                     w[c] = (int)strlen(v[c]);
         }
-        if (append(&p, &left, "route %s  strategy %s  inflight cap %u\n",
-                   r->prefix, r->ketama ? "ketama" : "round-robin",
-                   cfg->backend_cap) < 0)
+        char capv[16] = "-";
+        if (cfg->backend_cap)
+            snprintf(capv, sizeof capv, "%u", cfg->backend_cap);
+        if (append(&p, &left, "route %s  strategy %s  inflight cap %s\n",
+                   r->prefix, r->ketama ? "ketama" : "round-robin", capv) < 0)
             return -1;
         /* Pass 2: header (row -1) and rows share the widths; last column unpadded. */
         for (long j = -1; j < (long)r->backend_count; j++) {

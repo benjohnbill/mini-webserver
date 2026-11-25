@@ -43,5 +43,22 @@ int main(void)
         CHECK(col(ln[3], "0s ago") == col(ln[2], "CHANGED"));
         CHECK(col(ln[4], "0s ago") == col(ln[2], "CHANGED"));
     }
+
+    /* -B 0: in-flight still shown, never FULL. */
+    cfg.backend_cap = 0;
+    b->inflight = 3;
+    CHECK(lb_status_render(out, sizeof out, &cfg, 1, 0, 0, 0) > 0);
+    printf("%s", out);
+    CHECK(strstr(out, "inflight cap -\n") != NULL);
+    CHECK(strstr(out, "FULL") == NULL);
+    count = 0;
+    for (char *s = strtok(out, "\n"); s && count < 8; s = strtok(NULL, "\n"))
+        ln[count++] = s;
+    CHECK(count == 5);
+    if (count == 5) {
+        CHECK(col(ln[2], "INFLIGHT") >= 0);
+        CHECK(col(ln[4], "3/-") >= 0);
+        CHECK(col(ln[4], "3/-") == col(ln[2], "INFLIGHT"));
+    }
     TEST_MAIN_END();
 }

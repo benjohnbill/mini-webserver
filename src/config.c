@@ -20,7 +20,9 @@ static void usage(FILE *out, const char *prog)
         "  -F          enable forward proxy (absolute-URI requests)\n"
         "  -T MS       proxy connect/IO timeout in ms (default 3000)\n"
         "  -B N        max in-flight proxied requests per backend\n"
-        "              (default max(1, threads/2), 1..1024)\n"
+        "              (default max(1, threads/2), 0..1024, 0 = no cap)\n"
+        "  -W MS       503 a client queued longer than MS\n"
+        "              (default 2000, 0..600000, 0 = off)\n"
         "  -k MS       keep-alive idle timeout in ms (default 5000)\n"
         "  -n NAME     send 'X-Server-Name: NAME' on responses\n"
         "  -R SPEC     reverse-proxy route, repeatable:\n"
@@ -52,7 +54,7 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
     const char *prog = argc > 0 ? argv[0] : "webserver";
     const char *root = "./www";
     const char *cgi = "./cgi-bin";
-    int opt, cap = 0;
+    int opt, cap = -1;
 
     memset(cfg, 0, sizeof *cfg);
     cfg->port = 8080;
@@ -60,10 +62,11 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
     cfg->queue_size = 256;
     cfg->proxy_timeout_ms = 3000;
     cfg->keepalive_timeout_ms = 5000;
+    cfg->queue_wait_max_ms = 2000;
     route_table_init(&cfg->routes);
 
     optind = 1;                         /* allow repeated calls (tests) */
-    while ((opt = getopt(argc, argv, "p:r:c:t:q:FT:B:k:n:R:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:r:c:t:q:FT:B:W:k:n:R:h")) != -1) {
         switch (opt) {
         case 'p':
             if (parse_int(optarg, 1, 65535, &cfg->port) < 0) {
@@ -93,8 +96,14 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
             }
             break;
         case 'B':
-            if (parse_int(optarg, 1, 1024, &cap) < 0) {
+            if (parse_int(optarg, 0, 1024, &cap) < 0) {
                 fprintf(stderr, "invalid backend cap: %s\n", optarg);
+                return -1;
+            }
+            break;
+        case 'W':
+            if (parse_int(optarg, 0, 600000, &cfg->queue_wait_max_ms) < 0) {
+                fprintf(stderr, "invalid queue wait limit: %s\n", optarg);
                 return -1;
             }
             break;
@@ -133,7 +142,7 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
         return -1;
     }
     /* After the loop so "-B 2 -t 16" and "-t 16 -B 2" agree. */
-    cfg->backend_cap = cap > 0 ? (unsigned)cap
+    cfg->backend_cap = cap >= 0 ? (unsigned)cap
                                : (cfg->threads / 2 > 1 ? (unsigned)cfg->threads / 2 : 1);
 
     /* Canonical absolute paths make the later "is this file inside the

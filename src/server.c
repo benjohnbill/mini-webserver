@@ -36,14 +36,11 @@
 #include "route.h"
 
 #define SEND_TIMEOUT_MS 10000         /* a stuck reader must not pin a worker */
-/* A client queued longer than this has likely given up; serving it would
- * only burn a worker on a dead request. */
-#define QUEUE_WAIT_MAX_MS 2000
 
 static volatile sig_atomic_t g_stop = 0;
 static int g_busy;                    /* workers inside handle_connection, __atomic */
 static unsigned long g_shed_queue;    /* 503: queue full at accept, __atomic */
-static unsigned long g_shed_stale;    /* 503: waited > QUEUE_WAIT_MAX_MS, __atomic */
+static unsigned long g_shed_stale;    /* 503: waited > -W, __atomic */
 
 static void on_signal(int sig)
 {
@@ -447,7 +444,8 @@ static int proxy_route(ctx *x, route *r)
     int capped = 0;
     for (size_t i = 0; i < n; i++) {
         backend *b = c[i];
-        if (!backend_try_acquire(b, x->cfg->backend_cap)) {
+        /* Cap 0 still counts in-flight (for the status page) but never sheds. */
+        if (!backend_try_acquire(b, x->cfg->backend_cap ? x->cfg->backend_cap : UINT_MAX)) {
             __atomic_fetch_add(&b->shed, 1, __ATOMIC_RELAXED);
             capped = 1;
             continue;
@@ -600,7 +598,10 @@ static void *worker_main(void *arg)
     worker_arg *wa = arg;
     client cl;
     while (queue_pop(wa->queue, &cl) == 0) {
-        if (now_ms() - cl.accepted_ms > QUEUE_WAIT_MAX_MS) {
+        /* A client queued longer than -W has likely given up; serving it
+         * would only burn a worker on a dead request. */
+        int wait_max = wa->cfg->queue_wait_max_ms;
+        if (wait_max > 0 && now_ms() - cl.accepted_ms > wait_max) {
             set_timeout(cl.fd, SO_SNDTIMEO, 1000);
             http_send_error(cl.fd, 503, 0);
             close(cl.fd);
