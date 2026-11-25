@@ -15,11 +15,11 @@ _Avoid_: slow client, dead connection, slowloris (use slowloris only for the att
 ## Concurrency
 
 **Concurrency model**:
-The method that the server uses to serve more than one connection at the same time. The server has four: `iter`, `fork`, `pool`, and `epoll`.
+The method that the server uses to serve more than one connection at the same time. The server has five: `iter`, `fork`, `pool`, `epoll`, and `epoll-pool`.
 _Avoid_: mode, strategy, dispatcher (the code may use `dispatch` as a verb only)
 
 **Worker**:
-An execution unit (a thread or a process) that serves one connection at a time. In `iter`, the main loop is the only worker. In `fork`, each child process is a worker. In `pool`, each thread of the pool is a worker. `epoll` has no worker.
+An execution unit (a thread or a process) that serves one connection at a time. In `iter`, the main loop is the only worker. In `fork`, each child process is a worker. In `pool`, each thread of the pool is a worker. `epoll` has no worker. In `epoll-pool`, each thread of the pool is a worker, but it only makes the Response plan of one request: the loop reads the request and sends the reply, so a slow client holds no worker.
 _Avoid_: thread (when you mean a worker of any model), handler
 
 **Event loop**:

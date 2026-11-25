@@ -16,6 +16,7 @@
 #include "serve.h"
 
 #define CONN_CLOSED (-2)
+#define WORK_SPIN_STEP 10000 /* additions between two clock reads */
 
 struct conn_buffer {
     char *data;
@@ -50,6 +51,24 @@ void conn_serve(int conn_fd, const struct config *config)
         buffer.used = 0;
     }
     free(buffer.data);
+}
+
+void conn_work_burn(int work_ms)
+{
+    if (work_ms <= 0) {
+        return;
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    double end = (double)now.tv_sec + (double)now.tv_nsec / 1e9 +
+                 (double)work_ms / 1000.0;
+    volatile unsigned long spin = 0;
+    do {
+        for (int i = 0; i < WORK_SPIN_STEP; i++) {
+            spin += (unsigned long)i;
+        }
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    } while ((double)now.tv_sec + (double)now.tv_nsec / 1e9 < end);
 }
 
 void conn_log(const struct request *request, const struct response_plan *plan)
@@ -124,6 +143,7 @@ static bool connection_answer(int conn_fd, const struct config *config,
     if (config->delay_ms > 0) {
         delay_sleep(config->delay_ms);
     }
+    conn_work_burn(config->work_ms);
     if (status == 0) {
         status = http_parse_request(buffer->data, request_len, &request);
     }

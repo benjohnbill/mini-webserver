@@ -32,8 +32,8 @@ int main(int argc, char **argv)
     if (!config_init_from_args(&config, argc, argv)) {
         fprintf(stderr,
                 "usage: ./server <port> <root> [--model "
-                "iter|fork|pool|epoll] [--workers N] [--timeout S] [--log] "
-                "[--delay MS]\n");
+                "iter|fork|pool|epoll|epoll-pool] [--workers N] [--timeout S] "
+                "[--log] [--delay MS] [--work MS]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -54,6 +54,7 @@ static bool config_init_from_args(struct config *config, int argc, char **argv)
         .timeout = DEFAULT_TIMEOUT,
         .log = false,
         .delay_ms = 0,
+        .work_ms = 0,
     };
     if (argc < 3 || !number_parse(argv[1], 1, PORT_MAX, &config->port)) {
         return false;
@@ -102,6 +103,9 @@ static bool option_parse(struct config *config, const char *name, char *value)
     if (strcmp(name, "--delay") == 0) {
         return number_parse(value, 0, DELAY_MAX, &config->delay_ms);
     }
+    if (strcmp(name, "--work") == 0) {
+        return number_parse(value, 0, WORK_MAX, &config->work_ms);
+    }
 
     return false;
 }
@@ -109,7 +113,8 @@ static bool option_parse(struct config *config, const char *name, char *value)
 static bool model_is_known(const char *model)
 {
     return strcmp(model, "iter") == 0 || strcmp(model, "fork") == 0 ||
-           strcmp(model, "pool") == 0 || strcmp(model, "epoll") == 0;
+           strcmp(model, "pool") == 0 || strcmp(model, "epoll") == 0 ||
+           strcmp(model, "epoll-pool") == 0;
 }
 
 /* sa_flags = 0, not signal(): with -D_POSIX_C_SOURCE, signal() keeps the
@@ -188,6 +193,9 @@ static int model_run(int listen_fd, const struct config *config)
     }
     if (strcmp(config->model, "epoll") == 0) {
         return model_epoll_run(listen_fd, config);
+    }
+    if (strcmp(config->model, "epoll-pool") == 0) {
+        return model_epoll_pool_run(listen_fd, config);
     }
 
     return model_pool_run(listen_fd, config);

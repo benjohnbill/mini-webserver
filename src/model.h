@@ -14,5 +14,7 @@ int model_iter_run(int listen_fd, const struct config *config);
 int model_fork_run(int listen_fd, const struct config *config);
 int model_pool_run(int listen_fd, const struct config *config);
 int model_epoll_run(int listen_fd, const struct config *config);
+/* epoll for the sockets, --workers threads for the Shared core */
+int model_epoll_pool_run(int listen_fd, const struct config *config);
 
 #endif

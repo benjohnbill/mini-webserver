@@ -2,31 +2,56 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "conn.h"
 #include "response.h"
 #include "send_plan.h"
 #include "serve.h"
 
-/* epoll_event.data.ptr points to it. The listen socket has NULL. */
+/* epoll_event.data.ptr points to it. The listen socket has NULL, and the
+   wake fd of the Workers has &wake_mark. */
 struct connection {
     int conn_fd;
     char *buffer; /* heap: grows to HEADER_MAX, then to the request length */
     size_t used;
     size_t capacity;
     bool is_writing; /* plan is valid and the socket waits for EPOLLOUT */
+    /* epoll-pool: a Worker makes the plan. Only the Worker touches buffer
+       and plan until the loop takes the connection back. */
+    bool is_working;
+    long frame; /* epoll-pool: the request frame for the Worker */
     struct response_plan plan;
     size_t offset; /* bytes of plan already sent */
     time_t last_active;
     struct connection *prev;
     struct connection *next;
+    struct connection *job_next; /* epoll-pool: in the job or done list */
+};
+
+/* epoll-pool: the loop gives a full request to a Worker, and the Worker
+   gives back the connection with its plan. A slow client then waits in
+   the loop, not in a Worker. */
+struct work_pool {
+    pthread_mutex_t lock;
+    pthread_cond_t has_job;
+    struct connection *jobs; /* oldest first */
+    struct connection *jobs_tail;
+    struct connection *done; /* plans that wait for the loop */
+    bool is_closed;
+    int wake_fd; /* eventfd: a Worker writes 1 when it adds to done */
+    const struct config *config;
+    pthread_t *threads;
+    int thread_count;
 };
 
 struct epoll_loop {
@@ -35,8 +60,13 @@ struct epoll_loop {
     const struct config *config;
     struct connection *connections; /* list head */
     time_t last_sweep;
+    struct work_pool *pool; /* NULL in the epoll model */
 };
 
+static struct connection wake_mark;
+
+static int epoll_serve(int listen_fd, const struct config *config,
+                       bool has_pool);
 static time_t clock_get_seconds(void);
 static int loop_run(struct epoll_loop *loop);
 static int loop_dispatch(struct epoll_loop *loop,
@@ -53,8 +83,31 @@ static int loop_handle_input(struct epoll_loop *loop,
                              const struct epoll_event *event);
 static void loop_sweep_timeouts(struct epoll_loop *loop);
 static void loop_close(struct epoll_loop *loop);
+static void plan_build(struct connection *connection,
+                       const struct config *config);
+static void connection_start_send(struct epoll_loop *loop,
+                                  struct connection *connection);
+static struct work_pool *pool_create(int epoll_fd, const struct config *config);
+static void pool_start_workers(struct work_pool *pool);
+static void pool_stop(struct work_pool *pool);
+static void pool_push(struct work_pool *pool, struct connection *connection);
+static void *worker_main(void *arg);
+static void worker_give_back(struct work_pool *pool,
+                             struct connection *connection);
+static void loop_take_done(struct epoll_loop *loop);
 
 int model_epoll_run(int listen_fd, const struct config *config)
+{
+    return epoll_serve(listen_fd, config, false);
+}
+
+int model_epoll_pool_run(int listen_fd, const struct config *config)
+{
+    return epoll_serve(listen_fd, config, true);
+}
+
+static int epoll_serve(int listen_fd, const struct config *config,
+                       bool has_pool)
 {
     struct epoll_loop loop = {
         .listen_fd = listen_fd,
@@ -72,6 +125,13 @@ int model_epoll_run(int listen_fd, const struct config *config)
         perror("epoll_ctl");
         close(loop.epoll_fd);
         return 1;
+    }
+    if (has_pool) {
+        loop.pool = pool_create(loop.epoll_fd, config);
+        if (loop.pool == NULL) {
+            close(loop.epoll_fd);
+            return 1;
+        }
     }
 
     int result = loop_run(&loop);
@@ -113,6 +173,13 @@ static int loop_dispatch(struct epoll_loop *loop,
                          const struct epoll_event *event)
 {
     struct connection *connection = event->data.ptr;
+    if (connection == &wake_mark) {
+        loop_take_done(loop);
+        return 0;
+    }
+    if (connection != NULL && connection->is_working) {
+        return 0; /* a hang-up waits until the Worker gives it back */
+    }
     if (connection != NULL && connection->is_writing) {
         connection_send(loop, connection);
         return 0;
@@ -206,22 +273,52 @@ static void loop_accept(struct epoll_loop *loop)
     loop->connections = connection;
 }
 
-/* Full request in the buffer: build the plan, then wait for EPOLLOUT. */
+/* Full request in the buffer: build the plan, then wait for EPOLLOUT. In
+   epoll-pool a Worker builds the plan, and the loop serves the others. */
 static void connection_reply(struct epoll_loop *loop,
                              struct connection *connection, long frame)
 {
+    connection->frame = frame;
+    if (loop->pool != NULL) {
+        /* No events while a Worker has it. EPOLLHUP still comes, and
+           loop_dispatch drops it. */
+        connection->is_working = true;
+        if (connection_watch(loop, connection, 0) != 0) {
+            connection_close(loop, connection);
+            return;
+        }
+        pool_push(loop->pool, connection);
+        return;
+    }
+    plan_build(connection, loop->config);
+    connection_start_send(loop, connection);
+}
+
+/* The Shared core part of one request. --work burns CPU first: the
+   Handler time of a real Origin. */
+static void plan_build(struct connection *connection,
+                       const struct config *config)
+{
+    conn_work_burn(config->work_ms);
+    long frame = connection->frame;
     struct request request;
     int status =
         frame < HTTP_INCOMPLETE
             ? (int)-frame
             : http_parse_request(connection->buffer, (size_t)frame, &request);
     if (status == 0) {
-        serve_request(&request, loop->config, &connection->plan);
+        serve_request(&request, config, &connection->plan);
     } else {
         response_plan_init_error(&connection->plan, status, true);
     }
+}
+
+static void connection_start_send(struct epoll_loop *loop,
+                                  struct connection *connection)
+{
     connection->is_writing = true;
     connection->offset = 0;
+    connection->last_active = clock_get_seconds();
     if (connection_watch(loop, connection, EPOLLOUT) != 0) {
         connection_close(loop, connection);
     }
@@ -278,6 +375,7 @@ static int loop_handle_input(struct epoll_loop *loop,
     return 0;
 }
 
+/* A connection at a Worker is not idle: the sweep skips it. */
 static void loop_sweep_timeouts(struct epoll_loop *loop)
 {
     time_t now = clock_get_seconds();
@@ -289,17 +387,157 @@ static void loop_sweep_timeouts(struct epoll_loop *loop)
     struct connection *connection = loop->connections;
     while (connection != NULL) {
         struct connection *next = connection->next;
-        if (now - connection->last_active >= loop->config->timeout) {
+        if (!connection->is_working &&
+            now - connection->last_active >= loop->config->timeout) {
             connection_close(loop, connection);
         }
         connection = next;
     }
 }
 
+/* The Workers stop first, so no Worker touches a connection that the loop
+   frees. */
 static void loop_close(struct epoll_loop *loop)
 {
+    if (loop->pool != NULL) {
+        pool_stop(loop->pool);
+        loop_take_done(loop);
+        pthread_mutex_destroy(&loop->pool->lock);
+        pthread_cond_destroy(&loop->pool->has_job);
+        close(loop->pool->wake_fd);
+        free(loop->pool);
+    }
     while (loop->connections != NULL) {
         connection_close(loop, loop->connections);
     }
     close(loop->epoll_fd);
+}
+
+static struct work_pool *pool_create(int epoll_fd, const struct config *config)
+{
+    struct work_pool *pool = calloc(1, sizeof(*pool));
+    if (pool == NULL) {
+        return NULL;
+    }
+    pool->config = config;
+    pool->wake_fd = eventfd(0, EFD_NONBLOCK);
+    struct epoll_event event = {.events = EPOLLIN, .data.ptr = &wake_mark};
+    pool->threads = calloc((size_t)config->workers, sizeof(*pool->threads));
+    if (pool->wake_fd < 0 || pool->threads == NULL ||
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, pool->wake_fd, &event) < 0) {
+        perror("epoll-pool");
+        if (pool->wake_fd >= 0) {
+            close(pool->wake_fd);
+        }
+        free(pool->threads);
+        free(pool);
+        return NULL;
+    }
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->has_job, NULL);
+    pool_start_workers(pool);
+
+    return pool;
+}
+
+/* Workers inherit this mask, so only the main thread gets the signals. */
+static void pool_start_workers(struct work_pool *pool)
+{
+    sigset_t blocked;
+    sigset_t old;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &blocked, &old);
+    for (int i = 0; i < pool->config->workers; i++) {
+        if (pthread_create(&pool->threads[i], NULL, worker_main, pool) == 0) {
+            pool->thread_count++;
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+/* A Worker ends its current job, then stops. Jobs still in the list stay
+   in loop->connections, and loop_close frees them. */
+static void pool_stop(struct work_pool *pool)
+{
+    pthread_mutex_lock(&pool->lock);
+    pool->is_closed = true;
+    pthread_cond_broadcast(&pool->has_job);
+    pthread_mutex_unlock(&pool->lock);
+    for (int i = 0; i < pool->thread_count; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    free(pool->threads);
+}
+
+static void pool_push(struct work_pool *pool, struct connection *connection)
+{
+    connection->job_next = NULL;
+    pthread_mutex_lock(&pool->lock);
+    if (pool->jobs_tail != NULL) {
+        pool->jobs_tail->job_next = connection;
+    } else {
+        pool->jobs = connection;
+    }
+    pool->jobs_tail = connection;
+    pthread_cond_signal(&pool->has_job);
+    pthread_mutex_unlock(&pool->lock);
+}
+
+static void *worker_main(void *arg)
+{
+    struct work_pool *pool = arg;
+    for (;;) {
+        pthread_mutex_lock(&pool->lock);
+        while (pool->jobs == NULL && !pool->is_closed) {
+            pthread_cond_wait(&pool->has_job, &pool->lock);
+        }
+        struct connection *connection = pool->jobs;
+        if (connection == NULL) {
+            pthread_mutex_unlock(&pool->lock);
+            return NULL;
+        }
+        pool->jobs = connection->job_next;
+        if (pool->jobs == NULL) {
+            pool->jobs_tail = NULL;
+        }
+        pthread_mutex_unlock(&pool->lock);
+
+        plan_build(connection, pool->config);
+        worker_give_back(pool, connection);
+    }
+}
+
+static void worker_give_back(struct work_pool *pool,
+                             struct connection *connection)
+{
+    pthread_mutex_lock(&pool->lock);
+    connection->job_next = pool->done;
+    pool->done = connection;
+    pthread_mutex_unlock(&pool->lock);
+    uint64_t one = 1;
+    if (write(pool->wake_fd, &one, sizeof(one)) < 0) {
+        /* EAGAIN: the counter is full, and the loop wakes anyway. */
+    }
+}
+
+/* The loop takes back the connections that have a plan, and sends. */
+static void loop_take_done(struct epoll_loop *loop)
+{
+    uint64_t count;
+    if (read(loop->pool->wake_fd, &count, sizeof(count)) < 0) {
+        /* EAGAIN: no write since the last read, the list can still have
+           connections from before. */
+    }
+    pthread_mutex_lock(&loop->pool->lock);
+    struct connection *connection = loop->pool->done;
+    loop->pool->done = NULL;
+    pthread_mutex_unlock(&loop->pool->lock);
+    while (connection != NULL) {
+        struct connection *next = connection->job_next;
+        connection->is_working = false;
+        connection_start_send(loop, connection);
+        connection = next;
+    }
 }
