@@ -32,7 +32,11 @@ static size_t pick1(route *r, const char *key)
 {
     backend *b = NULL;
     CHECK(route_pick(r, key, &b, 1) == 1);
-    return b ? (size_t)(b - r->backends) : 0;
+    for (size_t i = 0; b && i < r->backend_count; ++i)
+        if (r->backends[i] == b)
+            return i;
+    CHECK(b == NULL);
+    return 0;
 }
 
 static void test_parse(void)
@@ -45,18 +49,18 @@ static void test_parse(void)
     const route *entry = &table.routes[0];
     CHECK_STR(entry->prefix, "/api/");
     CHECK(entry->backend_count == 3);
-    CHECK_STR(entry->backends[0].host, "one");
-    CHECK_STR(entry->backends[0].port, "1");
-    CHECK_STR(entry->backends[1].host, "::1");
-    CHECK_STR(entry->backends[1].port, "8001");
-    CHECK_STR(entry->backends[2].port, "65535");
+    CHECK_STR(entry->backends[0]->host, "one");
+    CHECK_STR(entry->backends[0]->port, "1");
+    CHECK_STR(entry->backends[1]->host, "::1");
+    CHECK_STR(entry->backends[1]->port, "8001");
+    CHECK_STR(entry->backends[2]->port, "65535");
     CHECK(entry->ketama == 0);
-    CHECK(entry->backends[0].weight == 1);
+    CHECK(entry->weight[0] == 1);
     CHECK(entry->ring_len == 0);
-    CHECK(backend_is_up(&entry->backends[0]));
-    CHECK(entry->backends[0].changed_ms > 0);
-    CHECK(__atomic_load_n(&entry->backends[0].inflight, __ATOMIC_RELAXED) == 0);
-    CHECK(__atomic_load_n(&entry->backends[0].shed, __ATOMIC_RELAXED) == 0);
+    CHECK(backend_is_up(entry->backends[0]));
+    CHECK(entry->backends[0]->changed_ms > 0);
+    CHECK(__atomic_load_n(&entry->backends[0]->inflight, __ATOMIC_RELAXED) == 0);
+    CHECK(__atomic_load_n(&entry->backends[0]->shed, __ATOMIC_RELAXED) == 0);
     printf("sizeof(route_table) = %zu bytes\n", sizeof table);
 
     const char *invalid[] = {
@@ -90,11 +94,11 @@ static void test_parse(void)
     entry = &table.routes[1];
     CHECK_STR(entry->prefix, "/k");
     CHECK(entry->ketama == 1);
-    CHECK(entry->backends[0].weight == 2);
-    CHECK_STR(entry->backends[1].host, "::1");
-    CHECK_STR(entry->backends[1].port, "80");
-    CHECK(entry->backends[1].weight == 4);
-    CHECK(entry->backends[2].weight == 1);
+    CHECK(entry->weight[0] == 2);
+    CHECK_STR(entry->backends[1]->host, "::1");
+    CHECK_STR(entry->backends[1]->port, "80");
+    CHECK(entry->weight[1] == 4);
+    CHECK(entry->weight[2] == 1);
     CHECK(entry->ring_len == ROUTE_RING_POINTS * 7);
     for (size_t j = 1; j < entry->ring_len; ++j)
         CHECK(entry->ring_hash[j - 1] <= entry->ring_hash[j]);
@@ -103,6 +107,7 @@ static void test_parse(void)
         CHECK(route_table_add(&table, "/=a:1") == 0);
     CHECK(route_table_add(&table, "/full=a:1") == -1);
     CHECK(table.count == ROUTE_MAX_ROUTES);
+    route_table_release(&table);
 }
 
 static void test_match(void)
@@ -124,6 +129,7 @@ static void test_match(void)
     CHECK(route_match(&table, "/api/v10/items") == &table.routes[1]);
     CHECK(route_match(&table, "/apix") == &table.routes[3]);
     CHECK(route_match(&table, "/") == &table.routes[3]);
+    route_table_release(&table);
 }
 
 static void test_round_robin(void)
@@ -151,6 +157,7 @@ static void test_round_robin(void)
         CHECK(route_pick(entry, NULL, out, 3) == 3);
         CHECK(out[0] != out[1] && out[1] != out[2] && out[0] != out[2]);
     }
+    route_table_release(&table);
 }
 
 static void test_ketama_spread(void)
@@ -173,8 +180,8 @@ static void test_ketama_spread(void)
     CHECK(pick1(r, NULL) == pick1(r, ""));
 
     for (int i = 0; i < 3; ++i)
-        backend_report(&r->backends[1], 0);
-    CHECK(!backend_is_up(&r->backends[1]));
+        backend_report(r->backends[1], 0);
+    CHECK(!backend_is_up(r->backends[1]));
     int moved = 0, naive_moved = 0;
     for (int i = 0; i < KEYS; ++i) {
         size_t now = pick1(r, key_of(i));
@@ -195,6 +202,7 @@ static void test_ketama_spread(void)
         heavy += pick1(r, key_of(i)) == 0;
     printf("ketama 2:1:1: backend 0 %.1f%% of keys\n", 100.0 * heavy / KEYS);
     CHECK(heavy > KEYS * 45 / 100 && heavy < KEYS * 55 / 100);
+    route_table_release(&table);
 }
 
 static void test_pick(void)
@@ -213,14 +221,15 @@ static void test_pick(void)
         CHECK(out[0] != out[1] && out[1] != out[2] && out[0] != out[2]);
 
         for (int i = 0; i < 3; ++i)
-            backend_report(&r->backends[0], 0);
+            backend_report(r->backends[0], 0);
         CHECK(route_pick(r, "k", out, 4) == 2);
-        CHECK(out[0] != &r->backends[0] && out[1] != &r->backends[0]);
+        CHECK(out[0] != r->backends[0] && out[1] != r->backends[0]);
         for (size_t b = 1; b < 3; ++b)
             for (int i = 0; i < 3; ++i)
-                backend_report(&r->backends[b], 0);
+                backend_report(r->backends[b], 0);
         CHECK(route_pick(r, "k", out, 4) == 0);
     }
+    route_table_release(&table);
 }
 
 static void test_health(void)
@@ -262,6 +271,7 @@ static void test_share(void)
         CHECK(sum > 0.999999 && sum < 1.000001);
     }
     CHECK(route_share(&table.routes[1], 2) == 0.5);
+    route_table_release(&table);
 }
 
 static void test_backend_cap(void)

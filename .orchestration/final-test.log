@@ -1,0 +1,385 @@
+===== [2026-11-25 17:52:50] bash scripts/dev.sh make clean all
+rm -rf build webserver
+mkdir -p build
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/cgi.o src/cgi.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/config.o src/config.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/health.o src/health.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/http.o src/http.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/main.o src/main.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/mime.o src/mime.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/proxy.o src/proxy.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/route.o src/route.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -c -o build/server.o src/server.c
+cc -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o webserver build/cgi.o build/config.o build/health.o build/http.o build/main.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+===== rc=0
+===== [2026-11-25 17:52:56] bash scripts/dev.sh make test
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_config tests/test_config.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_health tests/test_health.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_http tests/test_http.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_mime tests/test_mime.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_proxy tests/test_proxy.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_reload tests/test_reload.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O2 -g -Wall -Wextra -Wpedantic -o build/test_route tests/test_route.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+invalid backend cap: 1025
+invalid backend cap: -1
+invalid queue wait limit: 600001
+invalid queue wait limit: 5x
+tests/test_config.c: 15 checks, 0 failures
+front :8080  workers 1/4 busy  queue 0/256  shed 0 (queue) 0 (stale)
+route /echo  strategy round-robin  inflight cap 2
+  BACKEND                  STATE  WEIGHT  SHARE   INFLIGHT  SHED  FAILS  OK           ERR  CHANGED
+  [::ffff:127.0.0.1]:19256 UP     1       50.0%   0/2       0     0      0            0    0s ago
+  127.0.0.1:19257          UP     1       50.0%   2/2 FULL  0     0      123456789012 0    0s ago
+front :8080  workers 1/4 busy  queue 0/256  shed 0 (queue) 0 (stale)
+route /echo  strategy round-robin  inflight cap -
+  BACKEND                  STATE  WEIGHT  SHARE   INFLIGHT  SHED  FAILS  OK           ERR  CHANGED
+  [::ffff:127.0.0.1]:19256 UP     1       50.0%   0/-       0     0      0            0    0s ago
+  127.0.0.1:19257          UP     1       50.0%   3/-       0     0      123456789012 0    0s ago
+tests/test_health.c: 17 checks, 0 failures
+tests/test_http.c: 118 checks, 0 failures
+tests/test_mime.c: 26 checks, 0 failures
+tests/test_proxy.c: 64 checks, 0 failures
+route file: empty backend list
+route file: empty backend list
+route file: too many backends
+route file: duplicate backend
+route file: invalid backend token
+route file: invalid backend token
+route file: invalid backend token
+route file: No such file or directory
+over 64 KiB: /tmp/test_reload.Sogjlk/list: route file exceeds 64 KiB
+missing file: /tmp/test_reload.Sogjlk/list: No such file or directory
+tests/test_reload.c: 449 checks, 0 failures
+sizeof(route_table) = 419728 bytes
+ketama equal: backend 0 30.7% of keys (ring share 30.7%)
+ketama equal: backend 1 32.9% of keys (ring share 32.8%)
+ketama equal: backend 2 36.4% of keys (ring share 36.5%)
+backend 1 down: ketama moved 32.9% of keys, naive hash % N moved 66.8%
+ketama 2:1:1: backend 0 49.2% of keys
+tests/test_route.c: 41723 checks, 0 failures
+===== rc=0
+===== [2026-11-25 17:53:02] bash scripts/dev.sh make asan
+make clean
+make[1]: Entering directory '/src'
+rm -rf build webserver
+make[1]: Leaving directory '/src'
+make all test CFLAGS="-std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer"
+make[1]: Entering directory '/src'
+mkdir -p build
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/cgi.o src/cgi.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/config.o src/config.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/health.o src/health.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/http.o src/http.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/main.o src/main.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/mime.o src/mime.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/proxy.o src/proxy.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/route.o src/route.c
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -c -o build/server.o src/server.c
+cc -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o webserver build/cgi.o build/config.o build/health.o build/http.o build/main.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_config tests/test_config.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_health tests/test_health.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_http tests/test_http.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_mime tests/test_mime.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_proxy tests/test_proxy.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_reload tests/test_reload.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+cc -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -o build/test_route tests/test_route.c build/cgi.o build/config.o build/health.o build/http.o build/mime.o build/proxy.o build/route.o build/server.o -pthread
+invalid backend cap: 1025
+invalid backend cap: -1
+invalid queue wait limit: 600001
+invalid queue wait limit: 5x
+tests/test_config.c: 15 checks, 0 failures
+front :8080  workers 1/4 busy  queue 0/256  shed 0 (queue) 0 (stale)
+route /echo  strategy round-robin  inflight cap 2
+  BACKEND                  STATE  WEIGHT  SHARE   INFLIGHT  SHED  FAILS  OK           ERR  CHANGED
+  [::ffff:127.0.0.1]:19256 UP     1       50.0%   0/2       0     0      0            0    0s ago
+  127.0.0.1:19257          UP     1       50.0%   2/2 FULL  0     0      123456789012 0    0s ago
+front :8080  workers 1/4 busy  queue 0/256  shed 0 (queue) 0 (stale)
+route /echo  strategy round-robin  inflight cap -
+  BACKEND                  STATE  WEIGHT  SHARE   INFLIGHT  SHED  FAILS  OK           ERR  CHANGED
+  [::ffff:127.0.0.1]:19256 UP     1       50.0%   0/-       0     0      0            0    0s ago
+  127.0.0.1:19257          UP     1       50.0%   3/-       0     0      123456789012 0    0s ago
+tests/test_health.c: 17 checks, 0 failures
+tests/test_http.c: 118 checks, 0 failures
+tests/test_mime.c: 26 checks, 0 failures
+tests/test_proxy.c: 64 checks, 0 failures
+route file: empty backend list
+route file: empty backend list
+route file: too many backends
+route file: duplicate backend
+route file: invalid backend token
+route file: invalid backend token
+route file: invalid backend token
+route file: No such file or directory
+over 64 KiB: /tmp/test_reload.R8rJeE/list: route file exceeds 64 KiB
+missing file: /tmp/test_reload.R8rJeE/list: No such file or directory
+tests/test_reload.c: 449 checks, 0 failures
+sizeof(route_table) = 419728 bytes
+ketama equal: backend 0 30.7% of keys (ring share 30.7%)
+ketama equal: backend 1 32.9% of keys (ring share 32.8%)
+ketama equal: backend 2 36.4% of keys (ring share 36.5%)
+backend 1 down: ketama moved 32.9% of keys, naive hash % N moved 66.8%
+ketama 2:1:1: backend 0 49.2% of keys
+tests/test_route.c: 41723 checks, 0 failures
+make[1]: Leaving directory '/src'
+===== rc=0
+===== [2026-11-25 17:53:16] bash scripts/dev.sh bash scripts/functional_test.sh
+== static files
+  ok   GET / -> 200
+  ok   index is text/html
+  ok   css mime
+  ok   png mime
+  ok   Content-Length matches file
+  ok   HEAD has no body
+  ok   missing -> 404
+  ok   traversal -> 400/403/404
+  ok   encoded traversal blocked
+  ok   POST static -> 405
+== dynamic (CGI)
+  ok   CGI GET 200
+  ok   CGI sees QUERY_STRING
+  ok   CGI POST body via stdin
+  ok   missing CGI -> 404
+== reverse proxy
+  ok   round-robin b1/b2
+  ok   POST body relayed
+  ok   backend down -> 502
+  ok   backend timeout -> 504
+== forward proxy
+  ok   curl -x via proxy
+  ok   forward proxy reached b2
+  ok   unreachable origin -> 502
+== ketama / lb status
+  ok   sticky 127.0.0.5 -> b1 
+  ok   sticky 127.0.0.6 -> b1 
+  ok   sticky 127.0.0.7 -> b2 
+  ok   /_lb/status from loopback -> 200
+  ok   /_lb/status mentions ketama
+  ok   /_lb/status from non-loopback -> 404
+== protocol edge cases
+  ok   garbage -> 400
+  ok   bad version -> 505
+  ok   unknown method -> 501
+  ok   1.1 without Host -> 400
+  ok   long URI -> 414
+  ok   huge body -> 413
+  ok   keep-alive pipelined x2
+  ok   survives abrupt close
+== concurrency
+  ok   ab 2000 req / c=50, 0 failed
+       Requests per second:    2364.53 [#/sec] (mean)
+== back-pressure
+  ok   paused b2 stays UP and FULL
+  ok   b2 key spills -> 200
+  ok   spill reached b1
+  ok   paused b1 stays UP and FULL
+  ok   GET / while both backends full -> 200
+  ok   both backends full -> 503
+  ok   503 carries Retry-After
+  ok   held b1 request completes after resume
+  ok   held b2 request completes after resume
+== connection queue shedding
+  ok   queue/stale shed counters start at zero
+       queue full: 503, Retry-After: 1
+       queue stale: 503, Retry-After: 1
+  ok   both queue rejections carry Retry-After
+  ok   queue/stale shed counters each increased by one
+== backend list reload (SIGHUP)
+  ok   file route at start
+  ok   both file backends serve
+  ok   added backend in status within 1 s
+  ok   reload: ok logged
+  ok   kept backend keeps OK counter
+  ok   added backend gets traffic
+  ok   removed backend leaves status within 1 s
+  ok   removed backend gets no traffic
+  ok   front survives SIGHUP
+  ok   reload took effect under load (63 of 64)
+  ok   ab 6000 req with 64 reloads, 0 failed
+  ok   ab with reloads, 0 non-2xx
+  ok   ab completed 6000
+  ok   bad file 'not-a-backend' logs reload: failed
+  ok   bad file 'not-a-backend' keeps the list
+  ok   bad file '' logs reload: failed
+  ok   bad file '' keeps the list
+  ok   bad file '127.0.0.1:8004 127.0.0.1:8004' logs reload: failed
+  ok   bad file '127.0.0.1:8004 127.0.0.1:8004' keeps the list
+  ok   missing file logs reload: failed
+  ok   missing file keeps the list
+  ok   kept list keeps OK counter
+  ok   kept list still serves
+       reload: failed: /tmp/tmp.8F1hc4Ty4a/reload.route: No such file or directory
+       reload: failed: /tmp/tmp.8F1hc4Ty4a/reload.route: duplicate backend
+       reload: failed: /tmp/tmp.8F1hc4Ty4a/reload.route: empty backend list
+       reload: failed: /tmp/tmp.8F1hc4Ty4a/reload.route: invalid backend token
+== failover (b1 killed)
+  ok   ketama skips dead b1
+  ok   round-robin skips dead b1
+  ok   status shows 127.0.0.1:8001 DOWN
+== graceful shutdown
+  ok   SIGTERM exits
+  ok   SIGTERM exits (front2)
+
+passed 76, failed 0
+===== rc=0
+===== [2026-11-25 17:54:11] copy container: lb.sh regression (script below, then output)
+set -u
+L=scripts/lb.sh
+rows() { curl -s -m 1 http://127.0.0.1:8080/_lb/status | awk '$1 ~ /^127\.0\.0\.1:/ {print $1}' | tr '\n' ' '; }
+want() { for b in $(cat .lb/backends); do printf '127.0.0.1:%s ' $((8000 + ${b#b})); done; }
+check() { if [ "$2" = "$3" ]; then echo "  PASS $1"; else echo "  FAIL $1 (expected '$2', got '$3')"; fi; }
+make -s all 2>&1 | tail -3
+echo "## up"; bash $L up; P=$(cat .lb/front.pid)
+echo "cmdline: $(tr '\0' ' ' </proc/$P/cmdline)"
+echo "## add/add/remove b2 under load"
+rm -f /tmp/stop
+( n=0; bad=0; while [ ! -f /tmp/stop ]; do c=$(curl -s -o /dev/null -w '%{http_code}' -m 3 --interface 127.0.0.$((n % 50 + 2)) http://127.0.0.1:8080/echo); [ "$c" = 200 ] || bad=$((bad+1)); n=$((n+1)); done; echo "$n $bad" >/tmp/load ) & LOAD=$!
+sleep 0.5
+bash $L add; echo "rc=$?"; bash $L add; echo "rc=$?"; bash $L remove b2; echo "rc=$?"
+sleep 0.5; touch /tmp/stop; wait $LOAD; read n bad </tmp/load; echo "load: $n requests, $bad non-200"
+check "front pid unchanged" "$P" "$(cat .lb/front.pid)"
+check "load non-200" 0 "$bad"
+check "status rows = members" "$(want)" "$(rows)"
+grep '^reload' .lb/front.log
+echo "## fill to 8, 9th add"
+while [ "$(wc -w <.lb/backends)" -lt 8 ]; do bash $L add | tail -1; done
+bash $L add; rc=$?
+check "9th add rc" 1 "$rc"; check "front pid unchanged after 9th" "$P" "$(cat .lb/front.pid)"
+check "members still 8" 8 "$(wc -w <.lb/backends)"
+echo "## old inline front -> remove restarts on file route"
+bash $L stop front
+nohup ./webserver -p 8080 -r www -c cgi-bin -R "/echo@ketama=$(for b in $(cat .lb/backends); do printf '127.0.0.1:%s,' $((8000 + ${b#b})); done | sed 's/,$//')" >.lb/front.log 2>&1 &
+echo $! >.lb/front.pid; sleep 0.5; OLD=$(cat .lb/front.pid); echo "old cmdline: $(tr '\0' ' ' </proc/$OLD/cmdline | cut -c1-90)..."
+bash $L remove b3; echo "rc=$?"; NEW=$(cat .lb/front.pid)
+check "old front replaced" 1 "$([ "$OLD" != "$NEW" ] && echo 1)"
+check "new front on file route" 1 "$(tr '\0' ' ' </proc/$NEW/cmdline | grep -q '=@' && echo 1)"
+check "status rows = members" "$(want)" "$(rows)"
+echo "## add within 0.05 s of front start (HUP during start-up)"
+bash $L remove b8 | tail -1
+bash $L stop front
+bash $L start front & ST=$!
+sleep 0.05
+FP=$(cat .lb/front.pid 2>/dev/null); echo "front pid at add time: ${FP:-none} (accepting: $( (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null && echo yes || echo no))"
+bash $L add; echo "add rc=$?"
+wait $ST; echo "start rc=$?"
+sleep 0.3
+check "front still the same process" "$FP" "$(cat .lb/front.pid)"
+check "front alive" 1 "$(kill -0 "$(cat .lb/front.pid)" 2>/dev/null && echo 1)"
+check "status rows = members after early add" "$(want)" "$(rows)"
+grep '^reload' .lb/front.log
+bash $L down >/dev/null
+----- output
+## up
+b1 started (pid 72, :8001, webserver)
+b2 started (pid 97, :8002, webserver)
+b3 started (pid 122, :8003, webserver)
+front started (pid 156, :8080, webserver)
+cmdline: ./webserver -p 8080 -r www -c cgi-bin -B 2 -W 2000 -T 1000 -t 8 -R /echo@ketama=@.lb/front.route 
+## add/add/remove b2 under load
+b4 started (pid 266, :8004, webserver)
+front reloaded (pid 156, :8080, webserver)
+backends: b1 b2 b3 b4 
+rc=0
+b5 started (pid 349, :8005, webserver)
+front reloaded (pid 156, :8080, webserver)
+backends: b1 b2 b3 b4 b5 
+rc=0
+front reloaded (pid 156, :8080, webserver)
+b2 stopped
+backends: b1 b3 b4 b5 
+rc=0
+load: 160 requests, 0 non-200
+  PASS front pid unchanged
+  PASS load non-200
+  PASS status rows = members
+reload: ok
+reload: ok
+reload: ok
+## fill to 8, 9th add
+backends: b1 b2 b3 b4 b5 
+backends: b1 b2 b3 b4 b5 b6 
+backends: b1 b2 b3 b4 b5 b6 b7 
+backends: b1 b2 b3 b4 b5 b6 b7 b8 
+the front takes at most 8 backends (ROUTE_MAX_BACKENDS); remove one first
+  PASS 9th add rc
+  PASS front pid unchanged after 9th
+  PASS members still 8
+## old inline front -> remove restarts on file route
+front stopped
+old cmdline: ./webserver -p 8080 -r www -c cgi-bin -R /echo@ketama=127.0.0.1:8001,127.0.0.1:8002,127.0....
+front started (pid 1037, :8080, webserver)
+b3 stopped
+backends: b1 b2 b4 b5 b6 b7 b8 
+rc=0
+  PASS old front replaced
+  PASS new front on file route
+  PASS status rows = members
+## add within 0.05 s of front start (HUP during start-up)
+backends: b1 b2 b4 b5 b6 b7 
+front stopped
+front started (pid 1208, :8080, webserver)
+front pid at add time: 1208 (accepting: yes)
+b3 started (pid 1253, :8003, webserver)
+front reloaded (pid 1208, :8080, webserver)
+backends: b1 b2 b3 b4 b5 b6 b7 
+add rc=0
+start rc=0
+  PASS front still the same process
+  PASS front alive
+  PASS status rows = members after early add
+reload: ok
+===== end
+===== [2026-11-25 17:54:51] copy container: SIGHUP right after exec (extra, start-up window)
+make -s all >/dev/null 2>&1
+printf '127.0.0.1:9001\n' > /tmp/r.route
+./webserver -p 9001 -n x -r www 2>/dev/null & BX=$!
+dead=0 noreload=0 pend=0
+for d in 0 0 0 0 0 0.001 0.001 0.002 0.002 0.005 0.005 0.01 0.01 0.02 0.02 0.03 0.05 0.05 0.1 0.2; do
+  ./webserver -p 9080 -r www -R "/echo=@/tmp/r.route" 2>/tmp/f.log & F=$!
+  [ "$d" = 0 ] || sleep $d
+  kill -HUP $F
+  for _ in $(seq 30); do curl -s -m 0.2 -o /dev/null http://127.0.0.1:9080/ && break; sleep 0.05; done
+  sleep 0.6
+  if ! kill -0 $F 2>/dev/null; then dead=$((dead+1)); echo "delay $d: front DIED ($(tail -1 /tmp/f.log))"
+  else
+    c=$(curl -s -o /dev/null -w '%{http_code}' -m 2 http://127.0.0.1:9080/echo)
+    r=$(grep -c '^reload: ok' /tmp/f.log)
+    echo "delay $d: alive, /echo $c, reload: ok x$r"
+    [ "$r" -ge 1 ] || noreload=$((noreload+1))
+  fi
+  kill $F 2>/dev/null; wait $F 2>/dev/null
+done
+kill $BX
+echo "SUMMARY: 20 runs, died $dead, no reload line $noreload"
+----- output
+bash: line 9:    43 Hangup                  ./webserver -p 9080 -r www -R "/echo=@/tmp/r.route" 2> /tmp/f.log
+delay 0: front DIED ()
+tail: cannot open '/tmp/f.log' for reading: No such file or directory
+bash: line 9:   116 Hangup                  ./webserver -p 9080 -r www -R "/echo=@/tmp/r.route" 2> /tmp/f.log
+tail: cannot open '/tmp/f.log' for reading: No such file or directory
+delay 0: front DIED ()
+bash: line 9:   180 Hangup                  ./webserver -p 9080 -r www -R "/echo=@/tmp/r.route" 2> /tmp/f.log
+tail: cannot open '/tmp/f.log' for reading: No such file or directory
+delay 0: front DIED ()
+bash: line 9:   244 Hangup                  ./webserver -p 9080 -r www -R "/echo=@/tmp/r.route" 2> /tmp/f.log
+tail: cannot open '/tmp/f.log' for reading: No such file or directory
+delay 0: front DIED ()
+bash: line 9:   308 Hangup                  ./webserver -p 9080 -r www -R "/echo=@/tmp/r.route" 2> /tmp/f.log
+tail: cannot open '/tmp/f.log' for reading: No such file or directory
+delay 0: front DIED ()
+delay 0.001: alive, /echo 200, reload: ok x1
+delay 0.001: alive, /echo 200, reload: ok x1
+delay 0.002: alive, /echo 200, reload: ok x1
+delay 0.002: alive, /echo 200, reload: ok x1
+delay 0.005: alive, /echo 200, reload: ok x1
+delay 0.005: alive, /echo 200, reload: ok x1
+delay 0.01: alive, /echo 200, reload: ok x1
+delay 0.01: alive, /echo 200, reload: ok x1
+delay 0.02: alive, /echo 200, reload: ok x1
+delay 0.02: alive, /echo 200, reload: ok x1
+delay 0.03: alive, /echo 200, reload: ok x1
+delay 0.05: alive, /echo 200, reload: ok x1
+delay 0.05: alive, /echo 200, reload: ok x1
+delay 0.1: alive, /echo 200, reload: ok x1
+delay 0.2: alive, /echo 200, reload: ok x1
+SUMMARY: 20 runs, died 5, no reload line 0
+===== end

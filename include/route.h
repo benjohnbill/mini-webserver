@@ -1,6 +1,7 @@
 #ifndef ROUTE_H
 #define ROUTE_H
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,7 +17,7 @@
 typedef struct {
     char host[256];
     char port[8];
-    unsigned weight;                      /* 1..ROUTE_MAX_WEIGHT, "*N" in spec */
+    unsigned refs;                        /* atomic lifetime references */
     /* Health state: read/written only with __atomic builtins. */
     int down;                             /* 0 = UP, 1 = DOWN */
     unsigned fails;                       /* consecutive failures */
@@ -30,7 +31,9 @@ typedef struct {
 
 typedef struct {
     char prefix[256];                     /* e.g. "/api/" */
-    backend backends[ROUTE_MAX_BACKENDS];
+    backend *backends[ROUTE_MAX_BACKENDS];
+    unsigned weight[ROUTE_MAX_BACKENDS];
+    char file[256];                       /* absolute path, or empty for inline */
     size_t backend_count;
     unsigned int next;                    /* round-robin cursor, use atomics */
     int ketama;                           /* "@ketama" after the prefix */
@@ -44,13 +47,33 @@ typedef struct {
 typedef struct {
     route routes[ROUTE_MAX_ROUTES];
     size_t count;
+    unsigned refs;
+    int heap;
 } route_table;
 
+typedef struct {
+    pthread_mutex_t lock;
+    route_table *cur;
+} route_live;
+
 void route_table_init(route_table *t);
+void route_table_release(route_table *t);
+
+/* Build a new table while the caller holds old. Failure leaves *out unchanged. */
+int route_table_reload(const route_table *old, route_table **out,
+                       char *err, size_t err_size);
+
+/* Init and swap take ownership of the caller's reference. */
+void route_live_init(route_live *l, route_table *t);
+/* Hold the returned reference for as long as its routes or backends are used. */
+route_table *route_live_acquire(route_live *l);
+void route_live_swap(route_live *l, route_table *t);
+void route_live_destroy(route_live *l);
 
 /* Add a route from a spec string:
  *   "/api/=127.0.0.1:8001,127.0.0.1:8003"
  *   "/echo@ketama=127.0.0.1:8001*2,127.0.0.1:8002"   (*N = weight 1..4)
+ *   "/echo@ketama=@./backends.list"
  * prefix must start with '/'. Returns 0 on success, -1 on malformed spec
  * or table full (table unchanged on failure). */
 int route_table_add(route_table *t, const char *spec);

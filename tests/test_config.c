@@ -4,10 +4,16 @@
 
 static server_config cfg;             /* route_table is too big for the stack */
 
+static int live;                     /* cfg.live holds a table from the last good parse */
+
 static int parse(const char *a, const char *b)
 {
     char *argv[] = { "webserver", "-r", ".", "-c", ".", (char *)a, (char *)b, NULL };
-    return config_parse_args(&cfg, a ? 7 : 5, argv);
+    if (live)
+        route_live_destroy(&cfg.live);
+    int rc = config_parse_args(&cfg, a ? 7 : 5, argv);
+    live = rc == 0;
+    return rc;
 }
 
 int main(void)
@@ -29,5 +35,7 @@ int main(void)
     CHECK(cfg.queue_wait_max_ms == 600000);
     CHECK(parse("-W", "600001") == -1);
     CHECK(parse("-W", "5x") == -1);
+    if (live)
+        route_live_destroy(&cfg.live);
     TEST_MAIN_END();
 }

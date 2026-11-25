@@ -8,6 +8,7 @@
 #   :8003  black hole (accepts, never answers) for the timeout case
 #   :8081  second front, /echo@ketama over b1/b2 (sticky keys, health checks, cap of 1)
 #   :8082  one worker and one queue slot for connection shedding
+#   :8083  front whose /echo list is a file, re-read on SIGHUP, over r1..r3 (:8004..:8006)
 set -u
 cd "$(dirname "$0")/.."
 make -s all || exit 1
@@ -35,7 +36,16 @@ while True: conns.append(s.accept()[0])' & HOLE=$!
     -R '/slow=127.0.0.1:8003' 2>"$LOG/front.log" & FRONT=$!
 ./webserver -p 8081 -B 1 -T 8000 -R '/echo@ketama=127.0.0.1:8001,127.0.0.1:8002' 2>"$LOG/front2.log" & FRONT2=$!
 ./webserver -p 8082 -t 1 -q 1 -k 10000 2>"$LOG/front3.log" & FRONT3=$!
-trap 'kill -CONT $B1 $B2 2>/dev/null; kill $B1 $B2 $HOLE $FRONT $FRONT2 $FRONT3 2>/dev/null; wait' EXIT
+# Reload topology: front :8083 reads /echo from a file, re-read on SIGHUP; r1..r3 on :8004..:8006.
+ROUTE_FILE=$LOG/reload.route
+set_route() { printf '127.0.0.1:%s\n' "$@" >"$ROUTE_FILE.tmp" && mv -f "$ROUTE_FILE.tmp" "$ROUTE_FILE"; }
+set_route 8004 8005
+./webserver -p 8004 -n r1 -r www 2>"$LOG/r1.log" & R1=$!
+./webserver -p 8005 -n r2 -r www 2>"$LOG/r2.log" & R2=$!
+./webserver -p 8006 -n r3 -r www 2>"$LOG/r3.log" & R3=$!
+# -B 0: the load below hits one backend at times; the per-backend cap would shed 503s unrelated to reload.
+./webserver -p 8083 -B 0 -R "/echo=@$ROUTE_FILE" 2>"$LOG/front4.log" & FRONT4=$!
+trap 'kill -CONT $B1 $B2 2>/dev/null; kill $B1 $B2 $HOLE $FRONT $FRONT2 $FRONT3 $R1 $R2 $R3 $FRONT4 2>/dev/null; wait' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 sleep 0.5
@@ -209,6 +219,87 @@ with connect() as held:
         check_rejected(queued, "queue stale")
 ' && ok "both queue rejections carry Retry-After" || bad "both queue rejections carry Retry-After"
 expect "queue/stale shed counters each increased by one" "1 1" "$(queue_shed_counts)"
+
+echo "== backend list reload (SIGHUP)"
+RELOAD=http://127.0.0.1:8083
+now_ms() { date +%s%3N; }
+secs() { printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000)); }   # ms -> curl -m / sleep seconds
+rows() { # [max-seconds]: ports of the status rows, in order
+    curl -s -m "${1:-1}" "$RELOAD/_lb/status" | awk '$1 ~ /^127\.0\.0\.1:/ {sub(/.*:/, "", $1); print $1}' | tr '\n' ' '; }
+ok_of() { curl -s -m 1 "$RELOAD/_lb/status" | awk -v a="127.0.0.1:$1" '$1 == a {print $8}'; }  # OK column (no FULL at rest)
+names() { for _ in $(seq "$1"); do curl -s -m 2 -D - -o /dev/null "$RELOAD/echo" | \
+    tr -d '\r' | awk -F': ' 'tolower($1)=="x-server-name"{print $2}'; done | sort -u | tr '\n' ' '; }
+hup_rows() { # expected-rows: SIGHUP the front, then rows must match within 1 s in all
+    local end=$(( $(now_ms) + 1000 )) left
+    kill -HUP $FRONT4
+    while left=$(( end - $(now_ms) )); [ "$left" -gt 0 ]; do
+        [ "$(rows "$(secs "$left")")" = "$1" ] && return 0
+        [ "$left" -gt 100 ] && sleep 0.1
+    done
+    return 1
+}
+reloads_ok() { grep -c '^reload: ok' "$LOG/front4.log"; }
+reloads_failed() { grep -c '^reload: failed: ' "$LOG/front4.log"; }
+wait_more() { # counter-function previous: wait up to 1 s for the log count to pass previous
+    local end=$(( $(now_ms) + 1000 ))
+    while [ "$($1)" -le "$2" ] && [ "$(now_ms)" -lt "$end" ]; do sleep 0.05; done
+    [ "$($1)" -gt "$2" ]
+}
+total_ok() { curl -s -m 1 "$RELOAD/_lb/status" | awk '$1 ~ /^127\.0\.0\.1:/ {s += $8} END {print s + 0}'; }
+expect "file route at start"            "8004 8005 " "$(rows)"
+expect "both file backends serve"       "r1 r2 " "$(names 4)"
+OK1=$(ok_of 8004)
+set_route 8004 8005 8006
+hup_rows "8004 8005 8006 " && ok "added backend in status within 1 s" || bad "added backend in status (got '$(rows)')"
+expect "reload: ok logged"              1 "$(reloads_ok)"
+expect "kept backend keeps OK counter"  "$OK1" "$(ok_of 8004)"
+expect "added backend gets traffic"     "r1 r2 r3 " "$(names 6)"
+set_route 8004 8006
+hup_rows "8004 8006 " && ok "removed backend leaves status within 1 s" || bad "removed backend leaves status (got '$(rows)')"
+expect "removed backend gets no traffic" "r1 r3 " "$(names 6)"
+kill -0 $FRONT4 2>/dev/null && ok "front survives SIGHUP" || bad "front survives SIGHUP"
+
+BASE=$(total_ok)
+ab -q -n 6000 -c 20 "$RELOAD/echo" >"$LOG/ab-reload.txt" 2>&1 & AB=$!
+# Start swapping only once the load is flowing (OK counters moving).
+for _ in $(seq 40); do [ "$(total_ok)" -gt "$BASE" ] && break; sleep 0.05; done
+LISTS=("8004 8005 8006" "8005" "8006 8004")
+N=0 LIVE=0
+while kill -0 $AB 2>/dev/null; do
+    L=${LISTS[N % 3]} BEFORE=$(reloads_ok)
+    # shellcheck disable=SC2086  # L is a port list
+    set_route $L
+    # Counted only if the new list showed and reload: ok was logged while ab was still running.
+    hup_rows "$L " && wait_more reloads_ok "$BEFORE" && kill -0 $AB 2>/dev/null && LIVE=$((LIVE + 1))
+    N=$((N + 1))
+done
+wait $AB
+[ "$LIVE" -ge 1 ] && ok "reload took effect under load ($LIVE of $N)" || bad "reload took effect under load (0 of $N)"
+FAILED=$(awk '/^Failed requests/{print $3}' "$LOG/ab-reload.txt")
+NON2XX=$(awk '/^Non-2xx responses/{print $3}' "$LOG/ab-reload.txt")
+expect "ab 6000 req with $N reloads, 0 failed" 0 "${FAILED:-missing}"
+expect "ab with reloads, 0 non-2xx"     0 "${NON2XX:-0}"
+grep -q 'Complete requests: *6000' "$LOG/ab-reload.txt" && ok "ab completed 6000" || bad "ab completed 6000"
+
+set_route 8004 8006
+hup_rows "8004 8006 " || bad "settle on 8004 8006 (got '$(rows)')"
+OK1=$(ok_of 8004)
+for content in 'not-a-backend' '' '127.0.0.1:8004 127.0.0.1:8004'; do
+    FAILS=$(reloads_failed)
+    printf '%s\n' "$content" >"$ROUTE_FILE.tmp" && mv -f "$ROUTE_FILE.tmp" "$ROUTE_FILE"
+    kill -HUP $FRONT4
+    wait_more reloads_failed "$FAILS"
+    expect "bad file '$content' logs reload: failed" $((FAILS + 1)) "$(reloads_failed)"
+    expect "bad file '$content' keeps the list" "8004 8006 " "$(rows)"
+done
+FAILS=$(reloads_failed)
+rm -f "$ROUTE_FILE"; kill -HUP $FRONT4
+wait_more reloads_failed "$FAILS"
+expect "missing file logs reload: failed" $((FAILS + 1)) "$(reloads_failed)"
+expect "missing file keeps the list"    "8004 8006 " "$(rows)"
+expect "kept list keeps OK counter"     "$OK1" "$(ok_of 8004)"
+expect "kept list still serves"         "r1 r3 " "$(names 6)"
+grep '^reload: failed: ' "$LOG/front4.log" | sort -u | sed 's/^/       /'
 
 echo "== failover (b1 killed)"
 kill $B1; wait $B1 2>/dev/null

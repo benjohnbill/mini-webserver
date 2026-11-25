@@ -38,6 +38,7 @@
 #define SEND_TIMEOUT_MS 10000         /* a stuck reader must not pin a worker */
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_reload = 0;
 static int g_busy;                    /* workers inside handle_connection, __atomic */
 static unsigned long g_shed_queue;    /* 503: queue full at accept, __atomic */
 static unsigned long g_shed_stale;    /* 503: waited > -W, __atomic */
@@ -45,7 +46,13 @@ static unsigned long g_shed_stale;    /* 503: waited > -W, __atomic */
 static void on_signal(int sig)
 {
     (void)sig;
-    g_stop = 1;
+    __atomic_store_n(&g_stop, 1, __ATOMIC_RELAXED);
+}
+
+static void on_reload(int sig)
+{
+    (void)sig;
+    g_reload = 1;
 }
 
 static int64_t now_ms(void)
@@ -500,14 +507,17 @@ static int dispatch(ctx *x)
     }
 
     /* 2. reverse-proxy routes (longest prefix wins) */
-    route *r = route_match(&cfg->routes, req->path);
+    route_table *table = route_live_acquire(&cfg->live);
+    route *r = route_match(table, req->path);
     if (r != NULL) {
         x->keep_alive = 0;
         int st = proxy_route(x, r);
+        route_table_release(table);
         if (st != 0)
             return reply_error(x, st, NULL);
         return 0;
     }
+    route_table_release(table);
 
     /* 3. built-in dynamic handler, CGI, then static files */
     if (strcmp(req->path, "/echo") == 0)
@@ -561,7 +571,7 @@ static void handle_connection(server_config *cfg, client_queue *q,
     set_timeout(cl->fd, SO_RCVTIMEO, cfg->keepalive_timeout_ms);
     set_timeout(cl->fd, SO_SNDTIMEO, SEND_TIMEOUT_MS);
 
-    while (!g_stop) {
+    while (!__atomic_load_n(&g_stop, __ATOMIC_RELAXED)) {
         int rc = http_read_request(conn, req);
         if (rc < 0)
             break;                      /* closed or idle timeout */
@@ -577,7 +587,8 @@ static void handle_connection(server_config *cfg, client_queue *q,
          * If other clients are queued, answer with "Connection: close" so
          * this worker frees up instead of starving them. */
         ctx x = { cfg, cl->fd, cl->ip, req,
-                  req->keep_alive && !g_stop && !queue_has_waiting(q), q };
+                  req->keep_alive && !__atomic_load_n(&g_stop, __ATOMIC_RELAXED) &&
+                  !queue_has_waiting(q), q };
         int status = dispatch(&x);
         log_access(cl->ip, req, status);
         http_request_free(req);
@@ -681,11 +692,28 @@ static int accept_client(int lfd, client *cl)
     return 0;
 }
 
-static void accept_loop(int lfd, client_queue *q)
+static void reload_routes(route_live *live)
 {
-    while (!g_stop) {
-        /* poll with a short timeout closes the race where the signal lands
-         * between the g_stop check and a blocking accept(). */
+    char err[sizeof ((route *)0)->file + 256];
+    route_table *old = route_live_acquire(live);
+    route_table *next;
+    if (route_table_reload(old, &next, err, sizeof err) == 0) {
+        route_live_swap(live, next);
+        fprintf(stderr, "reload: ok\n");
+    } else {
+        fprintf(stderr, "reload: failed: %s\n", err);
+    }
+    route_table_release(old);
+}
+
+static void accept_loop(int lfd, client_queue *q, route_live *live)
+{
+    while (!__atomic_load_n(&g_stop, __ATOMIC_RELAXED)) {
+        if (g_reload) {
+            g_reload = 0;
+            reload_routes(live);
+        }
+        /* Bound the wait if a signal lands just before poll(). */
         struct pollfd pfd = { lfd, POLLIN, 0 };
         int r = poll(&pfd, 1, 500);
         if (r < 0) {
@@ -736,23 +764,28 @@ int server_run(server_config *cfg)
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sa.sa_handler = on_reload;
+    sigaction(SIGHUP, &sa, NULL);
 
     int lfd = open_listener(cfg->port);
-    if (lfd < 0)
+    if (lfd < 0) {
+        route_live_destroy(&cfg->live);
         return -1;
+    }
 
     client_queue queue;
     if (queue_init(&queue, (size_t)cfg->queue_size) != 0) {
         close(lfd);
+        route_live_destroy(&cfg->live);
         return -1;
     }
 
-    /* Workers block SIGINT/SIGTERM (mask is inherited at creation) so the
-     * signal is always delivered to the accepting main thread. */
+    /* Worker threads inherit the mask so the accept loop receives the signals. */
     sigset_t block, old;
     sigemptyset(&block);
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
     pthread_sigmask(SIG_BLOCK, &block, &old);
 
     pthread_t *threads = calloc((size_t)cfg->threads, sizeof *threads);
@@ -764,6 +797,7 @@ int server_run(server_config *cfg)
     /* Created while signals are blocked, like the workers. */
     if (started > 0 && health_start(cfg) != 0)
         fprintf(stderr, "could not start health checker\n");
+    sigdelset(&old, SIGHUP);
     pthread_sigmask(SIG_SETMASK, &old, NULL);
 
     if (started == 0) {
@@ -774,7 +808,7 @@ int server_run(server_config *cfg)
                 "threads=%d  forward-proxy=%s  routes=%zu\n",
                 cfg->port, cfg->root, cfg->cgi_dir[0] ? cfg->cgi_dir : "(off)",
                 started, cfg->forward_proxy ? "on" : "off", cfg->routes.count);
-        accept_loop(lfd, &queue);
+        accept_loop(lfd, &queue, &cfg->live);
         fprintf(stderr, "shutting down\n");
     }
 
@@ -788,5 +822,6 @@ int server_run(server_config *cfg)
         pthread_join(threads[i], NULL);
     free(threads);
     queue_destroy(&queue);
+    route_live_destroy(&cfg->live);
     return started == 0 ? -1 : 0;
 }

@@ -22,7 +22,8 @@ int main(void)
     cfg.backend_cap = 2;
     CHECK(route_table_add(&cfg.routes,
                           "/echo=[::ffff:127.0.0.1]:19256,127.0.0.1:19257") == 0);
-    backend *b = &cfg.routes.routes[0].backends[1];
+    route_live_init(&cfg.live, &cfg.routes);  /* lb_status_render reads cfg.live */
+    backend *b = cfg.routes.routes[0].backends[1];
     b->inflight = 2;                  /* "2/2 FULL" */
     b->req_ok = 123456789012UL;       /* wider than the OK column */
 
@@ -60,5 +61,6 @@ int main(void)
         CHECK(col(ln[4], "3/-") >= 0);
         CHECK(col(ln[4], "3/-") == col(ln[2], "INFLIGHT"));
     }
+    route_live_destroy(&cfg.live);
     TEST_MAIN_END();
 }

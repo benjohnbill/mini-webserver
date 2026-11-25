@@ -27,6 +27,7 @@ static void usage(FILE *out, const char *prog)
         "  -n NAME     send 'X-Server-Name: NAME' on responses\n"
         "  -R SPEC     reverse-proxy route, repeatable:\n"
         "              /api/=127.0.0.1:8001,127.0.0.1:8003\n"
+        "              /api/=@./backends.list (reload with SIGHUP)\n"
         "  -h          show this help\n",
         prog);
 }
@@ -71,7 +72,7 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
         case 'p':
             if (parse_int(optarg, 1, 65535, &cfg->port) < 0) {
                 fprintf(stderr, "invalid port: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'r': root = optarg; break;
@@ -79,38 +80,38 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
         case 't':
             if (parse_int(optarg, 1, 256, &cfg->threads) < 0) {
                 fprintf(stderr, "invalid thread count: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'q':
             if (parse_int(optarg, 1, 65536, &cfg->queue_size) < 0) {
                 fprintf(stderr, "invalid queue size: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'F': cfg->forward_proxy = 1; break;
         case 'T':
             if (parse_int(optarg, 1, 600000, &cfg->proxy_timeout_ms) < 0) {
                 fprintf(stderr, "invalid proxy timeout: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'B':
             if (parse_int(optarg, 0, 1024, &cap) < 0) {
                 fprintf(stderr, "invalid backend cap: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'W':
             if (parse_int(optarg, 0, 600000, &cfg->queue_wait_max_ms) < 0) {
                 fprintf(stderr, "invalid queue wait limit: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'k':
             if (parse_int(optarg, 1, 600000, &cfg->keepalive_timeout_ms) < 0) {
                 fprintf(stderr, "invalid keep-alive timeout: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'n':
@@ -118,28 +119,29 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
              * cannot inject extra header lines. */
             if (strlen(optarg) >= sizeof cfg->name || strpbrk(optarg, "\r\n")) {
                 fprintf(stderr, "invalid server name: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             strcpy(cfg->name, optarg);
             break;
         case 'R':
             if (route_table_add(&cfg->routes, optarg) != 0) {
                 fprintf(stderr, "invalid route spec: %s\n", optarg);
-                return -1;
+                goto fail;
             }
             break;
         case 'h':
             usage(stdout, prog);
+            route_table_release(&cfg->routes);
             exit(EXIT_SUCCESS);
         default:
             usage(stderr, prog);
-            return -1;
+            goto fail;
         }
     }
     if (optind < argc) {
         fprintf(stderr, "unexpected argument: %s\n", argv[optind]);
         usage(stderr, prog);
-        return -1;
+        goto fail;
     }
     /* After the loop so "-B 2 -t 16" and "-t 16 -B 2" agree. */
     cfg->backend_cap = cap >= 0 ? (unsigned)cap
@@ -149,11 +151,16 @@ int config_parse_args(server_config *cfg, int argc, char **argv)
      * root?" prefix check meaningful. */
     if (!is_dir(root) || realpath(root, cfg->root) == NULL) {
         fprintf(stderr, "static root is not a directory: %s\n", root);
-        return -1;
+        goto fail;
     }
     if (!is_dir(cgi) || realpath(cgi, cfg->cgi_dir) == NULL) {
         fprintf(stderr, "CGI directory %s not found; CGI disabled\n", cgi);
         cfg->cgi_dir[0] = '\0';
     }
+    route_live_init(&cfg->live, &cfg->routes);
     return 0;
+
+fail:
+    route_table_release(&cfg->routes);
+    return -1;
 }

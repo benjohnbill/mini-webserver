@@ -35,16 +35,18 @@ static void *health_main(void *arg)
      * non-blocking probes once there are many remote backends. */
     while (!stopping()) {
         int64_t next = now_ms() + PROBE_INTERVAL_MS;
-        for (size_t i = 0; i < cfg->routes.count && !stopping(); i++) {
-            route *r = &cfg->routes.routes[i];
+        route_table *table = route_live_acquire(&cfg->live);
+        for (size_t i = 0; i < table->count && !stopping(); i++) {
+            const route *r = &table->routes[i];
             for (size_t j = 0; j < r->backend_count && !stopping(); j++) {
-                backend *b = &r->backends[j];
+                backend *b = r->backends[j];
                 int fd = tcp_connect_timeout(b->host, b->port, PROBE_TIMEOUT_MS);
                 if (fd >= 0)
                     close(fd);
                 backend_report(b, fd >= 0);
             }
         }
+        route_table_release(table);
         /* Short sleeps so shutdown never waits a whole interval. */
         while (!stopping() && now_ms() < next) {
             struct timespec ts = { 0, STOP_POLL_MS * 1000 * 1000 };
@@ -102,21 +104,23 @@ int lb_status_render(char *out, size_t size, const server_config *cfg,
                cfg->port, busy, cfg->threads, queued, cfg->queue_size,
                shed_queue, shed_stale) < 0)
         return -1;
-    for (size_t i = 0; i < cfg->routes.count; i++) {
-        const route *r = &cfg->routes.routes[i];
+    /* Taking a snapshot only changes live's lock and the table's refcount. */
+    route_table *table = route_live_acquire((route_live *)&cfg->live);
+    for (size_t i = 0; i < table->count; i++) {
+        const route *r = &table->routes[i];
         int w[NCOL];
         for (int c = 0; c < NCOL; c++)
             w[c] = min_w[c] > (int)strlen(head[c]) ? min_w[c] : (int)strlen(head[c]);
         /* Pass 1: snapshot every value as text and widen columns to fit. */
         for (size_t j = 0; j < r->backend_count; j++) {
-            const backend *b = &r->backends[j];
+            const backend *b = r->backends[j];
             char (*v)[sizeof cell[0][0]] = cell[j];
             size_t vs = sizeof cell[0][0];
             int v6 = strchr(b->host, ':') != NULL;
             snprintf(v[0], vs, "%s%s%s:%s", v6 ? "[" : "", b->host,
                      v6 ? "]" : "", b->port);
             snprintf(v[1], vs, "%s", backend_is_up(b) ? "UP" : "DOWN");
-            snprintf(v[2], vs, "%u", b->weight);
+            snprintf(v[2], vs, "%u", r->weight[j]);
             snprintf(v[3], vs, "%.1f%%", route_share(r, j) * 100);
             unsigned inf = __atomic_load_n(&b->inflight, __ATOMIC_RELAXED);
             if (cfg->backend_cap == 0)
@@ -144,18 +148,23 @@ int lb_status_render(char *out, size_t size, const server_config *cfg,
             snprintf(capv, sizeof capv, "%u", cfg->backend_cap);
         if (append(&p, &left, "route %s  strategy %s  inflight cap %s\n",
                    r->prefix, r->ketama ? "ketama" : "round-robin", capv) < 0)
-            return -1;
+            goto too_small;
         /* Pass 2: header (row -1) and rows share the widths; last column unpadded. */
         for (long j = -1; j < (long)r->backend_count; j++) {
             if (append(&p, &left, " ") < 0)
-                return -1;
+                goto too_small;
             for (int c = 0; c < NCOL; c++)
                 if (append(&p, &left, " %-*s", c == NCOL - 1 ? 0 : w[c],
                            j < 0 ? head[c] : cell[j][c]) < 0)
-                    return -1;
+                    goto too_small;
             if (append(&p, &left, "\n") < 0)
-                return -1;
+                goto too_small;
         }
     }
+    route_table_release(table);
     return (int)(size - left);
+
+too_small:
+    route_table_release(table);
+    return -1;
 }

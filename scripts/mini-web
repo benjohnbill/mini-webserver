@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Short front door to scripts/lb.sh for the lab container (herdr_lab.sh puts it on PATH):
+#   mini-web backend new        start a backend on the lowest free port, front routes there too
+#   mini-web backend rm bN      stop bN and take it out of the front's route
+#   mini-web backend ls         the front's /_lb/status table
+#   mini-web <lb.sh command>    anything else goes to lb.sh as is (status, keys 20, pause b2, ...)
+LB="$(dirname "$(readlink -f "$0")")/lb.sh"
+if [ "${1:-}" = backend ]; then
+    case ${2:-} in
+        new) exec bash "$LB" add ;;
+        rm)  exec bash "$LB" remove "${3:-}" ;;
+        ls)  exec bash "$LB" status ;;
+        *)   echo "usage: mini-web backend new | rm bN | ls"; exit 1 ;;
+    esac
+fi
+exec bash "$LB" "$@"

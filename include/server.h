@@ -21,9 +21,11 @@ typedef struct {
     unsigned backend_cap;         /* -B N, in-flight per backend, default max(1, threads/2); 0 = no cap */
     int queue_wait_max_ms;        /* -W MS, 503 if queued longer, default 2000; 0 = off */
     route_table routes;           /* -R spec, repeatable */
+    route_live live;
 } server_config;
 
-/* Parse argv. Returns 0 ok, -1 on error (usage printed to stderr). */
+/* Parse argv. On success, server_run consumes cfg->live, or the caller
+ * must destroy it before reusing cfg. Returns -1 on error. */
 int config_parse_args(server_config *cfg, int argc, char **argv);
 
 /* MIME type for a file path by extension; "application/octet-stream"

@@ -1,10 +1,14 @@
 #include "route.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 static int64_t now_ms(void)
 {
@@ -28,19 +32,21 @@ static uint32_t ring_hashstr(const char *s)
     return h;
 }
 
-static int parse_backend(backend *b, const char *start, const char *end)
+static int parse_backend(backend *b, unsigned *weight,
+                         const char *start, const char *end)
 {
     const char *separator;
     const char *host_end;
     if (start == end)
         return -1;
 
-    b->weight = 1;
+    *weight = 1;
     const char *star = memchr(start, '*', (size_t)(end - start));
     if (star) {
-        if (star + 2 != end || star[1] < '1' || star[1] > '0' + ROUTE_MAX_WEIGHT)
+        if (end - star != 2 || star == start ||
+            star[1] < '1' || star[1] > '0' + ROUTE_MAX_WEIGHT)
             return -1;
-        b->weight = (unsigned)(star[1] - '0');
+        *weight = (unsigned)(star[1] - '0');
         end = star;
     }
 
@@ -83,9 +89,7 @@ static int parse_backend(backend *b, const char *start, const char *end)
         if (inet_pton(AF_INET6, b->host, &addr) != 1)
             return -1;
     }
-    memcpy(b->port, port, port_len);
-    b->port[port_len] = '\0';
-    b->changed_ms = now_ms();
+    snprintf(b->port, sizeof b->port, "%hu", (unsigned short)number);
     return 0;
 }
 
@@ -107,8 +111,8 @@ static void build_ring(route *r)
     ring_point points[ROUTE_RING_MAX];
     size_t n = 0;
     for (size_t i = 0; i < r->backend_count; ++i) {
-        const backend *b = &r->backends[i];
-        for (unsigned k = 0; k < ROUTE_RING_POINTS * b->weight; ++k) {
+        const backend *b = r->backends[i];
+        for (unsigned k = 0; k < ROUTE_RING_POINTS * r->weight[i]; ++k) {
             char name[300];
             snprintf(name, sizeof name, "%s:%s-%u", b->host, b->port, k);
             points[n].hash = ring_hashstr(name);
@@ -127,6 +131,189 @@ static void build_ring(route *r)
 void route_table_init(route_table *t)
 {
     memset(t, 0, sizeof *t);
+    t->refs = 1;
+}
+
+static void release_backends(route *r)
+{
+    for (size_t i = 0; i < r->backend_count; ++i) {
+        backend *b = r->backends[i];
+        if (__atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0)
+            free(b);
+    }
+}
+
+void route_table_release(route_table *t)
+{
+    if (__atomic_sub_fetch(&t->refs, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    for (size_t i = 0; i < t->count; ++i)
+        release_backends(&t->routes[i]);
+    if (t->heap)
+        free(t);
+}
+
+void route_live_init(route_live *l, route_table *t)
+{
+    pthread_mutex_init(&l->lock, NULL);
+    l->cur = t;
+}
+
+route_table *route_live_acquire(route_live *l)
+{
+    pthread_mutex_lock(&l->lock);
+    route_table *t = l->cur;
+    __atomic_add_fetch(&t->refs, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&l->lock);
+    return t;
+}
+
+void route_live_swap(route_live *l, route_table *t)
+{
+    pthread_mutex_lock(&l->lock);
+    route_table *old = l->cur;
+    l->cur = t;
+    pthread_mutex_unlock(&l->lock);
+    route_table_release(old);
+}
+
+void route_live_destroy(route_live *l)
+{
+    route_table_release(l->cur);
+    pthread_mutex_destroy(&l->lock);
+}
+
+static backend *find_backend(const route *r, const backend *key)
+{
+    for (size_t i = 0; i < r->backend_count; ++i) {
+        backend *b = r->backends[i];
+        if (strcmp(b->host, key->host) == 0 && strcmp(b->port, key->port) == 0)
+            return b;
+    }
+    return NULL;
+}
+
+static const char *add_backend(route *r, const route *old,
+                               const char *start, const char *end)
+{
+    size_t i = r->backend_count;
+    backend parsed = {0};
+    if (i == ROUTE_MAX_BACKENDS)
+        return "too many backends";
+    if (parse_backend(&parsed, &r->weight[i], start, end) < 0)
+        return "invalid backend token";
+    if (r->file[0] && find_backend(r, &parsed))
+        return "duplicate backend";
+
+    /* shortcut: a quick re-add splits inflight across objects while old requests run, use a global backend registry if this matters. */
+    backend *b = old ? find_backend(old, &parsed) : NULL;
+    if (b) {
+        __atomic_add_fetch(&b->refs, 1, __ATOMIC_RELAXED);
+    } else {
+        b = malloc(sizeof *b);
+        if (!b)
+            return "out of memory";
+        parsed.refs = 1;
+        parsed.changed_ms = now_ms();
+        *b = parsed;
+    }
+    r->backends[r->backend_count++] = b;
+    return NULL;
+}
+
+static const char *read_route_file(route *r, const route *old)
+{
+    enum { FILE_LIMIT = 64 * 1024 };
+    char text[FILE_LIMIT + 1];
+    /* A FIFO substituted for the route file must not block the accept loop. */
+    int fd = open(r->file, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0)
+        return strerror(errno);
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return "route file is not a regular file";
+    }
+    size_t len = 0;
+    while (len < sizeof text) {
+        ssize_t n = read(fd, text + len, sizeof text - len);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0) {
+            int error = errno;
+            close(fd);
+            return strerror(error);
+        }
+        if (n == 0)
+            break;
+        len += (size_t)n;
+    }
+    close(fd);
+    if (len > FILE_LIMIT)
+        return "route file exceeds 64 KiB";
+    if (memchr(text, '\0', len))
+        return "NUL byte in route file";
+    text[len] = '\0';
+
+    const char *separators = ", \t\r\n";
+    const char *p = text + strspn(text, separators);
+    while (*p) {
+        const char *end;
+        if (*p == '#') {
+            end = p + strcspn(p, "\r\n");
+        } else {
+            end = p + strcspn(p, ", \t\r\n#");
+            const char *error = add_backend(r, old, p, end);
+            if (error)
+                return error;
+        }
+        p = end + strspn(end, separators);
+    }
+    return r->backend_count ? NULL : "empty backend list";
+}
+
+int route_table_reload(const route_table *old, route_table **out,
+                       char *err, size_t err_size)
+{
+    route_table *t = malloc(sizeof *t);
+    if (!t) {
+        snprintf(err, err_size, "out of memory");
+        return -1;
+    }
+    route_table_init(t);
+    t->heap = 1;
+    for (size_t i = 0; i < old->count; ++i) {
+        const route *prev = &old->routes[i];
+        /* Include partial routes in release if loading fails. */
+        route *r = &t->routes[t->count++];
+        memcpy(r->prefix, prev->prefix, sizeof r->prefix);
+        memcpy(r->file, prev->file, sizeof r->file);
+        r->ketama = prev->ketama;
+        r->next = __atomic_load_n(&prev->next, __ATOMIC_RELAXED);
+        if (r->file[0]) {
+            const char *error = read_route_file(r, prev);
+            if (error) {
+                snprintf(err, err_size, "%s: %s", r->file, error);
+                for (size_t j = 0; j < err_size && err[j]; ++j)
+                    if (err[j] == '\r' || err[j] == '\n')
+                        err[j] = ' ';
+                route_table_release(t);
+                return -1;
+            }
+        } else {
+            for (size_t j = 0; j < prev->backend_count; ++j) {
+                backend *b = prev->backends[j];
+                __atomic_add_fetch(&b->refs, 1, __ATOMIC_RELAXED);
+                r->backends[j] = b;
+                r->weight[j] = prev->weight[j];
+            }
+            r->backend_count = prev->backend_count;
+        }
+        if (r->ketama)
+            build_ring(r);
+    }
+    *out = t;
+    return 0;
 }
 
 int route_table_add(route_table *t, const char *spec)
@@ -149,17 +336,37 @@ int route_table_add(route_table *t, const char *spec)
         return -1;
     memcpy(entry.prefix, spec, prefix_len);
 
-    /* Publish the route only after every backend has been validated. */
     const char *start = equals + 1;
-    for (;;) {
-        const char *end = start + strcspn(start, ",");
-        if (entry.backend_count == ROUTE_MAX_BACKENDS ||
-            parse_backend(&entry.backends[entry.backend_count], start, end) < 0)
+    if (*start == '@') {
+        char *path = realpath(start + 1, NULL);
+        if (!path) {
+            fprintf(stderr, "route file: %s\n", strerror(errno));
             return -1;
-        ++entry.backend_count;
-        if (*end == '\0')
-            break;
-        start = end + 1;
+        }
+        if (strlen(path) >= sizeof entry.file) {
+            free(path);
+            fprintf(stderr, "route file: path is too long\n");
+            return -1;
+        }
+        strcpy(entry.file, path);
+        free(path);
+        const char *error = read_route_file(&entry, NULL);
+        if (error) {
+            fprintf(stderr, "route file: %s\n", error);
+            release_backends(&entry);
+            return -1;
+        }
+    } else {
+        for (;;) {
+            const char *end = start + strcspn(start, ",");
+            if (add_backend(&entry, NULL, start, end)) {
+                release_backends(&entry);
+                return -1;
+            }
+            if (*end == '\0')
+                break;
+            start = end + 1;
+        }
     }
 
     if (entry.ketama)
@@ -199,7 +406,7 @@ static size_t rr_slot(const route *r, unsigned s)
 {
     for (unsigned k = 0;; ++k)
         for (size_t i = 0; i < r->backend_count; ++i)
-            if (r->backends[i].weight > k && s-- == 0)
+            if (r->weight[i] > k && s-- == 0)
                 return i;
 }
 
@@ -209,8 +416,8 @@ static int pick_one(route *r, size_t i, unsigned *seen, backend **out,
 {
     if (!(*seen & (1u << i))) {
         *seen |= 1u << i;
-        if (backend_is_up(&r->backends[i]))
-            out[(*n)++] = &r->backends[i];
+        if (backend_is_up(r->backends[i]))
+            out[(*n)++] = r->backends[i];
     }
     return *n == max || *seen == (1u << r->backend_count) - 1;
 }
@@ -240,7 +447,7 @@ size_t route_pick(route *r, const char *key, backend **out, size_t max)
 
     unsigned total = 0;
     for (size_t i = 0; i < r->backend_count; ++i)
-        total += r->backends[i].weight;
+        total += r->weight[i];
     /* Reduce first so cursor + j cannot wrap past UINT_MAX and repeat a slot. */
     unsigned cursor = __atomic_fetch_add(&r->next, 1, __ATOMIC_RELAXED) % total;
     for (unsigned j = 0; j < total; ++j)
@@ -256,8 +463,8 @@ double route_share(const route *r, size_t i)
     if (!r->ketama) {
         unsigned total = 0;
         for (size_t k = 0; k < r->backend_count; ++k)
-            total += r->backends[k].weight;
-        return (double)r->backends[i].weight / total;
+            total += r->weight[k];
+        return (double)r->weight[i] / total;
     }
     /* Keys in (previous point, this point] go to this point's backend. */
     uint64_t owned = 0;
