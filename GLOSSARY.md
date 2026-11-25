@@ -113,8 +113,12 @@ _Avoid_: bot, attacker, attack script
 ## Back pressure demo
 
 **Back pressure**:
-The Reverse Proxy reads from the Origin only as fast as the client reads from the Reverse Proxy. Each connection has a write buffer with a limit. When the buffer is full, the Reverse Proxy stops reading the Origin socket.
-_Avoid_: flow control (the TCP mechanism under it), throttling, rate limit
+The rule "read the Origin only when the Relay buffer has room". The rule always applies. A connection is caught when its Relay buffer is full: then the Reverse Proxy stops reading the Origin socket, and TCP carries the stop back to the Origin `write()`. At the limit, back pressure waits; a cap refuses.
+_Avoid_: flow control (the TCP mechanism under it), throttling, rate limit, "back pressure turns on"
+
+**Relay buffer**:
+The buffer of one client connection that holds the gap between `read()` from the Origin and `write()` to the client (`used - sent`). In the Relay mode `backpressure` it has a limit (`--relay-buffer`, 64 KiB). It is memory of the Reverse Proxy process, not a kernel buffer.
+_Avoid_: send buffer (the kernel buffer of the socket), ring, window
 
 **Relay mode**:
 The way the Reverse Proxy moves a reply from the Origin to the client: `unbounded`, `reply-cap`, `conn-cap`, or `backpressure`. The flag `--relay` selects it.

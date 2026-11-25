@@ -44,6 +44,8 @@ RPROXY_ARGS="${RPROXY_ARGS:-}"        # more rproxy flags, for a rehearsal
 PRESENT_PAUSE="${PRESENT_PAUSE:-}"    # seconds; replaces each Enter of `present`
 PRESENT_DEATH_WAIT=60                 # Phase 1: the longest wait for the kill
 PRESENT_ACT4_WAIT=10                  # Phase 3: seconds before the bystander
+PRESENT_2A_WAIT="${PRESENT_2A_WAIT:-12}"   # Phase 2-A: seconds of reply-cap
+PRESENT_2B_WAIT="${PRESENT_2B_WAIT:-30}"   # Phase 2-B: seconds of conn-cap (measured: 503s pile up after 15-30 s)
 
 # The Phones get the upper half of the CPUs, rproxy and the Origin the lower
 # half, so the Python clients do not take CPU time from the servers.
@@ -209,7 +211,9 @@ act_json_write() {
  "rproxy_pid": $rproxy_pid, "cgroup": "$cgroup",
  "memory_max": $(numfmt --from=iec "$MEMORY_MAX"),
  "phones": $(mix_total), "tiers": $(mix_json), "arrival": $ARRIVAL,
- "file_bytes": $FILE_BYTES, "mode": "$mode", "started": $(date +%s.%N)}
+ "file_bytes": $FILE_BYTES, "proxy_port": $PROXY_PORT,
+ "origin_port": $ORIGIN_PORT, "relay_conns": $RELAY_CONNS,
+ "mode": "$mode", "started": $(date +%s.%N)}
 EOF
     mv "$RUN/act.tmp" "$RUN/act.json"
 }
@@ -389,12 +393,13 @@ present_header() {
 # The live flow of the talk. Each Phase waits for Enter.
 present() {
     local pid i
+    rm -f "$RUN/scores.json"     # the score table starts empty
     present_header "Phase 0  평소: Act 1 rproxy, Phone 없음"
     act_start 1 dry hold
     present_bystander
     present_wait
 
-    present_header "Phase 1  Act 1  unbounded: Phone 출발"
+    present_header "Phase 1  unbounded: Phone 출발"
     touch "$RUN/go"
     pid="$(pid_read rproxy)"
     for i in $(seq $((PRESENT_DEATH_WAIT * 10))); do
@@ -416,12 +421,19 @@ print(round(exit_time - act["started"], 1))' \
     present_bystander
     present_wait
 
-    present_header "Phase 2  Act 2  reply-cap"
+    # Phase 2 is two wrong fixes in a row, with no Enter between them:
+    # 2-A the 4 MiB whole-reply limit we had, 2-B a connection limit.
+    present_header "Phase 2-A  reply-cap: the 4 MiB limit we had"
     act_start 2 dry
+    sleep "$PRESENT_2A_WAIT"
+    present_bystander
+    present_header "Phase 2-B  conn-cap: a connection limit, set for memory"
+    act_start 3 dry
+    sleep "$PRESENT_2B_WAIT"
     present_bystander
     present_wait
 
-    present_header "Phase 3  Act 4  backpressure"
+    present_header "Phase 3  backpressure"
     act_start 4 dry
     sleep "$PRESENT_ACT4_WAIT"
     present_bystander

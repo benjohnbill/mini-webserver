@@ -40,17 +40,16 @@ bench/demo/demo.sh present
 
 ## The flow
 
-`demo.sh present` has four Phases. Each Enter starts the next Phase. The bystander is one `curl` of `/index.html` through rproxy. The flow runs it at the end of each Phase and prints the result as a large banner. The lines in quotes are a draft. The owner decides the lines later.
+`demo.sh present` has four Phases; Phase 2 runs two Acts. Each Enter starts the next Phase. The bystander is one `curl` of `/index.html` through rproxy. The flow runs it at the end of each Phase and prints the result as a large banner. The lines in quotes are a draft. The owner decides the lines later.
 
 | Phase | What the flow does | Bystander | Say |
 |---|---|---|---|
 | 0 평소 | Starts rproxy in the mode of Act 1 (`unbounded`). No Phones yet | `HTTP 200` | "앱 업데이트가 나온 날입니다. 휴대폰 200대가 50 MB 파일을 받습니다. 대부분은 빠르고, 몇 대는 데이터를 다 써서 느려진 휴대폰입니다." |
 | 1 Act 1 | Starts the Phones. It waits until rproxy dies (60 s at most) | `연결 거부` | "빠른 휴대폰은 금방 끝나지만, 느린 휴대폰의 몫은 Reverse Proxy 메모리에 쌓입니다. 서버가 죽었고, 첫 페이지만 보려던 저까지 끊겼습니다." |
-| 2 Act 2 | Starts Act 2 (`reply-cap`) | `HTTP 200` | "그래서 연결 하나가 쌓는 양에 4 MB 상한을 뒀습니다. 지금 저희 코드가 실제로 이렇습니다. 서버는 살지만, 파일이 50 MB라서 아무도 받지 못합니다." |
+| 2 Act 2, then Act 3 | Starts Act 2 (`reply-cap`, the 4 MiB limit we had), waits `PRESENT_2A_WAIT` (12 s), runs the bystander, then starts Act 3 (`conn-cap` 20) and waits `PRESENT_2B_WAIT` (30 s). One Enter | `HTTP 200`, then the observed result (503 in the measured run) | 2-A: "그래서 연결 하나가 쌓는 양에 4 MB 상한을 뒀습니다. 지금 저희 코드가 실제로 이렇습니다. 서버는 살지만, 파일이 50 MB라서 아무도 받지 못합니다." 2-B: the owner writes it |
 | 3 Act 4 | Starts Act 4 (`backpressure`). The bystander runs about 10 s later | `HTTP 200` | "쌓는 속도를 받는 속도에 맞췄습니다. 버퍼가 차면 Origin에서 읽기를 멈추고, 휴대폰이 가져가면 다시 읽습니다. 메모리는 평평하고, 빠른 휴대폰은 끝났고, 느린 휴대폰도 끊기지 않고 받고 있습니다." |
 | end | The last Enter stops rproxy, the Phones, and the Origin | | "막아야 할 것은 크기도 사람 수도 아니고, 속도였습니다." |
 
-Act 3 (`conn-cap`) is not in the talk. `demo.sh act 3` still runs it.
 
 ## Acceptance (2026-11-25, 3 runs of each Act; Act 1 again after the send queue fix)
 
@@ -58,7 +57,8 @@ Act 3 (`conn-cap`) is not in the talk. `demo.sh act 3` still runs it.
 |---|---|---|
 | 1 | OOM kill in 15–30 s. At the kill, the slow tiers hold 60 % or more of the relay bytes | Killed at 18.2, 18.2, and 16.4 s. Slow share 76, 73, and 75 %. Peak 1260–1261 MiB |
 | 2 | All Phones get 502. rproxy stays alive | All 200 got 502 in each run. Peak 122–134 MiB |
-| 4 | No Phone cut in 60 s. All `fast` Phones done. Peak under 1/10 of Act 1 | 0 cut, 170 `fast` done, 30 slow Phones receiving. Peak 24–25 MiB |
+| 3 (Phase 2-B) | One run with the mixed speeds, 2026-11-25 | At 30 s the 20 slots are held by 19 slow Phones and 1 fast; 503 × 54, 43 of them fast; the bystander gets 503; peak 970 MiB |
+| 4 | No Phone cut in 60 s. All `fast` Phones done. Peak under 1/10 of Act 1 | 0 cut, 170 `fast` done, 30 slow Phones receiving. Peak 24–25 MiB. One run to the end (2026-11-25, before 19:09): all 200 done, each tier at its own speed; the 400 kbps tier ended at 1022 s |
 
 The relay-stats sum and the cgroup memory agree within 7 % in Act 1 (for example 1155.6 and 1165 MiB). In Act 4 the relay-stats sum is about 8 MiB of 23 MiB: the rest is the TLS buffers and the base memory of rproxy.
 
@@ -87,7 +87,7 @@ The variables: `MIX` (the tiers, `label:KB/s:count`), `ARRIVAL`, `FILE_BYTES`, `
 
 By default the Phones run on the upper half of the CPUs, and rproxy and the Origin on the lower half. One `phones.py` process reads at most about 300 to 400 MB/s, so `demo.sh` starts one process for each tier.
 
-If rproxy has `--relay-stats`, `demo.sh` passes it, and the dashboard shows the buffer share of each tier. If not, the block shows "no data".
+If rproxy has `--relay-stats`, `demo.sh` passes it. The dashboard shows, top to bottom: the memory of rproxy over time; the buffer pipe (Origin send, proxy receive, the Relay buffer, proxy send, client receive), each bar the fill of that buffer against its own size, split into slow and fast Phones, with one line "signal → what rproxy does"; one cell for each Phone, with the cause of each failure from the `cause` lines of `rproxy.log`; and a score table with one row for each Phase. The design and its review are in `~/.claude/plans/backpressure-demo-grill/FINAL.md` (outside this repository).
 
 ## Epilogue (only if a rehearsal leaves time)
 
