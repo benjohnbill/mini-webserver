@@ -23,6 +23,9 @@ typedef struct {
     unsigned oks;                         /* consecutive successes */
     int64_t changed_ms;                   /* CLOCK_MONOTONIC ms of last UP/DOWN change (set at add) */
     unsigned long req_ok, req_err;        /* proxied request outcomes */
+    /* Back-pressure counters: atomic only. */
+    unsigned inflight;                    /* proxied requests currently in progress */
+    unsigned long shed;                   /* times skipped because of the cap */
 } backend;
 
 typedef struct {
@@ -69,5 +72,8 @@ double route_share(const route *r, size_t i);
  * consecutive successes -> UP. Thread-safe. */
 void backend_report(backend *b, int ok);
 int  backend_is_up(const backend *b);
+
+int backend_try_acquire(backend *b, unsigned cap);
+void backend_release(backend *b);
 
 #endif

@@ -18,6 +18,7 @@ typedef struct {
     int proxy_timeout_ms;         /* -T, default 3000 */
     int keepalive_timeout_ms;     /* idle keep-alive timeout, default 5000 */
     char name[64];                /* -n, sent as X-Server-Name if set */
+    unsigned backend_cap;         /* -B N, in-flight per backend, default max(1, threads/2) */
     route_table routes;           /* -R spec, repeatable */
 } server_config;
 

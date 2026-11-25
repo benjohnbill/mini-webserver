@@ -13,6 +13,7 @@ void health_stop(void);
 /* Render the /_lb/status text table into out. Returns its length, or -1
  * if it did not fit. */
 int lb_status_render(char *out, size_t size, const server_config *cfg,
-                     int busy, size_t queued);
+                     int busy, size_t queued,
+                     unsigned long shed_queue, unsigned long shed_stale);
 
 #endif

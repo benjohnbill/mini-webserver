@@ -292,3 +292,20 @@ int backend_is_up(const backend *b)
 {
     return !__atomic_load_n(&b->down, __ATOMIC_ACQUIRE);
 }
+
+int backend_try_acquire(backend *b, unsigned cap)
+{
+    /* Fetch-add then rollback would expose counts above the cap to readers. */
+    unsigned current = __atomic_load_n(&b->inflight, __ATOMIC_RELAXED);
+    while (current < cap) {
+        if (__atomic_compare_exchange_n(&b->inflight, &current, current + 1, 1,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    return 0;
+}
+
+void backend_release(backend *b)
+{
+    __atomic_fetch_sub(&b->inflight, 1, __ATOMIC_RELAXED);
+}

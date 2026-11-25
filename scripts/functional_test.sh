@@ -6,7 +6,8 @@
 #   :8001  backend "b1"  ┐ round-robin targets for /echo
 #   :8002  backend "b2"  ┘
 #   :8003  black hole (accepts, never answers) for the timeout case
-#   :8081  second front, /echo@ketama over b1/b2 (sticky keys, health checks)
+#   :8081  second front, /echo@ketama over b1/b2 (sticky keys, health checks, cap of 1)
+#   :8082  one worker and one queue slot for connection shedding
 set -u
 cd "$(dirname "$0")/.."
 make -s all || exit 1
@@ -32,8 +33,11 @@ while True: conns.append(s.accept()[0])' & HOLE=$!
     -R '/echo=127.0.0.1:8001,127.0.0.1:8002' \
     -R '/down=127.0.0.1:8009' \
     -R '/slow=127.0.0.1:8003' 2>"$LOG/front.log" & FRONT=$!
-./webserver -p 8081 -R '/echo@ketama=127.0.0.1:8001,127.0.0.1:8002' 2>"$LOG/front2.log" & FRONT2=$!
-trap 'kill $B1 $B2 $HOLE $FRONT $FRONT2 2>/dev/null' EXIT
+./webserver -p 8081 -B 1 -T 8000 -R '/echo@ketama=127.0.0.1:8001,127.0.0.1:8002' 2>"$LOG/front2.log" & FRONT2=$!
+./webserver -p 8082 -t 1 -q 1 -k 10000 2>"$LOG/front3.log" & FRONT3=$!
+trap 'kill -CONT $B1 $B2 2>/dev/null; kill $B1 $B2 $HOLE $FRONT $FRONT2 $FRONT3 2>/dev/null; wait' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 sleep 0.5
 
 echo "== static files"
@@ -115,6 +119,96 @@ ab -q -n 2000 -c 50 -k http://127.0.0.1:8080/index.html > "$LOG/ab.txt" 2>&1
 FAILED=$(awk '/^Failed requests/{print $3}' "$LOG/ab.txt")
 expect "ab 2000 req / c=50, 0 failed" 0 "${FAILED:-missing}"
 grep -E 'Requests per second' "$LOG/ab.txt" | sed 's/^/       /'
+
+echo "== back-pressure"
+BACKPRESSURE=http://127.0.0.1:8081
+KEYS=()
+for i in $(seq 2 64); do
+    IP=127.0.0.$i
+    if [ "$(server_from "$IP" 8081)" = b2 ]; then KEYS+=("$IP"); fi
+    [ "${#KEYS[@]}" -eq 3 ] && break
+done
+
+wait_full() {
+    local i
+    for i in $(seq 20); do
+        curl -s -m 0.2 "$BACKPRESSURE/_lb/status" | awk -v addr="127.0.0.1:$1" '
+            $1 == addr && $2 == "UP" {
+                for (j = 3; j < NF; j++) if ($j == "1/1" && $(j + 1) == "FULL") found = 1
+            }
+            END { exit !found }' && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
+if [ "${#KEYS[@]}" -eq 3 ] && kill -STOP "$B2"; then
+    code -m 12 --interface "${KEYS[0]}" "$BACKPRESSURE/echo" >"$LOG/held-b2.code" & HOLD_B2=$!
+    wait_full 8002 && ok "paused b2 stays UP and FULL" || bad "paused b2 stays UP and FULL"
+    expect "b2 key spills -> 200" 200 \
+        "$(code -m 2 --interface "${KEYS[1]}" -D "$LOG/spill.headers" "$BACKPRESSURE/echo")"
+    grep -qi '^X-Server-Name: b1' "$LOG/spill.headers" \
+        && ok "spill reached b1" || bad "spill reached b1"
+
+    # Hold b1's slot too so the 503 does not depend on racing a fast /echo.
+    if kill -STOP "$B1"; then
+        code -m 12 --interface "${KEYS[1]}" "$BACKPRESSURE/echo" >"$LOG/held-b1.code" & HOLD_B1=$!
+        wait_full 8001 && ok "paused b1 stays UP and FULL" || bad "paused b1 stays UP and FULL"
+        expect "GET / while both backends full -> 200" 200 "$(code -m 1 "$BACKPRESSURE/")"
+        expect "both backends full -> 503" 503 \
+            "$(code -m 1 --interface "${KEYS[2]}" -D "$LOG/shed.headers" "$BACKPRESSURE/echo")"
+        grep -qi '^Retry-After: [0-9]' "$LOG/shed.headers" \
+            && ok "503 carries Retry-After" || bad "503 carries Retry-After"
+        kill -CONT "$B1" "$B2"
+        wait "$HOLD_B1"
+        expect "held b1 request completes after resume" 200 "$(cat "$LOG/held-b1.code")"
+    else
+        bad "pause b1"
+        kill -CONT "$B2"
+    fi
+    wait "$HOLD_B2"
+    expect "held b2 request completes after resume" 200 "$(cat "$LOG/held-b2.code")"
+else
+    bad "find three b2 keys and pause b2"
+fi
+
+echo "== connection queue shedding"
+queue_shed_counts() {
+    curl -fsS -m 2 http://127.0.0.1:8082/_lb/status | awk '
+        NR == 1 { for (i = 1; i + 4 <= NF; i++)
+            if ($i == "shed" && $(i + 2) == "(queue)" && $(i + 4) == "(stale)")
+                print $(i + 1), $(i + 3) }'
+}
+expect "queue/stale shed counters start at zero" "0 0" "$(queue_shed_counts)"
+python3 -c '
+from http.client import HTTPResponse
+from socket import create_connection, SHUT_WR
+from time import sleep
+
+def connect():
+    return create_connection(("127.0.0.1", 8082), timeout=4)
+
+def check_rejected(client, reason):
+    with HTTPResponse(client) as response:
+        response.begin()
+        retry = response.getheader("Retry-After", "")
+        assert response.status == 503 and retry.isdigit(), (reason, response.status, retry)
+        print(f"       {reason}: {response.status}, Retry-After: {retry}")
+
+with connect() as held:
+    held.sendall(b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    with HTTPResponse(held, method="HEAD") as response:
+        response.begin()
+        assert response.status == 200 and response.getheader("Connection") == "keep-alive"
+
+    # Consecutive connects fill the slot and then prove it is full before timing the wait.
+    with connect() as queued, connect() as overflow:
+        check_rejected(overflow, "queue full")
+        sleep(2.1)
+        held.shutdown(SHUT_WR)
+        check_rejected(queued, "queue stale")
+' && ok "both queue rejections carry Retry-After" || bad "both queue rejections carry Retry-After"
+expect "queue/stale shed counters each increased by one" "1 1" "$(queue_shed_counts)"
 
 echo "== failover (b1 killed)"
 kill $B1; wait $B1 2>/dev/null

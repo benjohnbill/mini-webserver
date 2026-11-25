@@ -84,39 +84,71 @@ static int append(char **p, size_t *left, const char *fmt, ...)
 }
 
 int lb_status_render(char *out, size_t size, const server_config *cfg,
-                     int busy, size_t queued)
+                     int busy, size_t queued,
+                     unsigned long shed_queue, unsigned long shed_stale)
 {
+    enum { NCOL = 10 };
+    static const char *const head[NCOL] = { "BACKEND", "STATE", "WEIGHT", "SHARE",
+        "INFLIGHT", "SHED", "FAILS", "OK", "ERR", "CHANGED" };
+    /* Minimum widths keep the usual table looking the same; longer values
+     * (IPv6 hosts, big counters) widen their column for the whole route. */
+    static const int min_w[NCOL] = { 16, 6, 7, 7, 9, 5, 6, 4, 4, 0 };
+    char cell[ROUTE_MAX_BACKENDS][NCOL][sizeof ((backend *)0)->host + 16];
     char *p = out;
     size_t left = size;
     int64_t now = now_ms();
-    if (append(&p, &left, "front :%d  workers %d/%d busy  queue %zu/%d\n",
-               cfg->port, busy, cfg->threads, queued, cfg->queue_size) < 0)
+    if (append(&p, &left, "front :%d  workers %d/%d busy  queue %zu/%d  "
+               "shed %lu (queue) %lu (stale)\n",
+               cfg->port, busy, cfg->threads, queued, cfg->queue_size,
+               shed_queue, shed_stale) < 0)
         return -1;
     for (size_t i = 0; i < cfg->routes.count; i++) {
         const route *r = &cfg->routes.routes[i];
-        if (append(&p, &left, "route %s  strategy %s\n"
-                   "  BACKEND          STATE  WEIGHT  SHARE   FAILS  OK    ERR  CHANGED\n",
-                   r->prefix, r->ketama ? "ketama" : "round-robin") < 0)
-            return -1;
+        int w[NCOL];
+        for (int c = 0; c < NCOL; c++)
+            w[c] = min_w[c] > (int)strlen(head[c]) ? min_w[c] : (int)strlen(head[c]);
+        /* Pass 1: snapshot every value as text and widen columns to fit. */
         for (size_t j = 0; j < r->backend_count; j++) {
             const backend *b = &r->backends[j];
-            char addr[sizeof b->host + sizeof b->port + 3], share[16], ago[32];
+            char (*v)[sizeof cell[0][0]] = cell[j];
+            size_t vs = sizeof cell[0][0];
             int v6 = strchr(b->host, ':') != NULL;
-            snprintf(addr, sizeof addr, "%s%s%s:%s", v6 ? "[" : "", b->host,
+            snprintf(v[0], vs, "%s%s%s:%s", v6 ? "[" : "", b->host,
                      v6 ? "]" : "", b->port);
-            snprintf(share, sizeof share, "%.1f%%", route_share(r, j) * 100);
+            snprintf(v[1], vs, "%s", backend_is_up(b) ? "UP" : "DOWN");
+            snprintf(v[2], vs, "%u", b->weight);
+            snprintf(v[3], vs, "%.1f%%", route_share(r, j) * 100);
+            unsigned inf = __atomic_load_n(&b->inflight, __ATOMIC_RELAXED);
+            snprintf(v[4], vs, "%u/%u%s", inf, cfg->backend_cap,
+                     inf >= cfg->backend_cap ? " FULL" : "");
+            snprintf(v[5], vs, "%lu", __atomic_load_n(&b->shed, __ATOMIC_RELAXED));
+            snprintf(v[6], vs, "%u", __atomic_load_n(&b->fails, __ATOMIC_RELAXED));
+            snprintf(v[7], vs, "%lu", __atomic_load_n(&b->req_ok, __ATOMIC_RELAXED));
+            snprintf(v[8], vs, "%lu", __atomic_load_n(&b->req_err, __ATOMIC_RELAXED));
             long long s = (now - __atomic_load_n(&b->changed_ms, __ATOMIC_RELAXED)) / 1000;
             if (s < 60)
-                snprintf(ago, sizeof ago, "%llds ago", s < 0 ? 0 : s);
+                snprintf(v[9], vs, "%llds ago", s < 0 ? 0 : s);
             else if (s < 3600)
-                snprintf(ago, sizeof ago, "%lldm ago", s / 60);
+                snprintf(v[9], vs, "%lldm ago", s / 60);
             else
-                snprintf(ago, sizeof ago, "%lldh ago", s / 3600);
-            if (append(&p, &left, "  %-16s %-6s %-7u %-7s %-6u %-5lu %-4lu %s\n",
-                       addr, backend_is_up(b) ? "UP" : "DOWN", b->weight, share,
-                       __atomic_load_n(&b->fails, __ATOMIC_RELAXED),
-                       __atomic_load_n(&b->req_ok, __ATOMIC_RELAXED),
-                       __atomic_load_n(&b->req_err, __ATOMIC_RELAXED), ago) < 0)
+                snprintf(v[9], vs, "%lldh ago", s / 3600);
+            for (int c = 0; c < NCOL; c++)
+                if ((int)strlen(v[c]) > w[c])
+                    w[c] = (int)strlen(v[c]);
+        }
+        if (append(&p, &left, "route %s  strategy %s  inflight cap %u\n",
+                   r->prefix, r->ketama ? "ketama" : "round-robin",
+                   cfg->backend_cap) < 0)
+            return -1;
+        /* Pass 2: header (row -1) and rows share the widths; last column unpadded. */
+        for (long j = -1; j < (long)r->backend_count; j++) {
+            if (append(&p, &left, " ") < 0)
+                return -1;
+            for (int c = 0; c < NCOL; c++)
+                if (append(&p, &left, " %-*s", c == NCOL - 1 ? 0 : w[c],
+                           j < 0 ? head[c] : cell[j][c]) < 0)
+                    return -1;
+            if (append(&p, &left, "\n") < 0)
                 return -1;
         }
     }

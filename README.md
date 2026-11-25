@@ -27,7 +27,7 @@ curl -i localhost:8080/echo                                  # X-Server-Name: b1
 curl -x http://127.0.0.1:8080 http://127.0.0.1:8001/          # Forward Proxy
 ```
 
-옵션: `-p` 포트, `-r` 정적 루트, `-c` CGI 디렉터리, `-t` 워커 스레드 수, `-q` 대기 큐 크기, `-F` Forward Proxy 허용, `-T` 프록시 타임아웃(ms), `-k` keep-alive 타임아웃(ms), `-n` 서버 이름(`X-Server-Name`), `-R` 라우팅 규칙(반복 가능, `접두사[@ketama]=host:port[*가중치],...`; `@ketama`가 없으면 Round-Robin, `*N`은 가중치 1..4), `-h` 도움말.
+옵션: `-p` 포트, `-r` 정적 루트, `-c` CGI 디렉터리, `-t` 워커 스레드 수, `-q` 대기 큐 크기, `-F` Forward Proxy 허용, `-T` 프록시 타임아웃(ms), `-B` 백엔드당 동시 프록시 요청 상한(기본 max(1, 스레드/2); 상한에 걸리면 다음 후보; 연결된 후보가 없고 하나라도 상한 때문에 건너뛰었으면 503), `-k` keep-alive 타임아웃(ms), `-n` 서버 이름(`X-Server-Name`), `-R` 라우팅 규칙(반복 가능, `접두사[@ketama]=host:port[*가중치],...`; `@ketama`가 없으면 Round-Robin, `*N`은 가중치 1..4), `-h` 도움말.
 
 ## 구조
 
@@ -51,6 +51,26 @@ bash scripts/lb.sh status    # b2 DOWN
 bash scripts/lb.sh start b2  # 몇 초 뒤 status에서 UP, keys를 다시 돌리면 b2로 돌아옴
 bash scripts/lb.sh down      # 전부 종료
 ```
+
+백엔드당 프록시 요청을 2개로 제한한 상태에서 b2를 일시 정지합니다. 부하가 계속되는 동안 b2는 `UP`, `2/2 FULL`로 표시되고 `SHED`가 증가합니다. `GET /`은 `200`을 반환하며, b2의 슬롯이 가득 차면 해당 키의 요청은 다음 백엔드로 넘어갑니다.
+
+```sh
+bash scripts/lb.sh up
+bash scripts/lb.sh keys
+bash scripts/lb.sh pause b2
+ab -t 15 -c 20 http://127.0.0.1:8080/echo &
+load=$!
+sleep 1
+bash scripts/lb.sh status
+curl -i http://127.0.0.1:8080/
+bash scripts/lb.sh keys
+bash scripts/lb.sh resume b2
+wait "$load"
+bash scripts/lb.sh keys
+bash scripts/lb.sh down
+```
+
+ApacheBench의 출발지 `127.0.0.1`은 b3 → b2 → b1 순서로 라우팅됩니다. 부하 중에는 b1과 b3도 `FULL`로 표시될 수 있고, 모든 후보가 가득 찬 요청은 `503`을 받습니다. `keys`가 `ERR`를 표시하면 해당 키의 마지막 성공 기록을 보존합니다. 재개 후 부하가 끝나면 우회했던 키가 b2로 돌아옵니다.
 
 ## Map (파일 지도)
 

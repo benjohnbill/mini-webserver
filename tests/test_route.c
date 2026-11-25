@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 
 #define KEYS 10000
@@ -54,6 +55,8 @@ static void test_parse(void)
     CHECK(entry->ring_len == 0);
     CHECK(backend_is_up(&entry->backends[0]));
     CHECK(entry->backends[0].changed_ms > 0);
+    CHECK(__atomic_load_n(&entry->backends[0].inflight, __ATOMIC_RELAXED) == 0);
+    CHECK(__atomic_load_n(&entry->backends[0].shed, __ATOMIC_RELAXED) == 0);
     printf("sizeof(route_table) = %zu bytes\n", sizeof table);
 
     const char *invalid[] = {
@@ -261,6 +264,64 @@ static void test_share(void)
     CHECK(route_share(&table.routes[1], 2) == 0.5);
 }
 
+static void test_backend_cap(void)
+{
+    backend b = {0};
+    CHECK(!backend_try_acquire(&b, 0));
+    CHECK(backend_try_acquire(&b, 2));
+    CHECK(backend_try_acquire(&b, 2));
+    CHECK(!backend_try_acquire(&b, 2));
+    CHECK(__atomic_load_n(&b.inflight, __ATOMIC_RELAXED) == 2);
+    backend_release(&b);
+    CHECK(backend_try_acquire(&b, 2));
+    backend_release(&b);
+    backend_release(&b);
+    CHECK(__atomic_load_n(&b.inflight, __ATOMIC_RELAXED) == 0);
+    CHECK(__atomic_load_n(&b.shed, __ATOMIC_RELAXED) == 0);
+    CHECK(backend_is_up(&b));
+}
+
+typedef struct {
+    backend *b;
+    unsigned cap;
+    unsigned max;
+} cap_worker;
+
+static void *exercise_backend_cap(void *arg)
+{
+    cap_worker *worker = arg;
+    for (int i = 0; i < 100000; ++i) {
+        if (backend_try_acquire(worker->b, worker->cap)) {
+            unsigned inflight = __atomic_load_n(&worker->b->inflight, __ATOMIC_RELAXED);
+            if (inflight > worker->max)
+                worker->max = inflight;
+            backend_release(worker->b);
+        }
+    }
+    return NULL;
+}
+
+static void test_backend_cap_concurrent(void)
+{
+    enum { THREADS = 8, CAP = 2 };
+    backend b = {0};
+    pthread_t threads[THREADS];
+    cap_worker workers[THREADS];
+    int started = 0;
+    for (; started < THREADS; ++started) {
+        workers[started] = (cap_worker){.b = &b, .cap = CAP};
+        int rc = pthread_create(&threads[started], NULL, exercise_backend_cap, &workers[started]);
+        CHECK(rc == 0);
+        if (rc != 0)
+            break;
+    }
+    for (int i = 0; i < started; ++i) {
+        CHECK(pthread_join(threads[i], NULL) == 0);
+        CHECK(workers[i].max <= CAP);
+    }
+    CHECK(__atomic_load_n(&b.inflight, __ATOMIC_RELAXED) == 0);
+}
+
 int main(void)
 {
     test_parse();
@@ -270,5 +331,7 @@ int main(void)
     test_pick();
     test_health();
     test_share();
+    test_backend_cap();
+    test_backend_cap_concurrent();
     TEST_MAIN_END();
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Load-balancer demo: one Ketama front (:8080) and three backends (:8001..:8003).
-#   scripts/lb.sh up | down | start NAME | stop NAME | status | keys [N]
+#   scripts/lb.sh up | down | start NAME | stop NAME | pause bN | resume bN | status | keys [N]
 # NAME is front, b1, b2 or b3. pid files and logs live in .lb/.
 set -u
 cd "$(dirname "$0")/.."
@@ -15,6 +15,8 @@ usage: scripts/lb.sh COMMAND
   down            stop everything
   start NAME      start one of: front b1 b2 b3
   stop NAME       stop one of: front b1 b2 b3
+  pause bN        freeze one backend (b1, b2 or b3)
+  resume bN       continue a paused backend
   status          print the front's /_lb/status table
   keys [N]        send /echo from N source IPs (default 20), show which backend
                   each key hits and how many moved since the last run
@@ -26,18 +28,23 @@ port() { case $1 in front) echo 8080 ;; *) echo "800${1#b}" ;; esac; }
 
 args() {
     case $1 in
-        front) echo "-p 8080 -r www -c cgi-bin -R /echo@ketama=127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003" ;;
+        front) echo "-p 8080 -r www -c cgi-bin -B 2 -R /echo@ketama=127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003" ;;
         *) echo "-p $(port "$1") -n $1 -r www" ;;
     esac
+}
+
+proc_state() {
+    local st
+    case $1 in ''|*[!0-9]*) return 1 ;; esac
+    st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    st=${st##*) }                    # state is the first field after "(comm) "
+    [ -n "$st" ] && printf '%s\n' "${st%% *}"
 }
 
 # kill -0 alone counts zombies (parent gone, nobody reaped yet) as alive.
 alive() {
     local st
-    case $1 in ''|*[!0-9]*) return 1 ;; esac
-    st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
-    st=${st##*) }                    # state is the first field after "(comm) "
-    [ -n "$st" ] && [ "${st%% *}" != Z ]
+    st=$(proc_state "$1") && [ "$st" != Z ]
 }
 
 pid_of() { # prints the pid if NAME is running, else clears a stale pid file
@@ -65,11 +72,23 @@ start() {
 stop() {
     local pid
     if ! pid=$(pid_of "$1"); then echo "$1 is not running"; return 0; fi
+    kill -CONT "$pid" 2>/dev/null
     kill -TERM "$pid"
     for _ in $(seq 50); do alive "$pid" || break; sleep 0.1; done
     alive "$pid" && kill -KILL "$pid"
     rm -f "$DIR/$1.pid"
     echo "$1 stopped"
+}
+
+freeze() {
+    local pid
+    if ! pid=$(pid_of "$2"); then echo "$2 is not running"; return 0; fi
+    if [ "$1" = pause ]; then
+        if [ "$(proc_state "$pid")" = T ]; then echo "$2 is already paused"; return 0; fi
+        kill -STOP "$pid" && echo "$2 paused"
+    else
+        kill -CONT "$pid" && echo "$2 resumed"
+    fi
 }
 
 keys() {
@@ -83,8 +102,13 @@ keys() {
         name=$(curl -s -m 2 -D - -o /dev/null --interface "$key" "$FRONT/echo" |
             tr -d '\r' | awk -F': ' 'tolower($1)=="x-server-name"{print $2}')
         name=${name:-ERR}
+        prev=$( [ -f "$DIR/keys.prev" ] && awk -v k="$key" '$1==k && $2!="ERR"{print $2}' "$DIR/keys.prev")
+        if [ "$name" = ERR ]; then
+            [ -z "$prev" ] || echo "$key $prev" >>"$cur"
+            printf '%-12s %s\n' "$key" "$name"
+            continue
+        fi
         echo "$key $name" >>"$cur"
-        prev=$( [ -f "$DIR/keys.prev" ] && awk -v k="$key" '$1==k{print $2}' "$DIR/keys.prev")
         if [ -z "$prev" ]; then
             printf '%-12s %s\n' "$key" "$name"
         else
@@ -93,7 +117,7 @@ keys() {
             else moved=$((moved + 1)); printf '%-12s %s → %s  (moved)\n' "$key" "$prev" "$name"; fi
         fi
     done
-    if [ "$cmp" -eq 0 ]; then echo "first run, nothing to compare"
+    if [ "$cmp" -eq 0 ]; then echo "no keys to compare"
     else echo "moved $moved/$cmp ($((moved * 100 / cmp))%)"; fi
     mv "$cur" "$DIR/keys.prev"
 }
@@ -108,6 +132,8 @@ case $1 in
     down)   for n in front b1 b2 b3; do stop "$n"; done; rm -f "$DIR"/*.pid ;;
     start)  valid "${2:-}"; make -s all || exit 1; start "$2" ;;
     stop)   valid "${2:-}"; stop "$2" ;;
+    pause|resume)
+            case ${2:-} in b1|b2|b3) freeze "$1" "$2" ;; *) usage ;; esac ;;
     status) curl -sf "$FRONT/_lb/status" || { echo "front is not answering /_lb/status"; exit 1; } ;;
     keys)   keys "${2:-20}" ;;
     *)      usage ;;

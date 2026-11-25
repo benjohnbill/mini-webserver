@@ -36,14 +36,26 @@
 #include "route.h"
 
 #define SEND_TIMEOUT_MS 10000         /* a stuck reader must not pin a worker */
+/* A client queued longer than this has likely given up; serving it would
+ * only burn a worker on a dead request. */
+#define QUEUE_WAIT_MAX_MS 2000
 
 static volatile sig_atomic_t g_stop = 0;
 static int g_busy;                    /* workers inside handle_connection, __atomic */
+static unsigned long g_shed_queue;    /* 503: queue full at accept, __atomic */
+static unsigned long g_shed_stale;    /* 503: waited > QUEUE_WAIT_MAX_MS, __atomic */
 
 static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
+}
+
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* ------------------------------------------------------------------ */
@@ -53,6 +65,7 @@ static void on_signal(int sig)
 typedef struct {
     int fd;
     char ip[INET6_ADDRSTRLEN];
+    int64_t accepted_ms;              /* CLOCK_MONOTONIC */
 } client;
 
 typedef struct {
@@ -195,6 +208,8 @@ static int reply_error(ctx *x, int status, const char *extra)
                      status, t, status, t);
     if (n < 0 || (size_t)n >= sizeof page)
         n = 0;
+    if (status == 503 && extra == NULL)
+        extra = "Retry-After: 1\r\n";   /* same as http_send_error */
     return reply(x, status, "text/html; charset=utf-8", page, (size_t)n, extra);
 }
 
@@ -407,7 +422,9 @@ static int serve_lb_status(ctx *x)
     char *out = malloc(cap);
     int n = out ? lb_status_render(out, cap, x->cfg,
                                    __atomic_load_n(&g_busy, __ATOMIC_RELAXED),
-                                   queue_count(x->queue))
+                                   queue_count(x->queue),
+                                   __atomic_load_n(&g_shed_queue, __ATOMIC_RELAXED),
+                                   __atomic_load_n(&g_shed_stale, __ATOMIC_RELAXED))
                 : -1;
     if (n < 0) {
         free(out);
@@ -418,25 +435,36 @@ static int serve_lb_status(ctx *x)
     return 200;
 }
 
-/* Try backends in route_pick order. Only a failed connect moves on to the
- * next one: once the request was sent it is never retried. */
+/* Try backends in route_pick order. A failed connect (dead) or a full
+ * in-flight cap (busy) moves on to the next one: once the request was sent
+ * it is never retried. Busy is not a health failure, so it is never
+ * reported. If no candidate connected and at least one was skipped for the
+ * cap, the answer is 503 (retry later) instead of 502. */
 static int proxy_route(ctx *x, route *r)
 {
     backend *c[ROUTE_MAX_BACKENDS];
     size_t n = route_pick(r, x->ip, c, ROUTE_MAX_BACKENDS);
+    int capped = 0;
     for (size_t i = 0; i < n; i++) {
         backend *b = c[i];
+        if (!backend_try_acquire(b, x->cfg->backend_cap)) {
+            __atomic_fetch_add(&b->shed, 1, __ATOMIC_RELAXED);
+            capped = 1;
+            continue;
+        }
         int up = tcp_connect_timeout(b->host, b->port, x->cfg->proxy_timeout_ms);
         backend_report(b, up >= 0);
         if (up < 0) {
+            backend_release(b);
             __atomic_fetch_add(&b->req_err, 1, __ATOMIC_RELAXED);
             continue;
         }
         int st = proxy_reverse_fd(x->fd, up, x->req, b, x->ip);
+        backend_release(b);
         __atomic_fetch_add(st == 0 ? &b->req_ok : &b->req_err, 1, __ATOMIC_RELAXED);
         return st;
     }
-    return 502;
+    return capped ? 503 : 502;
 }
 
 /* Returns the status for the access log (0 = relayed by a proxy). */
@@ -572,6 +600,14 @@ static void *worker_main(void *arg)
     worker_arg *wa = arg;
     client cl;
     while (queue_pop(wa->queue, &cl) == 0) {
+        if (now_ms() - cl.accepted_ms > QUEUE_WAIT_MAX_MS) {
+            set_timeout(cl.fd, SO_SNDTIMEO, 1000);
+            http_send_error(cl.fd, 503, 0);
+            close(cl.fd);
+            __atomic_fetch_add(&g_shed_stale, 1, __ATOMIC_RELAXED);
+            fprintf(stderr, "%s rejected: queued too long (503)\n", cl.ip);
+            continue;
+        }
         __atomic_fetch_add(&g_busy, 1, __ATOMIC_RELAXED);
         handle_connection(wa->cfg, wa->queue, &cl);
         __atomic_fetch_sub(&g_busy, 1, __ATOMIC_RELAXED);
@@ -640,6 +676,7 @@ static int accept_client(int lfd, client *cl)
     if (inet_ntop(AF_INET, &peer.sin_addr, cl->ip, sizeof cl->ip) == NULL)
         strcpy(cl->ip, "?");
     cl->fd = fd;
+    cl->accepted_ms = now_ms();
     return 0;
 }
 
@@ -677,6 +714,7 @@ static void accept_loop(int lfd, client_queue *q)
             set_timeout(cl.fd, SO_SNDTIMEO, 1000);
             http_send_error(cl.fd, 503, 0);
             close(cl.fd);
+            __atomic_fetch_add(&g_shed_queue, 1, __ATOMIC_RELAXED);
             fprintf(stderr, "%s rejected: queue full (503)\n", cl.ip);
         }
     }
