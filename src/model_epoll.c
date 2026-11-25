@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,6 +53,7 @@ struct work_pool {
     const struct config *config;
     pthread_t *threads;
     int thread_count;
+    atomic_int busy; /* Workers that make a plan now, for --stats */
 };
 
 struct epoll_loop {
@@ -59,7 +61,9 @@ struct epoll_loop {
     int listen_fd;
     const struct config *config;
     struct connection *connections; /* list head */
+    int connection_count;
     time_t last_sweep;
+    double stats_due;       /* --stats: the next write, monotonic seconds */
     struct work_pool *pool; /* NULL in the epoll model */
 };
 
@@ -95,6 +99,8 @@ static void *worker_main(void *arg);
 static void worker_give_back(struct work_pool *pool,
                              struct connection *connection);
 static void loop_take_done(struct epoll_loop *loop);
+static int loop_get_wait_ms(const struct epoll_loop *loop);
+static void loop_publish_stats(struct epoll_loop *loop);
 
 int model_epoll_run(int listen_fd, const struct config *config)
 {
@@ -150,8 +156,8 @@ static int loop_run(struct epoll_loop *loop)
 {
     struct epoll_event events[EPOLL_EVENTS_MAX];
     while (!stop_requested) {
-        int count =
-            epoll_wait(loop->epoll_fd, events, EPOLL_EVENTS_MAX, EPOLL_WAIT_MS);
+        int count = epoll_wait(loop->epoll_fd, events, EPOLL_EVENTS_MAX,
+                               loop_get_wait_ms(loop));
         if (count < 0 && errno != EINTR) {
             perror("epoll_wait");
             return 1;
@@ -164,9 +170,43 @@ static int loop_run(struct epoll_loop *loop)
             }
         }
         loop_sweep_timeouts(loop);
+        loop_publish_stats(loop);
     }
 
     return 0;
+}
+
+/* With --stats the loop wakes often enough to keep the file fresh. */
+static int loop_get_wait_ms(const struct epoll_loop *loop)
+{
+    return loop->config->stats_path != NULL ? STATS_PERIOD_MS : EPOLL_WAIT_MS;
+}
+
+/* --stats: one line for the demo dashboard, "connections C workers W busy
+   B". A .tmp file and a rename, so a reader never sees half a file. */
+static void loop_publish_stats(struct epoll_loop *loop)
+{
+    const char *path = loop->config->stats_path;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double seconds = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+    if (path == NULL || seconds < loop->stats_due) {
+        return;
+    }
+    loop->stats_due = seconds + (double)STATS_PERIOD_MS / 1000.0;
+    char tmp_path[PATH_BUFFER_SIZE];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *file = fopen(tmp_path, "w");
+    if (file == NULL) {
+        return; /* the next try comes STATS_PERIOD_MS later */
+    }
+    int workers = loop->pool != NULL ? loop->pool->thread_count : 0;
+    int busy = loop->pool != NULL ? atomic_load(&loop->pool->busy) : 0;
+    bool is_written = fprintf(file, "connections %d workers %d busy %d\n",
+                              loop->connection_count, workers, busy) > 0;
+    if (fclose(file) == 0 && is_written) {
+        rename(tmp_path, path);
+    }
 }
 
 static int loop_dispatch(struct epoll_loop *loop,
@@ -226,6 +266,7 @@ static void connection_close(struct epoll_loop *loop,
     }
     close(connection->conn_fd);
     connection_unlink(loop, connection);
+    loop->connection_count--;
     free(connection->buffer);
     free(connection);
 }
@@ -271,6 +312,7 @@ static void loop_accept(struct epoll_loop *loop)
         loop->connections->prev = connection;
     }
     loop->connections = connection;
+    loop->connection_count++;
 }
 
 /* Full request in the buffer: build the plan, then wait for EPOLLOUT. In
@@ -433,6 +475,7 @@ static struct work_pool *pool_create(int epoll_fd, const struct config *config)
         free(pool);
         return NULL;
     }
+    atomic_init(&pool->busy, 0);
     pthread_mutex_init(&pool->lock, NULL);
     pthread_cond_init(&pool->has_job, NULL);
     pool_start_workers(pool);
@@ -504,7 +547,9 @@ static void *worker_main(void *arg)
         }
         pthread_mutex_unlock(&pool->lock);
 
+        atomic_fetch_add(&pool->busy, 1);
         plan_build(connection, pool->config);
+        atomic_fetch_sub(&pool->busy, 1);
         worker_give_back(pool, connection);
     }
 }

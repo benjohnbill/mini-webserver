@@ -23,6 +23,7 @@
 #define ORIGIN_READ_CHUNK 16384
 #define DELAY_MAX 10000
 #define WORK_MAX 10000
+#define STATS_PERIOD_MS 200
 #define CACHE_BUCKETS 1024
 /* A multiple of CACHE_BUCKETS, so a key and its seen slot have the same
    stripe. */
@@ -62,8 +63,9 @@ struct config {
     int workers;
     int timeout;
     bool log;
-    int delay_ms; /* sleep before each answer: a slow Origin */
-    int work_ms;  /* CPU time before each answer: the Handler time */
+    int delay_ms;           /* sleep before each answer: a slow Origin */
+    int work_ms;            /* CPU time before each answer: the Handler time */
+    const char *stats_path; /* --stats: epoll models write it, or NULL */
 };
 
 #endif
