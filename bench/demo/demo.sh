@@ -405,8 +405,13 @@ present() {
         echo "    rproxy is alive after $PRESENT_DEATH_WAIT s"
     else
         sleep 0.5    # let the runner record the exit
+        # The same clock as the dashboard: from "started" of act.json.
         echo "    rproxy: $(cat "$RUN/rproxy.exit" 2>/dev/null || echo gone)" \
-            "after about $((i / 10)) s"
+            "at $(python3 -c 'import json, os, sys
+act = json.load(open(sys.argv[1] + "/act.json"))
+exit_time = os.stat(sys.argv[1] + "/rproxy.exit").st_mtime
+print(round(exit_time - act["started"], 1))' \
+            "$RUN" 2>/dev/null || echo "?") s"
     fi
     present_bystander
     present_wait

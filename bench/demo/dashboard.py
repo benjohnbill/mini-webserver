@@ -24,15 +24,14 @@ from rich.live import Live
 from rich.text import Text
 
 POLL_PERIOD = 0.2          # seconds between two frames
-CHART_ROWS = 8
-CHART_SECONDS_PER_COLUMN = 0.5
-CHART_AXIS = 8             # columns of the axis labels
-TIER_PREFIX = 14           # columns of " <label> <count> " before the grid
-LIMIT_LABEL = " server memory (scaled) "
+MIN_WIDTH = 60
 MIB = 1024 * 1024
-BLOCKS = " ▁▂▃▄▅▆▇█"
+SHARE_MIN = 100 * MIB       # the least held memory that shows shares
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")
 FOOTNOTE = " speed tiers = KR carrier QoS caps; tier shares = assumption"
+EMPTY_COLOR = "grey19"
+SLOW_COLOR = "magenta"
+FAST_COLOR = "cyan"
 
 ACT_TITLES = {
     1: "Act 1  No limit",
@@ -42,19 +41,22 @@ ACT_TITLES = {
     5: "Act 5  Back pressure, pool Origin",
 }
 
-# A state shows by color and by glyph, for a dim projector or a color-blind
-# viewer. The failed states share one glyph; the counter line splits them.
-STATE_GLYPHS = {
-    "waiting": ("·", "grey50"),
-    "receiving": ("▶", "bold bright_blue"),
-    "done": ("●", "bold green"),
-    "http_502": ("✗", "bold red"),
-    "http_503": ("✗", "bold red"),
-    "http_other": ("✗", "bold red"),
-    "cut": ("✗", "bold red"),
-    "refused": ("✗", "bold red"),
+# The color of each state, and its character in a plain frame (--once).
+STATE_COLORS = {
+    "done": ("green", "#"),
+    "receiving": ("blue", ">"),
+    "failed": ("red", "x"),
+    "waiting": ("grey35", "."),
 }
 FAILED_STATES = ("http_502", "http_503", "http_other", "cut", "refused")
+
+# One line under the tiers: what the Relay mode does with a reply.
+REASONS = {
+    "unbounded": "rproxy keeps each whole reply until the Phone takes it",
+    "reply-cap": "a reply over 4 MiB gets 502: 50 MB fails for all",
+    "conn-cap": "over the open reply limit, a Phone gets 503",
+    "backpressure": "rproxy reads the Origin as fast as the Phone reads",
+}
 
 
 def parse_args():
@@ -100,6 +102,7 @@ class Monitor:
         self.cpu_last = None      # (time, ticks)
         self.cpu = 0.0
         self.relay = {}           # last relay stats: port -> heap + kernel
+        self.tiers = None         # the tiers of the last frame before death
 
     def poll(self, run_dir):
         start = self.act.get("started", time.time())
@@ -225,206 +228,167 @@ def tiers_read(run_dir, act):
 
 
 def render(monitor, tiers, exit_code, width, plain):
-    parts = [render_title(monitor.act, width), Text("")]
-    parts += render_grid(tiers, width, plain)
-    parts.append(render_legend(tiers))
+    width = max(MIN_WIDTH, width)
+    paint = Paint(plain)
+    parts = [render_title(monitor.act, width), render_status(
+        monitor, exit_code, paint), Text("")]
+    parts += render_memory(monitor, width, paint)
     parts.append(Text(""))
-    parts += render_chart(monitor, exit_code, width - 2)
+    parts += render_holders(monitor, tiers, width, paint)
     parts.append(Text(""))
-    parts += render_buffer_share(monitor, tiers, width)
+    parts += render_tiers(monitor, tiers, width, paint)
+    parts.append(render_legend(tiers, paint))
     parts.append(Text(""))
-    parts += render_progress(monitor, tiers, width)
-    parts.append(Text(""))
-    parts.append(render_counters(monitor, tiers, exit_code))
+    parts.append(Text(" " + REASONS.get(monitor.act.get("relay"), ""),
+                      style="italic"))
     parts.append(Text(FOOTNOTE, style="dim"))
 
     return Group(*parts)
 
 
+class Paint:
+    """A bar is a run of cells with a background color. A colored space has
+    a width of one column in every terminal; glyphs like ● and ▶ do not."""
+
+    def __init__(self, plain):
+        self.plain = plain
+
+    def bar(self, segments, width):
+        """segments: (share 0..1, color, plain char). The rest is empty."""
+        text = Text()
+        used = 0
+        for share, color, char in segments:
+            cells = min(width - used, round(share * width))
+            self.cells(text, cells, color, char)
+            used += cells
+        self.cells(text, width - used, EMPTY_COLOR, ".")
+
+        return text
+
+    def cells(self, text, count, color, char):
+        if count <= 0:
+            return
+        if self.plain:
+            text.append(char * count)
+        else:
+            text.append(" " * count, style=f"on {color}")
+
+    def swatch(self, color, char):
+        return Text(char if self.plain else " ",
+                    style=None if self.plain else f"on {color}")
+
+
 def render_title(act, width):
     number = act.get("act")
     title = ACT_TITLES.get(number, "Waiting for an Act")
-    text = Text(title, style="bold")
+    text = Text(" " + title, style="bold")
     if act.get("relay"):
         text.append("   --relay ", style="dim")
         text.append(act["relay"], style="bold cyan")
-    if act.get("origin_model"):
-        text.append("   Origin ", style="dim")
-        text.append(act["origin_model"], style="cyan")
     text.truncate(width)
 
     return text
 
 
-def render_grid(tiers, width, plain):
-    columns = max(1, (width - TIER_PREFIX - 1) // 2)
-    rows = []
-    for tier in tiers:
-        for row_start in range(0, max(tier.count, 1), columns):
-            if row_start == 0:
-                row = Text(f" {tier.label:>8} {tier.count:>3}  ", style="bold")
-            else:
-                row = Text(" " * TIER_PREFIX)
-            for state in tier.states[row_start:row_start + columns]:
-                glyph, style = STATE_GLYPHS.get(state, STATE_GLYPHS["cut"])
-                row.append(glyph, style=None if plain else style)
-                row.append(" ")
-            rows.append(row)
-
-    return rows
-
-
-def render_legend(tiers):
-    text = Text(" ")
-    for state, label in (("done", "done"), ("receiving", "receiving"),
-                         ("cut", "failed"), ("waiting", "waiting")):
-        states = FAILED_STATES if state == "cut" else (state,)
-        glyph, style = STATE_GLYPHS[state]
-        count = sum(tier.total(*states) for tier in tiers)
-        text.append(f"{glyph} {label} {count}", style=style)
-        text.append("   ")
-    statuses = [tier.status for tier in tiers]
-    if statuses and all(status and status.get("finished")
-                        for status in statuses):
-        elapsed = (max(status["now"] for status in statuses)
-                   - min(status["start"] for status in statuses))
-        text.append(f"all ended at {elapsed:.0f} s", style="bold")
+def render_status(monitor, exit_code, paint):
+    text = Text(" rproxy ")
+    if monitor.death is None:
+        text.append(" ALIVE ", style="bold black on green")
+        return text
+    word = death_word(monitor, exit_code).upper()
+    text.append(f" {word} at {monitor.death:.1f} s ",
+                style="bold white on red")
 
     return text
 
 
-def render_chart(monitor, exit_code, width):
+def render_memory(monitor, width, paint):
     limit = monitor.act.get("memory_max", 1024 * MIB)
-    top = limit * 1.2
-    columns = width - CHART_AXIS
-    buckets = chart_buckets(monitor, columns)
-    death_column = None
+    current = monitor.memory[-1][1] if monitor.memory else 0
+    head = Text(" server memory (scaled)", style="bold")
+    figure = f"{current / MIB:.0f} / {limit / MIB:.0f} MiB "
+    head.append(" " * max(1, width - len(head) - len(figure)))
+    head.append(figure, style="bold red" if current >= limit * 0.8
+                else "bold yellow")
+    share = min(1.0, current / limit) if limit else 0
+    color = "red" if share >= 0.8 else "yellow"
+    bar = Text(" ")
+    bar.append_text(paint.bar([(share, color, "#")], width - 2))
+    note = Text(f" peak {monitor.peak / MIB:.0f} MiB", style="dim")
     if monitor.death is not None:
-        death_column = min(int(monitor.death / CHART_SECONDS_PER_COLUMN),
-                           columns - 1)
-        death_column -= chart_offset(monitor, columns)
-    limit_row = int(limit / top * CHART_ROWS)          # rows from the bottom
-    lines = [chart_header(monitor)]
-    for row in range(CHART_ROWS - 1, -1, -1):
-        label = chart_label(row, limit_row, limit)
-        cells = []
-        for column in range(columns):
-            if column == death_column:
-                cells.append(("X" if row == CHART_ROWS - 1 else "|",
-                              "bold red"))
-                continue
-            value = buckets[column] if column < len(buckets) else None
-            cells.append(chart_cell(value, row, limit_row, top))
-        if row == limit_row:
-            chart_label_limit(cells)
-        line = Text(label.rjust(CHART_AXIS - 1) + " ", style="dim")
-        for cell in cells:
-            line.append(*cell)
+        note.append("   (the last value before rproxy died)", style="dim")
+    if not monitor.memory:
+        note = Text(" no sample yet", style="dim")
+
+    return [head, bar, note]
+
+
+def render_holders(monitor, tiers, width, paint):
+    """Slow tiers against the fast tier: the share of the Phones next to
+    the share of the relay memory that they hold."""
+    lines = [Text(" who holds the relay memory", style="bold")]
+    sums = buffer_sums(monitor.relay, tiers)
+    held = sum(sums.values())
+    phones = sum(tier.count for tier in tiers)
+    if not tiers or not phones:
+        lines.append(Text("   no Phones", style="dim"))
+        return lines
+    total = f"{held / MIB:.1f} MiB" if held >= MIB else "under 1 MiB"
+    lines[0].append(f"   total {total}", style="dim")
+    fast = max(tiers, key=lambda tier: tier.rate)
+    groups = (("slow", [tier for tier in tiers if tier is not fast],
+               SLOW_COLOR, "s"), ("fast", [fast], FAST_COLOR, "f"))
+    limit = monitor.act.get("memory_max", 1024 * MIB)
+    bar_width = max(6, (width - 36) // 2)
+    lines.append(Text(" " * 11 + "Phones".ljust(bar_width + 7)
+                      + "memory, against the limit", style="dim"))
+    for name, group, color, char in groups:
+        count = sum(tier.count for tier in group)
+        memory = sum(sums.get(tier.label, 0) for tier in group)
+        line = Text(f" {name} {count:>4}  ", style="bold")
+        line.append_text(paint.bar([(count / phones, color, char)],
+                                   bar_width))
+        line.append(f" {count / phones * 100:3.0f}%  ")
+        # The bar is against the memory limit, so Act 4 shows near nothing.
+        line.append_text(paint.bar([(memory / limit, color, char)],
+                                   bar_width))
+        line.append(f" {memory / MIB:5.0f} MiB", style="bold")
+        if held >= SHARE_MIN:     # a share of a few MiB tells nothing
+            line.append(f" {memory / held * 100:3.0f}%", style="dim")
         lines.append(line)
-    lines.append(chart_footer(monitor, exit_code, columns))
 
     return lines
 
 
-def chart_header(monitor):
-    header = Text(" rproxy memory  ", style="bold")
-    if not monitor.memory:
-        header.append("no sample", style="dim")
-        return header
-    current = monitor.memory[-1][1]
-    header.append(f"{current / MIB:.0f} MiB", style="bold yellow")
-    if monitor.death is not None:
-        header.append("  before it died", style="bold red")
-    elif monitor.parts:
-        header.append(f"  = heap {monitor.parts.get('anon', 0) / MIB:.0f}"
-                      f" + TCP buffers {monitor.parts.get('sock', 0) / MIB:.0f}"
-                      " + other", style="dim")
-    header.append(f"   peak {monitor.peak / MIB:.0f}", style="dim")
+def render_tiers(monitor, tiers, width, paint):
+    """One row for each tier: the state of its Phones as one stacked bar,
+    and the relay memory that the tier holds."""
+    lines = [Text(" Phones by tier", style="bold")]
+    sums = buffer_sums(monitor.relay, tiers)
+    bar_width = max(10, width - 30)
+    for tier in tiers:
+        line = Text(f" {tier.label:>8} {tier.count:>4}  ", style="bold")
+        segments = []
+        for state, (color, char) in STATE_COLORS.items():
+            states = FAILED_STATES if state == "failed" else (state,)
+            if tier.count:
+                segments.append((tier.total(*states) / tier.count, color,
+                                 char))
+        line.append_text(paint.bar(segments, bar_width))
+        if tier.label in sums:
+            line.append(f" {sums[tier.label] / MIB:7.1f} MiB")
+        lines.append(line)
 
-    return header
-
-
-def chart_label_limit(cells):
-    """Write the name of the limit on the dashed limit line, at its right."""
-    start = len(cells) - len(LIMIT_LABEL) - 1
-    if start < 0:
-        return
-    for i, char in enumerate(LIMIT_LABEL):
-        if cells[start + i][0] == "-":
-            cells[start + i] = (char, "red")
+    return lines
 
 
-def chart_offset(monitor, columns):
-    """The first column on screen, so the chart scrolls on a long Act."""
-    if not monitor.memory:
-        return 0
-    last = int(monitor.memory[-1][0] / CHART_SECONDS_PER_COLUMN)
-    if monitor.death is not None:
-        last = max(last, int(monitor.death / CHART_SECONDS_PER_COLUMN))
-
-    return max(0, last - columns + 1)
-
-
-def chart_buckets(monitor, columns):
-    offset = chart_offset(monitor, columns)
-    buckets = []
-    for seconds, value in monitor.memory:
-        column = int(seconds / CHART_SECONDS_PER_COLUMN) - offset
-        if column < 0:
-            continue
-        while len(buckets) <= column:
-            buckets.append(None)
-        buckets[column] = max(buckets[column] or 0, value)
-
-    return buckets
-
-
-def chart_label(row, limit_row, limit):
-    if row == limit_row:
-        return mib_text(limit)
-    if row == 0:
-        return "0"
-
-    return ""
-
-
-def mib_text(value):
-    if value >= 1024 * MIB:
-        return f"{value / MIB / 1024:.3g} GiB"
-
-    return f"{value / MIB:.0f} MiB"
-
-
-def chart_cell(value, row, limit_row, top):
-    """The text and the style of one cell of the memory chart."""
-    if value is None:
-        if row == limit_row:
-            return ("-", "red")
-        return (" ",)
-    height = value / top * CHART_ROWS               # in rows, as a float
-    fill = height - row
-    style = "red" if value >= top / 1.2 * 0.8 else "yellow"
-    if fill >= 1:
-        return ("█", style)
-    if fill > 0:
-        return (BLOCKS[max(1, int(fill * 8))], style)
-    if row == limit_row:
-        return ("-", "red")
-    # A non-zero value shows at least one bar on the bottom row.
-    if row == 0 and value > 0:
-        return (BLOCKS[1], style)
-
-    return (" ",)
-
-
-def chart_footer(monitor, exit_code, columns):
-    text = Text(" " * CHART_AXIS)
-    seconds = (chart_offset(monitor, columns) + columns) \
-        * CHART_SECONDS_PER_COLUMN
-    text.append(f"time, {seconds:.0f} s across", style="dim")
-    if monitor.death is not None:
-        text.append(f"   rproxy {death_word(monitor, exit_code)}"
-                    f" at {monitor.death:.1f} s", style="bold red")
+def render_legend(tiers, paint):
+    text = Text(" ")
+    for state, (color, char) in STATE_COLORS.items():
+        states = FAILED_STATES if state == "failed" else (state,)
+        count = sum(tier.total(*states) for tier in tiers)
+        text.append_text(paint.swatch(color, char))
+        text.append(f" {state} {count}  ")
 
     return text
 
@@ -438,31 +402,6 @@ def death_word(monitor, exit_code):
         return "gone"
 
     return f"exited ({exit_code})"
-
-
-def render_buffer_share(monitor, tiers, width):
-    """The relay buffer bytes of rproxy (heap + kernel), summed by tier."""
-    lines = [Text(" buffer share in rproxy (heap + kernel)", style="bold")]
-    sums = buffer_sums(monitor.relay, tiers)
-    total = sum(sums.values())
-    if not total:
-        lines.append(Text("   no data", style="dim"))
-        return lines
-    lines[0].append(f"   total {total / MIB:.1f} MiB", style="dim")
-    bar_width = max(10, width - 35)
-    labels = [tier.label for tier in tiers] + ["other"]
-    for label in labels:
-        if label not in sums:
-            continue
-        share = sums[label] / total
-        filled = round(share * bar_width)
-        line = Text(f" {label:>8}  ")
-        line.append("█" * filled, style="magenta")
-        line.append("·" * (bar_width - filled), style="grey23")
-        line.append(f" {sums[label] / MIB:7.1f} MiB {share * 100:4.0f}%")
-        lines.append(line)
-
-    return lines
 
 
 def buffer_sums(relay, tiers):
@@ -484,54 +423,6 @@ def buffer_sums(relay, tiers):
     return sums
 
 
-def render_progress(monitor, tiers, width):
-    file_bytes = monitor.act.get("file_bytes")
-    lines = [Text(" progress of each tier (average Phone)", style="bold")]
-    bar_width = max(10, width - 50)
-    for tier in tiers:
-        received = sum(phone.get("bytes", 0) for phone in tier.phones)
-        average = received / tier.count if tier.count else 0
-        speeds = [phone.get("speed", 0) for phone in tier.phones
-                  if phone["state"] == "receiving"]
-        line = Text(f" {tier.label:>8}  ")
-        filled = round(average / file_bytes * bar_width) if file_bytes else 0
-        filled = min(bar_width, filled)
-        line.append("━" * filled, style="blue")
-        line.append("·" * (bar_width - filled), style="grey23")
-        speed = (f"{sum(speeds) / len(speeds) / 1000:6.0f} KB/s"
-                 if speeds else "      - KB/s")
-        size = f"{file_bytes / 1e6:.0f}" if file_bytes else "?"
-        line.append(f" {speed}  {average / 1e6:5.1f}/{size} MB")
-        line.append(f"  cap {tier.rate / 1000:.0f}", style="dim")
-        lines.append(line)
-
-    return lines
-
-
-def render_counters(monitor, tiers, exit_code):
-    def total(*states):
-        return str(sum(tier.total(*states) for tier in tiers))
-
-    text = Text(" ")
-    pairs = (("CPU", f"{monitor.cpu:.0f}%", "bold"),
-             ("done", total("done"), "bold green"),
-             ("502", total("http_502"), "bold red"),
-             ("503", total("http_503"), "bold red"),
-             ("cut", total("cut", "refused", "http_other"), "bold red"))
-    for label, value, style in pairs:
-        text.append(label + " ", style="dim")
-        text.append(value, style=style)
-        text.append("   ")
-    text.append("killed ", style="dim")
-    if monitor.death is not None and death_word(
-            monitor, exit_code).startswith("killed"):
-        text.append("YES", style="bold white on red")
-    else:
-        text.append("no", style="bold")
-
-    return text
-
-
 def act_key(act):
     return (act or {}).get("started")
 
@@ -548,8 +439,11 @@ def main():
             monitor = Monitor(act)                 # a new Act: reset
         exit_code = monitor.poll(args.run)
         tiers = tiers_read(args.run, act)
+        # After rproxy dies, show the Phones as they were at that moment.
+        if monitor.death is None or monitor.tiers is None:
+            monitor.tiers = tiers
 
-        return render(monitor, tiers, exit_code, width, plain)
+        return render(monitor, monitor.tiers, exit_code, width, plain)
 
     if args.once:
         end = time.time() + args.watch
