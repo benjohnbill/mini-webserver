@@ -646,10 +646,27 @@ sleep 1.5
 cat "$WORK"/stats/loop-*.txt > "$WORK/stats_snapshot" 2>/dev/null
 wait "$stats_pid"
 stats_port=$(cat "$WORK/stats_port")
-awk -v port="$stats_port" '$1 == port && $2 > 0 {found = 1} END {exit !found}' \
+awk -v port="$stats_port" '$1 == port && $2 > 0 && $3 > 0 && $4 == 0 {found = 1} END {exit !found}' \
     "$WORK/stats_snapshot" \
-    && pass "--relay-stats lists an open connection by client port with its heap bytes" \
-    || fail "--relay-stats lists an open connection by client port with its heap bytes: port '$stats_port', $(tr '\n' '|' < "$WORK/stats_snapshot")"
+    && pass "--relay-stats lists an open connection by client port with its Origin port and held bytes" \
+    || fail "--relay-stats lists an open connection by client port with its Origin port and held bytes: port '$stats_port', $(tr '\n' '|' < "$WORK/stats_snapshot")"
+
+# With backpressure, a slow client fills its relay buffer: the line shows
+# the 64 KiB capacity and paused = 1 (rproxy does not read the Origin).
+start_proxy --origin "$HOST:$EPOLL_PORT" --relay backpressure --loops 2 \
+    --relay-stats "$WORK/stats"
+curl -sk --max-time 30 --limit-rate 200K -o /dev/null -w '%{local_port}' \
+    "$BASE/big.bin" > "$WORK/stats_port" &
+stats_pid=$!
+sleep 2
+cat "$WORK"/stats/loop-*.txt > "$WORK/stats_snapshot" 2>/dev/null
+kill "$stats_pid" 2>/dev/null
+wait "$stats_pid" 2>/dev/null
+stats_port=$(cat "$WORK/stats_port" 2>/dev/null)
+awk '$4 == 65536 && $5 == 1 {found = 1} END {exit !found}' \
+    "$WORK/stats_snapshot" \
+    && pass "--relay-stats shows a slow backpressure client as paused with a 64 KiB relay buffer" \
+    || fail "--relay-stats shows a slow backpressure client as paused with a 64 KiB relay buffer: $(tr '\n' '|' < "$WORK/stats_snapshot")"
 
 stop_proxy
 "$RPROXY" --port "$PROXY_PORT" --cert build/cert.pem --key build/key.pem \

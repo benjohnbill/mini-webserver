@@ -106,6 +106,10 @@ struct exchange {
     int origin_index;       /* -1 if no Origin was picked */
     int status;             /* 0 if no reply was sent */
     size_t reply_bytes;     /* the reply to the client, without X-Cache */
+    int client_port;        /* the peer port of the client, 0 if unknown */
+    /* why the reply was not a whole 200, for the cause line: NULL if no
+       cause is known */
+    const char *cause;
     bool needs_drain;
     bool has_behavior; /* the request stage counted this request */
     struct behavior_counts behavior;
@@ -139,6 +143,7 @@ struct connection {
     int conn_fd;
     int origin_fd;   /* -1 while no Origin socket is open */
     int client_port; /* the peer port of conn_fd, 0 if unknown */
+    int origin_port; /* the local port of the last origin_fd, 0 if none */
     struct endpoint client_end;
     struct endpoint origin_end;
     uint32_t client_events; /* what conn_fd waits for: EPOLLIN or EPOLLOUT */
@@ -288,6 +293,9 @@ static void loop_expire_timers(struct event_loop *loop);
 static void loop_publish_stats(struct event_loop *loop);
 static bool relay_stats_format(const struct connection *connection, FILE *file);
 static long socket_get_queue(int fd, unsigned long request);
+static int socket_get_local_port(int fd);
+static size_t relay_get_pending(const struct connection *connection);
+static void cause_log(const struct exchange *exchange);
 static void connection_expire(struct connection *connection);
 static void relay_expire(struct connection *connection);
 static bool send_queue_has_drained(struct connection *connection);
@@ -473,9 +481,8 @@ static void connection_refuse(int conn_fd)
 {
     struct exchange exchange = {
         .verdict_name = "full", .cache_name = "-", .origin_index = -1};
-    int client_port = 0;
     client_address_get(conn_fd, exchange.client_ip, sizeof(exchange.client_ip),
-                       &client_port);
+                       &exchange.client_port);
     close(conn_fd);
     exchange_log(&exchange);
 }
@@ -531,6 +538,7 @@ static void connection_open(struct event_loop *loop, int conn_fd)
     client_address_get(conn_fd, connection->exchange.client_ip,
                        sizeof(connection->exchange.client_ip),
                        &connection->client_port);
+    connection->exchange.client_port = connection->client_port;
     fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL, 0) | O_NONBLOCK);
     struct epoll_event event = {.events = EPOLLIN | EPOLLET,
                                 .data.ptr = &connection->client_end};
@@ -1217,6 +1225,7 @@ static int exchange_slot_take(struct connection *connection)
     int in_progress = atomic_fetch_add(&rproxy->origin_exchanges, 1);
     if (in_progress >= rproxy->config.relay_conns) {
         atomic_fetch_sub(&rproxy->origin_exchanges, 1);
+        connection->exchange.cause = "conn-cap";
         return 503;
     }
     connection->holds_exchange_slot = true;
@@ -1263,6 +1272,7 @@ static enum step origin_connect_start(struct connection *connection)
     if (connection->origin_fd < 0) {
         return origin_connect_retry(connection);
     }
+    connection->origin_port = socket_get_local_port(connection->origin_fd);
     struct epoll_event event = {.events = EPOLLOUT | EPOLLET,
                                 .data.ptr = &connection->origin_end};
     if (epoll_ctl(connection->loop->epoll_fd, EPOLL_CTL_ADD,
@@ -1520,6 +1530,7 @@ static enum step relay_wait(struct connection *connection,
     bool has_room = relay->used < relay->capacity;
     connection_watch_origin(connection, has_room ? EPOLLIN : 0);
     if (has_moved) {
+        connection->send_queue = LONG_MAX; /* bytes moved: a new start */
         bool waits_for_client = relay->sent < relay->used;
         connection_set_deadline(
             connection, waits_for_client
@@ -1557,6 +1568,7 @@ static enum step origin_read_step(struct connection *connection)
         }
         connection->reply_len += (size_t)length;
         if (reply_is_over_cap(connection)) {
+            connection->exchange.cause = "reply-cap";
             return origin_exchange_end(connection, 502);
         }
     }
@@ -1727,6 +1739,18 @@ static void exchange_log(const struct exchange *exchange)
             exchange->verdict_name, exchange->cache_name, origin_text,
             status_text, exchange->reply_bytes);
     behavior_log(exchange);
+    cause_log(exchange);
+}
+
+/* A third line when rproxy knows why a reply failed. It starts with
+   "cause", so a reader of the 7-field line can skip it. */
+static void cause_log(const struct exchange *exchange)
+{
+    if (exchange->cause == NULL) {
+        return;
+    }
+    fprintf(stderr, "cause %s %d %d %s\n", exchange->client_ip,
+            exchange->client_port, exchange->status, exchange->cause);
 }
 
 /* A second line after a request Verdict: the behavior counters of the
@@ -1784,7 +1808,8 @@ static void loop_publish_stats(struct event_loop *loop)
         return;
     }
     bool is_written =
-        fprintf(file, "# client_port heap_bytes kernel_bytes\n") > 0;
+        fprintf(file,
+                "# client_port origin_port pending capacity paused slot\n") > 0;
     for (const struct connection *connection = loop->connections;
          connection != NULL && is_written; connection = connection->next) {
         is_written = relay_stats_format(connection, file);
@@ -1801,14 +1826,45 @@ static void loop_publish_stats(struct event_loop *loop)
    Origin socket. */
 static bool relay_stats_format(const struct connection *connection, FILE *file)
 {
-    size_t heap_bytes = connection->reply_len + connection->relay.capacity;
-    long kernel_bytes = socket_get_queue(connection->conn_fd, SIOCOUTQ);
-    if (connection->origin_fd >= 0) {
-        kernel_bytes += socket_get_queue(connection->origin_fd, FIONREAD);
+    const struct relay_buffer *relay = &connection->relay;
+    bool is_paused = relay->capacity > 0 && !relay->origin_is_done &&
+                     relay->used >= relay->capacity;
+
+    return fprintf(file, "%d %d %zu %zu %d %d\n", connection->client_port,
+                   connection->origin_port, relay_get_pending(connection),
+                   relay->capacity, is_paused ? 1 : 0,
+                   connection->holds_exchange_slot ? 1 : 0) > 0;
+}
+
+/* The reply bytes that rproxy holds in its own memory for this client.
+   Back pressure: read() - write() of the relay buffer. The other modes
+   hold the whole reply until the connection closes. */
+static size_t relay_get_pending(const struct connection *connection)
+{
+    const struct relay_buffer *relay = &connection->relay;
+    if (relay->capacity > 0) {
+        return relay->used - relay->sent;
     }
 
-    return fprintf(file, "%d %zu %ld\n", connection->client_port, heap_bytes,
-                   kernel_bytes) > 0;
+    return connection->reply_len;
+}
+
+/* 0 if the socket has no local address. */
+static int socket_get_local_port(int fd)
+{
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        return 0;
+    }
+    if (addr.ss_family == AF_INET) {
+        return ntohs(((struct sockaddr_in *)&addr)->sin_port);
+    }
+    if (addr.ss_family == AF_INET6) {
+        return ntohs(((struct sockaddr_in6 *)&addr)->sin6_port);
+    }
+
+    return 0;
 }
 
 /* SIOCOUTQ: the bytes in the send queue. FIONREAD: the bytes in the
@@ -1851,6 +1907,7 @@ static void connection_expire(struct connection *connection)
             connection_set_deadline(connection, CLIENT_TIMEOUT);
             return;
         }
+        connection->exchange.cause = "client-timeout";
         break;
     default:
         break;
@@ -1867,6 +1924,12 @@ static void relay_expire(struct connection *connection)
         connection_advance(connection);
         return;
     }
+    if (connection->relay.sent < connection->relay.used &&
+        send_queue_has_drained(connection)) {
+        connection_set_deadline(connection, CLIENT_TIMEOUT);
+        return;
+    }
+    connection->exchange.cause = "client-timeout";
     connection_close(connection);
 }
 
