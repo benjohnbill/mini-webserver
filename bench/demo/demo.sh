@@ -212,12 +212,15 @@ origin_start() {
         return
     fi
     origin_stop
-    (cd "$ROOT" && setsid taskset -c "$SERVER_CPUS" ./server "$ORIGIN_PORT" \
-        www --model "$model" --timeout "$ORIGIN_TIMEOUT" \
+    # exec: the pid of the background job is the pid of the server. Without
+    # it, the pid was a bash subshell, and `stop` left the server running.
+    (cd "$ROOT" && exec setsid taskset -c "$SERVER_CPUS" ./server \
+        "$ORIGIN_PORT" www --model "$model" --timeout "$ORIGIN_TIMEOUT" \
         --workers "$ORIGIN_WORKERS" --work "$ORIGIN_WORK" \
         --send-buffer "$ORIGIN_SEND_BUFFER" \
         --stats "$RUN/origin.stats" \
-        >"$RUN/origin.log" 2>&1 </dev/null & echo $! >"$RUN/origin.pid")
+        >"$RUN/origin.log" 2>&1 </dev/null) &
+    echo $! >"$RUN/origin.pid"
     echo "$model" >"$RUN/origin.model"
     echo "$key" >"$RUN/origin.key"
     for _ in $(seq 50); do

@@ -15,7 +15,7 @@
 #define DRAIN_READS_MAX 16
 #define DRAIN_WAIT_MS 1000
 #define PORT_MAX 65535
-#define WORKERS_MAX 1024
+#define WORKERS_MAX 16384 /* pool: one Worker per Phone in the 10k demo */
 #define TIMEOUT_MAX 3600
 /* 4 MiB, so that a 2 MiB file passes rproxy and the size admission of
    the cache has a reply to reject. */
