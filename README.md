@@ -17,117 +17,6 @@ flowchart LR
     proxy --> backend[Backend]
 ```
 
-### Requests
-
-#### Static · `GET /`
-
-```mermaid
----
-config:
-  sequence:
-    noteAlign: left
----
-sequenceDiagram
-    participant C as Browser
-    participant S as mini-webserver
-    participant F as File system
-
-    C->>S: Request
-    Note over C,S: GET / HTTP/1.1<br/>Host: localhost:8080
-    S->>F: Open index.html
-    F-->>S: File size · 366 bytes
-    S-->>C: Response headers
-    Note over C,S: HTTP/1.1 200 OK<br/>Content-Type: text/html#59; charset=utf-8<br/>Content-Length: 366<br/>Connection: close
-    S->>F: Read file
-    F-->>S: HTML bytes
-    S-->>C: HTML bytes
-```
-
-#### Echo · `POST /echo`
-
-```mermaid
----
-config:
-  sequence:
-    noteAlign: left
----
-sequenceDiagram
-    participant C as Browser
-    participant S as mini-webserver
-
-    C->>S: Request headers
-    Note over C,S: POST /echo HTTP/1.1<br/>Host: localhost:8080<br/>Content-Type: text/plain<br/>Content-Length: 5
-    C->>S: he
-    Note right of S: 2/5 bytes · wait
-    C->>S: llo
-    Note right of S: 5/5 bytes · ready
-    S-->>C: Response headers
-    Note over C,S: HTTP/1.1 200 OK<br/>Content-Type: application/octet-stream<br/>Content-Length: 5<br/>Connection: close
-    S-->>C: hello
-```
-
-#### Proxy · `/api` (Cache Miss)
-
-```mermaid
----
-config:
-  sequence:
-    noteAlign: left
----
-sequenceDiagram
-    participant C as Browser
-    participant P as Reverse Proxy
-    participant K as Proxy Cache
-    participant B as Backend
-
-    C->>P: Request
-    Note over C,P: GET /api/items?id=7 HTTP/1.1<br/>Host: localhost:8080
-    P->>P: Select backend · Ketama
-    P->>K: Lookup
-    K-->>P: Miss
-    P->>B: Open TCP connection
-    P->>B: Forward request
-    Note over P,B: GET /api/items?id=7 HTTP/1.1<br/>Host: 127.0.0.1:8001<br/>Via: 1.1 mini-webserver<br/>Connection: close<br/>Content-Length: 0
-    B-->>P: Response headers
-    P-->>C: Response headers
-    Note over C,P: HTTP/1.1 200 OK<br/>Content-Type: application/json<br/>Cache-Control: public, max-age=30<br/>Content-Length: 8<br/>Connection: close
-    loop Until body complete
-        B-->>P: Read up to 8 KiB
-        P-->>C: Forward chunk
-    end
-```
-
-#### Proxy · `/api` (Cache Hit)
-
-```mermaid
----
-config:
-  sequence:
-    noteAlign: left
----
-sequenceDiagram
-    participant C as Browser
-    participant P as Reverse Proxy
-    participant K as Proxy Cache
-
-    C->>P: Request
-    Note over C,P: GET /api/items?id=7 HTTP/1.1<br/>Host: localhost:8080
-    P->>P: Select backend · Ketama
-    P->>K: Lookup
-    K-->>P: Hit · headers and body
-    P-->>C: Response headers
-    Note over C,P: HTTP/1.1 200 OK<br/>Content-Type: application/json<br/>Cache-Control: public, max-age=30<br/>Content-Length: 8<br/>Connection: close<br/>Age: 0
-    P-->>C: {"id":7}
-```
-
-### Concurrency
-
-| 모델 | 처리 단위 | 백엔드 지연 시 |
-|---|---|---|
-| **Thread Pool** · 기본 | 워커 4개, 워커당 연결 1개 | 워커 4개 점유 시 다음 연결은 큐 대기 |
-| **Fork** | 연결당 자식 프로세스 1개 | 해당 자식만 대기 |
-| **Event Loop** | 스레드 1개, 연결 여러 개 | 다른 연결 처리 후 응답 도착 시 재개 |
-
 ## Features
 
 해당 프로젝트는 리버스 프록시를 통해 다양한 상황에서 서버가 감당하는 부하를 줄이는 것을 핵심 목표로 삼았습니다.
@@ -257,6 +146,117 @@ sequenceDiagram
         R->>P: Resume reads
     end
 ```
+
+## Requests
+
+### Static · `GET /`
+
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant S as mini-webserver
+    participant F as File system
+
+    C->>S: Request
+    Note over C,S: GET / HTTP/1.1<br/>Host: localhost:8080
+    S->>F: Open index.html
+    F-->>S: File size · 366 bytes
+    S-->>C: Response headers
+    Note over C,S: HTTP/1.1 200 OK<br/>Content-Type: text/html#59; charset=utf-8<br/>Content-Length: 366<br/>Connection: close
+    S->>F: Read file
+    F-->>S: HTML bytes
+    S-->>C: HTML bytes
+```
+
+### Echo · `POST /echo`
+
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant S as mini-webserver
+
+    C->>S: Request headers
+    Note over C,S: POST /echo HTTP/1.1<br/>Host: localhost:8080<br/>Content-Type: text/plain<br/>Content-Length: 5
+    C->>S: he
+    Note right of S: 2/5 bytes · wait
+    C->>S: llo
+    Note right of S: 5/5 bytes · ready
+    S-->>C: Response headers
+    Note over C,S: HTTP/1.1 200 OK<br/>Content-Type: application/octet-stream<br/>Content-Length: 5<br/>Connection: close
+    S-->>C: hello
+```
+
+### Proxy · `/api` (Cache Miss)
+
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant P as Reverse Proxy
+    participant K as Proxy Cache
+    participant B as Backend
+
+    C->>P: Request
+    Note over C,P: GET /api/items?id=7 HTTP/1.1<br/>Host: localhost:8080
+    P->>P: Select backend · Ketama
+    P->>K: Lookup
+    K-->>P: Miss
+    P->>B: Open TCP connection
+    P->>B: Forward request
+    Note over P,B: GET /api/items?id=7 HTTP/1.1<br/>Host: 127.0.0.1:8001<br/>Via: 1.1 mini-webserver<br/>Connection: close<br/>Content-Length: 0
+    B-->>P: Response headers
+    P-->>C: Response headers
+    Note over C,P: HTTP/1.1 200 OK<br/>Content-Type: application/json<br/>Cache-Control: public, max-age=30<br/>Content-Length: 8<br/>Connection: close
+    loop Until body complete
+        B-->>P: Read up to 8 KiB
+        P-->>C: Forward chunk
+    end
+```
+
+### Proxy · `/api` (Cache Hit)
+
+```mermaid
+---
+config:
+  sequence:
+    noteAlign: left
+---
+sequenceDiagram
+    participant C as Browser
+    participant P as Reverse Proxy
+    participant K as Proxy Cache
+
+    C->>P: Request
+    Note over C,P: GET /api/items?id=7 HTTP/1.1<br/>Host: localhost:8080
+    P->>P: Select backend · Ketama
+    P->>K: Lookup
+    K-->>P: Hit · headers and body
+    P-->>C: Response headers
+    Note over C,P: HTTP/1.1 200 OK<br/>Content-Type: application/json<br/>Cache-Control: public, max-age=30<br/>Content-Length: 8<br/>Connection: close<br/>Age: 0
+    P-->>C: {"id":7}
+```
+
+## Concurrency
+
+| 모델 | 처리 단위 | 백엔드 지연 시 |
+|---|---|---|
+| **Thread Pool** · 기본 | 워커 4개, 워커당 연결 1개 | 워커 4개 점유 시 다음 연결은 큐 대기 |
+| **Fork** | 연결당 자식 프로세스 1개 | 해당 자식만 대기 |
+| **Event Loop** | 스레드 1개, 연결 여러 개 | 다른 연결 처리 후 응답 도착 시 재개 |
 
 ## 지원 범위
 
