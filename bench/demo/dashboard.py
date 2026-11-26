@@ -12,12 +12,14 @@ and bright, and dims the others:
   relay buffer  the bytes that rproxy holds, and its limit in this mode
   Phones        one bar for all Phones: done, receiving, queued, failed
   rproxy        the connections of each Event loop
-  Origin        the Origin connections and the busy Workers
+  Origin        the Origin threads: asleep in write(), idle, running.
+                Phase 4 draws each thread and compares with Phase 3
   scores        one row for each Phase
 
 It reads the run directory that demo.sh writes:
   act.json          the Act: Relay mode, rproxy pid and cgroup, the values
-  scene             the scene of `present` (P0, P1, 2A, 2B, P3, ORIGIN)
+  scene             the scene of `present` (P0, P1, 2A, 2B, P3, P4)
+  origin.pid        the Origin; its threads come from /proc/<pid>/task
   status-*.json     the Phones of one phones.py process (bench/demo/phones.py)
   relay/loop-*.txt  one line for each rproxy connection: "client_port
                     origin_port pending capacity paused slot queued"
@@ -67,14 +69,11 @@ SCENES = {
     "P3": {"act": 4, "title": "Phase 3  backpressure",
            "note": "read the Origin only when there is room",
            "focus": {"memory", "relay"}},
-    "ORIGIN": {"act": 4, "title": "Origin  epoll-pool",
-               "note": "a slow Phone holds a socket, not a Worker",
-               "focus": {"loops", "origin", "scores"}},
-    "A5": {"act": 5, "title": "Origin  pool (comparison)",
-           "note": "a slow Phone holds a Worker",
-           "focus": {"origin", "phones"}},
+    "P4": {"act": 5, "title": "Phase 4  pool",
+           "note": "the same load; a slow Phone holds a Worker thread",
+           "focus": {"origin"}},
 }
-SCENE_OF_ACT = {1: "P1", 2: "2A", 3: "2B", 4: "P3", 5: "A5"}
+SCENE_OF_ACT = {1: "P1", 2: "2A", 3: "2B", 4: "P3", 5: "P4"}
 
 # The parts of the Phone bar, in order: label, colour, plain char.
 PARTS = {
@@ -91,6 +90,19 @@ PARTS = {
 BASE_COLOR = "grey42"      # the memory of the open connections
 RELAY_COLOR = "bold white"  # the Relay buffer bytes on top
 LIMIT_COLOR = "red"
+
+# The Origin threads by what the kernel says they wait in (wchan).
+# wait_woken: a send() that waits for room in the socket send buffer.
+# futex_do_wait: a Worker that waits for a connection, or a lock.
+THREAD_KINDS = {
+    "write": ("asleep in write()", "gold1", "w"),
+    "idle": ("idle", "grey50", "."),
+    "running": ("running", "green3", "R"),
+    "other": ("other wait", "grey35", "o"),
+}
+THREAD_WCHAN = {"wait_woken": "write", "futex_do_wait": "idle"}
+THREAD_POLL_PERIOD = 1.0   # seconds; 10k threads take a moment to read
+THREADS_PER_CELL = 20
 
 
 def parse_args():
@@ -149,6 +161,11 @@ class Monitor:
         self.seen = 0.0       # seconds since act start of the last frame
         self.polls = 0
         self.exit_code = None
+        self.threads = None   # the last threads_read(), or None
+        # The reading with the most RSS: at the end of an Act the Origin
+        # stops and frees its memory, so the last reading is too small.
+        self.threads_peak = None
+        self.threads_time = 0.0
 
     def poll(self, run_dir):
         start = self.act.get("started", time.time())
@@ -166,6 +183,14 @@ class Monitor:
                 self.was_dead_at_start = self.polls == 1
         if not self.phones:
             self.phones = phones_read(run_dir, self.act, self.relay)
+        if self.death is None and \
+                time.time() - self.threads_time >= THREAD_POLL_PERIOD:
+            self.threads = threads_read(run_dir) or self.threads
+            if self.threads and (self.threads_peak is None or
+                                 self.threads["rss"] >
+                                 self.threads_peak["rss"]):
+                self.threads_peak = self.threads
+            self.threads_time = time.time()
 
         self.exit_code = read_text(os.path.join(run_dir, "rproxy.exit"))
 
@@ -282,6 +307,31 @@ def origin_read(run_dir):
                 for i in range(0, len(fields) - 1, 2)}
     except ValueError:
         return None
+
+
+def threads_read(run_dir):
+    """The Origin threads: the count of each kind, and the RSS. None if
+    the Origin is not running."""
+    pid = (read_text(os.path.join(run_dir, "origin.pid")) or "").strip()
+    status = read_text(f"/proc/{pid}/status") if pid.isdigit() else None
+    if status is None:
+        return None
+    counts = {kind: 0 for kind in THREAD_KINDS}
+    for task in glob.glob(f"/proc/{pid}/task/*"):
+        stat = read_text(os.path.join(task, "stat"))
+        if stat is None:
+            continue
+        if stat.rsplit(")", 1)[1].split()[0] == "R":
+            counts["running"] += 1
+            continue
+        wchan = read_text(os.path.join(task, "wchan")) or ""
+        counts[THREAD_WCHAN.get(wchan, "other")] += 1
+    rss = 0
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            rss = int(line.split()[1]) * 1024
+
+    return {"counts": counts, "total": sum(counts.values()), "rss": rss}
 
 
 def scene_get(run_dir, act, forced):
@@ -612,21 +662,88 @@ def render_loops(view):
 
 
 def render_origin(view):
-    act = view["monitor"].act
-    origin = view["origin"]
+    monitor = view["monitor"]
+    act = monitor.act
     is_focus = "origin" in SCENES[view["scene"]]["focus"]
     text = block_title("Origin", is_focus, view["plain"])
     text.append(f"   {act.get('origin_model', '?')}", style="bold")
-    if not origin:
-        text.append("   no stats", style="dim")
+    threads = monitor.threads
+    if not threads:
+        text.append("   not running", style="dim")
         return [text]
-    text.append(f"   {origin.get('connections', 0):,} connections open ·"
-                f" Workers busy {origin.get('busy', 0)}"
-                f"/{origin.get('workers', 0)}")
-    text.append(f"   (each answer: {act.get('origin_work', 0)} ms of CPU)",
-                style="dim")
+    text.append_text(threads_summary(threads, view["plain"]))
+    stats = view["origin"]
+    if stats and act.get("origin_model") != "pool":
+        # pool writes no --stats; epoll-pool counts the sockets it holds.
+        text.append(f" · {stats.get('connections', 0):,} sockets")
+    text.truncate(view["width"])
+    if not is_focus:
+        return [text]
+    model = act.get("origin_model", "?")
+    lines = [text, Text(f"   1 cell = {THREADS_PER_CELL} threads",
+                        style="dim")]
+    columns = max(10, view["width"] - LABEL - 12)
+    lines += threads_grid(f"Phase 4  {model}", threads, columns,
+                          view["plain"])
+    before = next((row for row in view["scores"]
+                   if row.get("scene") == "P3" and row.get("origin")), None)
+    if before:
+        lines += threads_grid("Phase 3  epoll-pool", before["origin"],
+                              columns, view["plain"])
+    lines.append(Text(""))
+    lines += rss_bars(threads, before, model, view)
 
-    return [text]
+    return lines
+
+
+def threads_summary(threads, plain):
+    text = Text(f"   {threads['total']:,} threads: ")
+    for kind, (label, color, char) in THREAD_KINDS.items():
+        count = threads["counts"].get(kind, 0)
+        if not count and kind != "write":
+            continue
+        text.append(char if plain else "■", style=color)
+        text.append(f" {label} {count:,}  ",
+                    style="bold" if kind == "write" and count else "")
+    text.append(f" RSS {mib(threads['rss'])}")
+
+    return text
+
+
+def threads_grid(title, threads, columns, plain):
+    """One cell for each THREADS_PER_CELL threads, in the order of
+    THREAD_KINDS, `columns` cells on a row."""
+    cells = []
+    for kind, (_, color, char) in THREAD_KINDS.items():
+        count = threads["counts"].get(kind, 0)
+        cells += [(char, color)] * -(-count // THREADS_PER_CELL)
+    lines = []
+    for start in range(0, max(1, len(cells)), columns):
+        label = title if start == 0 else ""
+        line = Text(f"   {label:<{LABEL + 8}}", style="bold" if label else "")
+        for char, color in cells[start:start + columns]:
+            line.append(char if plain else "█", style=color)
+        lines.append(line)
+
+    return lines
+
+
+def rss_bars(threads, before, model, view):
+    """The Origin RSS now and in Phase 3, on one scale."""
+    rows = [(f"Phase 4  {model}", threads["rss"])]
+    if before:
+        rows.append(("Phase 3  epoll-pool", before["origin"]["rss"]))
+    top = max(rss for _, rss in rows) or 1
+    width = max(10, view["width"] - LABEL - 8 - 16)
+    lines = [Text("   Origin memory (RSS; Phase 3 at its peak)",
+                  style="bold")]
+    for title, rss in rows:
+        line = Text(f"   {title:<{LABEL + 8}}")
+        line.append_text(bar([(rss, "gold1")], top, width, view["plain"]))
+        line.append(f"  {mib(rss)}")
+        lines.append(line)
+
+    return lines
 
 
 def score_row(monitor, scene):
@@ -644,13 +761,11 @@ def score_row(monitor, scene):
         if word != "stopped":    # demo.sh stopped it for the next Act
             note = f"{word} at {monitor.death:.0f} s"
 
-    # The Origin scene runs on the Act of Phase 3: one row for both.
-    return {"scene": "P3" if scene == "ORIGIN" else scene,
-            "at": round(monitor.seen),
+    return {"scene": scene, "at": round(monitor.seen),
             "peak_mib": round(monitor.peak / MIB),
             "done": counts.get("done", 0),
             "open": counts.get("receiving", 0) + counts.get("queued", 0),
-            "failed": failed, "note": note}
+            "failed": failed, "note": note, "origin": monitor.threads_peak}
 
 
 def render_scores(view):

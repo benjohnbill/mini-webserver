@@ -61,6 +61,9 @@ RELAY_BUFFER="${RELAY_BUFFER:-16384}" # Act 4 and 5 buffer
 # time). Act 5 is the same load on a pool Origin, for the comparison.
 ORIGIN_MODEL="${ORIGIN_MODEL:-epoll-pool}"
 ORIGIN_WORKERS="${ORIGIN_WORKERS:-8}"
+# Act 5: one pool Worker for each Phone, so that pool serves the same load.
+# Each Worker sleeps in write() while its Phone reads slowly (Phase 4).
+POOL_WORKERS="${POOL_WORKERS:-10000}"
 ORIGIN_WORK="${ORIGIN_WORK:-5}"
 CERT="${CERT:-ec}"                    # ec (ECDSA P-256) or rsa
 # rproxy waits this long for a client. The 5 s default cut the Phones under
@@ -75,9 +78,11 @@ PROXY_ORIGIN_TIMEOUT="${PROXY_ORIGIN_TIMEOUT:-60}"
 ORIGIN_SEND_BUFFER="${ORIGIN_SEND_BUFFER:-16384}"
 # The Origin closes a connection after this many seconds with no progress.
 # In Act 4 the Origin sends only as fast as a slow Phone reads, so its send
-# queue drains slowly and the 5 s default cuts the 1 Mbps Phones. 60 s is
-# the default of nginx send_timeout.
-ORIGIN_TIMEOUT="${ORIGIN_TIMEOUT:-60}"
+# queue drains slowly. The 5 s default cut the 1 Mbps Phones. With 60 s (the
+# nginx send_timeout default) the epoll-pool Origin still cut about 35 of
+# the slowest Phones at 10k, in the middle of the body; with 600 s none
+# (2026-11-26). pool has no send timeout, so the comparison stays fair.
+ORIGIN_TIMEOUT="${ORIGIN_TIMEOUT:-300}"
 ORIGIN_PORT="${ORIGIN_PORT:-19080}"
 PROXY_PORT="${PROXY_PORT:-19443}"
 RPROXY_ARGS="${RPROXY_ARGS:-}"        # more rproxy flags, for a rehearsal
@@ -202,11 +207,16 @@ prepare() {
     fi
 }
 
+origin_workers() {
+    if [[ "$1" == pool ]]; then echo "$POOL_WORKERS"; else echo "$ORIGIN_WORKERS"; fi
+}
+
 # Start the Origin once. Act 5 needs a `pool` Origin, the others
 # ORIGIN_MODEL. A change of a value starts a new Origin.
 origin_start() {
-    local model="$1" key pid
-    key="$model $ORIGIN_TIMEOUT $SERVER_CPUS $ORIGIN_WORKERS $ORIGIN_WORK $ORIGIN_SEND_BUFFER"
+    local model="$1" key pid workers
+    workers="$(origin_workers "$model")"
+    key="$model $ORIGIN_TIMEOUT $SERVER_CPUS $workers $ORIGIN_WORK $ORIGIN_SEND_BUFFER"
     pid="$(pid_read origin)"
     if pid_is_alive "$pid" && [[ "$(cat "$RUN/origin.key" 2>/dev/null)" == "$key" ]]; then
         return
@@ -216,7 +226,7 @@ origin_start() {
     # it, the pid was a bash subshell, and `stop` left the server running.
     (cd "$ROOT" && exec setsid taskset -c "$SERVER_CPUS" ./server \
         "$ORIGIN_PORT" www --model "$model" --timeout "$ORIGIN_TIMEOUT" \
-        --workers "$ORIGIN_WORKERS" --work "$ORIGIN_WORK" \
+        --workers "$workers" --work "$ORIGIN_WORK" \
         --send-buffer "$ORIGIN_SEND_BUFFER" \
         --stats "$RUN/origin.stats" \
         >"$RUN/origin.log" 2>&1 </dev/null) &
@@ -298,7 +308,7 @@ act_json_write() {
  "file_bytes": $FILE_BYTES, "proxy_port": $PROXY_PORT,
  "origin_port": $ORIGIN_PORT, "relay_conns": $RELAY_CONNS,
  "relay_memory": $RELAY_MEMORY, "relay_queue": $RELAY_QUEUE,
- "relay_buffer": $RELAY_BUFFER, "origin_workers": $ORIGIN_WORKERS,
+ "relay_buffer": $RELAY_BUFFER, "origin_workers": $(origin_workers "$(cat "$RUN/origin.model")"),
  "origin_work": $ORIGIN_WORK, "cert": "$CERT",
  "speed_scale": $SPEED_SCALE, "client_timeout": $CLIENT_TIMEOUT,
  "mode": "$mode", "held": $held, "started": $(date +%s.%N)}
@@ -542,8 +552,11 @@ present() {
     present_bystander
     present_wait
 
-    present_header "Origin  $ORIGIN_MODEL: $ORIGIN_WORKERS Workers"
-    scene_set ORIGIN
+    # Phase 4: the same load on a pool Origin. Phase 3 can end early: the
+    # comparison needs only its threads, not its last Phone.
+    present_header "Phase 4  pool: $POOL_WORKERS Workers, the same load"
+    act_start 5 dry
+    scene_set P4
     present_wait
 
     act_stop
