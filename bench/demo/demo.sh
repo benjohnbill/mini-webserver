@@ -30,6 +30,12 @@ RUN="${RUN:-$DEMO/run}"
 # read 10k Phones at the real speeds (they took 100 % CPU at about 1.3 GB/s,
 # 2026-11-26). The ratios between the tiers stay.
 SPEED_SCALE="${SPEED_SCALE:-10}"
+# Sigma of the log of each Phone speed around its tier speed. With one speed
+# per tier, a whole tier ended at once, and the done count stood still at
+# 500, 1000, 2000, and 5000 between the tiers. 0.35 puts two of three Phones
+# between 0.7 and 1.4 times the tier speed, so the tiers overlap. The tier
+# speed is the median, so some Phones go above the carrier cap.
+SPEED_SPREAD="${SPEED_SPREAD:-0.35}"
 MIX="${MIX:-fast:50000:500 5mbps:625:500 3mbps:375:1000 1mbps:125:3000 400kbps:50:5000}"
 # Phones per second that start, for all tiers together. Act 1 is slower, so
 # that the memory line has time to climb before the kill.
@@ -313,7 +319,8 @@ phones_start() {
             part=$((left < PHONES_PER_PROC ? left : PHONES_PER_PROC))
             taskset -c "$PHONE_CPUS" python3 "$DEMO/phones.py" \
                 --port "$PROXY_PORT" --count "$part" --arrival "$arrival" \
-                --rate "$rate" --tier "$label" --path "$FILE_PATH" \
+                --rate "$rate" --spread "$SPEED_SPREAD" --seed "$index" \
+                --tier "$label" --path "$FILE_PATH" \
                 --status "$RUN/status-$label-$index.json" \
                 >>"$RUN/phones.log" 2>&1 &
             pids+=("$!")

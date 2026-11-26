@@ -2,7 +2,9 @@
 """The Phones of the Back pressure demo (SPEC 12).
 
 Each Phone opens one TLS connection to rproxy, sends one GET, and reads the
-body at a fixed speed. The Phones start one by one over the arrival time.
+body at its own fixed speed. The speeds of one tier spread on a log-normal
+curve around the tier speed (--spread), so the tiers overlap and the Phones
+do not all end at once. The Phones start one by one over the arrival time.
 The program writes the state of each Phone to a JSON status file.
 
 demo.sh starts one process for each speed tier. --tier names the tier in the
@@ -10,13 +12,16 @@ status file, and each Phone records its local port, so the dashboard can join
 the Phones to the relay buffer stats of rproxy.
 
 Usage: bench/demo/phones.py [--host H] [--port P] [--count N]
-       [--arrival S] [--rate KBPS] [--tier NAME] [--path P] [--status FILE]
+       [--arrival S] [--rate KBPS] [--spread SIGMA] [--seed N] [--tier NAME]
+       [--path P] [--status FILE]
 """
 import argparse
 import asyncio
 import enum
 import json
+import math
 import os
+import random
 import socket
 import ssl
 import time
@@ -26,6 +31,10 @@ CHUNK_MAX = 16384         # the largest read of one step
 STATUS_PERIOD = 0.2       # seconds between two status writes
 SPEED_WINDOW = 1.0        # seconds of history for the speed of a Phone
 HEADER_MAX = 16384
+# The spread is cut at these factors of the tier speed, so that one slow
+# draw does not make the Act much longer.
+RATE_FACTOR_MIN = 0.6
+RATE_FACTOR_MAX = 1.8
 
 
 class State(str, enum.Enum):
@@ -43,8 +52,9 @@ STATUS_STATES = {502: State.HTTP_502, 503: State.HTTP_503}
 
 
 class Phone:
-    def __init__(self, index):
+    def __init__(self, index, rate):
         self.index = index
+        self.rate = rate        # body bytes per second that it reads
         self.state = State.WAITING
         self.bytes = 0          # body bytes read
         self.length = None      # Content-Length of the reply
@@ -67,7 +77,7 @@ class Phone:
         speed = self.speed(now) if self.state == State.RECEIVING else 0
         return {"state": self.state.value, "bytes": self.bytes,
                 "length": self.length, "status": self.status,
-                "speed": speed, "error": self.error, "port": self.port}
+                "speed": speed, "rate": self.rate, "error": self.error, "port": self.port}
 
 
 def parse_args():
@@ -78,7 +88,11 @@ def parse_args():
     parser.add_argument("--arrival", type=float, default=15.0,
                         help="seconds to start all Phones")
     parser.add_argument("--rate", type=float, default=400.0,
-                        help="KB/s that each Phone reads")
+                        help="median KB/s that a Phone reads")
+    parser.add_argument("--spread", type=float, default=0.0,
+                        help="sigma of the log of the speed (0: all equal)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="with --tier, picks the same speeds each run")
     parser.add_argument("--tier", default="",
                         help="label of the speed tier, for the status file")
     parser.add_argument("--path", default="/update.bin")
@@ -157,7 +171,7 @@ async def phone_run(phone, args, context, delay):
         writer.write(request.encode())
         await writer.drain()
         await phone_read_head(phone, reader, args.stall)
-        await phone_read_body(phone, reader, args.rate * 1000, args.stall)
+        await phone_read_body(phone, reader, phone.rate, args.stall)
         phone.state = phone_decide_end(phone)
     except (OSError, ssl.SSLError, asyncio.IncompleteReadError,
             asyncio.TimeoutError, ValueError, IndexError) as error:
@@ -176,6 +190,18 @@ def phone_decide_end(phone):
     return STATUS_STATES.get(phone.status, State.HTTP_OTHER)
 
 
+def phone_draw_rates(args):
+    """The speed of each Phone, in bytes per second."""
+    draw = random.Random(f"{args.tier}:{args.seed}")
+    rates = []
+    for _ in range(args.count):
+        factor = math.exp(draw.gauss(0.0, args.spread))
+        factor = min(max(factor, RATE_FACTOR_MIN), RATE_FACTOR_MAX)
+        rates.append(args.rate * 1000 * factor)
+
+    return rates
+
+
 def status_write(path, phones, args, start, finished):
     now = time.time()
     totals = {state.value: 0 for state in State}
@@ -184,7 +210,7 @@ def status_write(path, phones, args, start, finished):
     status = {
         "start": start, "now": now, "finished": finished,
         "tier": args.tier, "count": args.count, "arrival": args.arrival,
-        "rate": args.rate * 1000, "path": args.path,
+        "rate": args.rate * 1000, "spread": args.spread, "path": args.path,
         "totals": totals,
         "bytes": sum(phone.bytes for phone in phones),
         "phones": [phone.to_json(now) for phone in phones],
@@ -205,7 +231,7 @@ async def main():
     args = parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(args.status)), exist_ok=True)
     context = make_tls_context()
-    phones = [Phone(i) for i in range(args.count)]
+    phones = [Phone(i, rate) for i, rate in enumerate(phone_draw_rates(args))]
     start = time.time()
     step = args.arrival / args.count if args.count else 0
     writer_task = asyncio.create_task(
