@@ -96,9 +96,9 @@ LIMIT_COLOR = "red"
 # futex_do_wait: a Worker that waits for a connection, or a lock.
 # The order is the order of the grid: the few that work first, bright.
 THREAD_KINDS = {
-    "running": ("running", "bold green3", "R"),
-    "write": ("asleep in write()", "dark_goldenrod", "z"),
-    "idle": ("asleep, no connection", "grey42", "."),
+    "running": ("working", "bold green3", "R"),
+    "write": ("wasted: holds a Phone, asleep in write()", "red3", "z"),
+    "idle": ("spare", "grey42", "."),
     "other": ("other wait", "grey30", "o"),
 }
 THREAD_WCHAN = {"wait_woken": "write", "futex_do_wait": "idle"}
@@ -333,7 +333,12 @@ def threads_read(run_dir):
         if line.startswith("VmRSS:"):
             rss = int(line.split()[1]) * 1024
 
-    return {"counts": counts, "total": sum(counts.values()), "rss": rss}
+    stats = origin_read(run_dir) or {}
+    sockets = stats.get("connections") if os.path.exists(
+        os.path.join(run_dir, "origin.stats")) else None
+
+    return {"counts": counts, "total": sum(counts.values()), "rss": rss,
+            "sockets": sockets}
 
 
 def scene_get(run_dir, act, forced):
@@ -713,19 +718,15 @@ def threads_summary(threads, plain):
 
 
 def threads_headline(threads, plain):
-    """How many threads sleep, and how few work."""
+    """Wasted threads against working threads."""
     counts = threads["counts"]
-    asleep = counts.get("write", 0) + counts.get("idle", 0)
-    share = asleep * 100 // max(1, threads["total"])
     text = Text("   ")
-    text.append(f" {asleep:,} of {threads['total']:,} threads asleep"
-                f" ({share} %) ",
-                style="" if plain else "bold black on gold1")
-    text.append("   ")
-    text.append(f" {counts.get('running', 0):,} running ",
+    text.append(f" {counts.get('write', 0):,} threads wasted ",
+                style="" if plain else "bold white on red3")
+    text.append("  vs  ", style="bold")
+    text.append(f" {counts.get('running', 0):,} working ",
                 style="" if plain else "bold black on green3")
-    text.append(f"   {counts.get('write', 0):,} hold a Phone in write()",
-                style="bold")
+    text.append(f"   of {threads['total']:,}", style="bold")
 
     return text
 
@@ -744,8 +745,22 @@ def threads_grid(title, threads, columns, plain):
         for char, color in cells[start:start + columns]:
             line.append(char + " " if plain else CELL, style=color)
         lines.append(line)
+    lines[-1].append_text(grid_tally(threads))
 
     return lines
+
+
+def grid_tally(threads):
+    counts = threads["counts"]
+    text = Text("  ")
+    text.append(f"{counts.get('write', 0):,} wasted", style="bold red3")
+    text.append(f" · {counts.get('running', 0):,} working",
+                style="bold green3")
+    if threads.get("sockets"):
+        text.append(f" · 1 Event loop holds {threads['sockets']:,} sockets",
+                    style="bold")
+
+    return text
 
 
 def rss_bars(threads, before, model, view):
