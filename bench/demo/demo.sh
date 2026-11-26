@@ -46,7 +46,10 @@ CONNECTIONS="${CONNECTIONS:-12000}"   # rproxy --connections
 # (2026-11-26).
 RELAY_MEMORY="${RELAY_MEMORY:-1536}"
 RELAY_CONNS="${RELAY_CONNS:-2000}"    # Act 3 limit
-RELAY_QUEUE="${RELAY_QUEUE:-60}"      # Act 3: seconds in the queue, then 503
+# Act 3: seconds in the queue, then 503. A slot stays taken for a whole
+# download (200 s and more for a slow Phone), so the queue hardly moves.
+# 15 s shows the 503s early on stage; 60 s only delayed the same result.
+RELAY_QUEUE="${RELAY_QUEUE:-15}"
 RELAY_BUFFER="${RELAY_BUFFER:-16384}" # Act 4 and 5 buffer
 # The Origin: epoll-pool, ORIGIN_WORK ms of CPU for each answer (the Handler
 # time). Act 5 is the same load on a pool Origin, for the comparison.
