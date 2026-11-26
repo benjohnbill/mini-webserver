@@ -94,15 +94,17 @@ LIMIT_COLOR = "red"
 # The Origin threads by what the kernel says they wait in (wchan).
 # wait_woken: a send() that waits for room in the socket send buffer.
 # futex_do_wait: a Worker that waits for a connection, or a lock.
+# The order is the order of the grid: the few that work first, bright.
 THREAD_KINDS = {
-    "write": ("asleep in write()", "gold1", "w"),
-    "idle": ("idle", "grey50", "."),
-    "running": ("running", "green3", "R"),
-    "other": ("other wait", "grey35", "o"),
+    "running": ("running", "bold green3", "R"),
+    "write": ("asleep in write()", "dark_goldenrod", "z"),
+    "idle": ("asleep, no connection", "grey42", "."),
+    "other": ("other wait", "grey30", "o"),
 }
 THREAD_WCHAN = {"wait_woken": "write", "futex_do_wait": "idle"}
 THREAD_POLL_PERIOD = 1.0   # seconds; 10k threads take a moment to read
-THREADS_PER_CELL = 20
+THREADS_PER_CELL = 50
+CELL = "● "                # one cell and its gap, so each one reads as one
 
 
 def parse_args():
@@ -680,9 +682,9 @@ def render_origin(view):
     if not is_focus:
         return [text]
     model = act.get("origin_model", "?")
-    lines = [text, Text(f"   1 cell = {THREADS_PER_CELL} threads",
-                        style="dim")]
-    columns = max(10, view["width"] - LABEL - 12)
+    lines = [text, Text(""), threads_headline(threads, view["plain"]),
+             Text(f"   ● = {THREADS_PER_CELL} threads", style="dim")]
+    columns = max(10, (view["width"] - LABEL - 12) // len(CELL))
     lines += threads_grid(f"Phase 4  {model}", threads, columns,
                           view["plain"])
     before = next((row for row in view["scores"]
@@ -710,6 +712,24 @@ def threads_summary(threads, plain):
     return text
 
 
+def threads_headline(threads, plain):
+    """How many threads sleep, and how few work."""
+    counts = threads["counts"]
+    asleep = counts.get("write", 0) + counts.get("idle", 0)
+    share = asleep * 100 // max(1, threads["total"])
+    text = Text("   ")
+    text.append(f" {asleep:,} of {threads['total']:,} threads asleep"
+                f" ({share} %) ",
+                style="" if plain else "bold black on gold1")
+    text.append("   ")
+    text.append(f" {counts.get('running', 0):,} running ",
+                style="" if plain else "bold black on green3")
+    text.append(f"   {counts.get('write', 0):,} hold a Phone in write()",
+                style="bold")
+
+    return text
+
+
 def threads_grid(title, threads, columns, plain):
     """One cell for each THREADS_PER_CELL threads, in the order of
     THREAD_KINDS, `columns` cells on a row."""
@@ -722,7 +742,7 @@ def threads_grid(title, threads, columns, plain):
         label = title if start == 0 else ""
         line = Text(f"   {label:<{LABEL + 8}}", style="bold" if label else "")
         for char, color in cells[start:start + columns]:
-            line.append(char if plain else "█", style=color)
+            line.append(char + " " if plain else CELL, style=color)
         lines.append(line)
 
     return lines
@@ -739,7 +759,7 @@ def rss_bars(threads, before, model, view):
                   style="bold")]
     for title, rss in rows:
         line = Text(f"   {title:<{LABEL + 8}}")
-        line.append_text(bar([(rss, "gold1")], top, width, view["plain"]))
+        line.append_text(bar([(rss, "grey62")], top, width, view["plain"]))
         line.append(f"  {mib(rss)}")
         lines.append(line)
 
