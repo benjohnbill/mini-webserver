@@ -470,6 +470,7 @@ act_start() {
 # One bystander curl, printed as a large plain banner.
 present_bystander() {
     local line word
+    ((PRESENT_SKIP)) && return 0
     line="$(RUN="$RUN" "$DEMO/bystander.sh" "$PROXY_PORT")"
     case "$line" in
         *"HTTP 200"*) word="HTTP 200" ;;
@@ -487,7 +488,33 @@ present_bystander() {
     echo
 }
 
+# Enter moves to the next Phase at any time. PRESENT_SKIP is 1 when Enter
+# came during the Phase: the rest of it (sleeps, bystander) is skipped.
+PRESENT_SKIP=0
+
+# Start a Phase: drop the Enters that came before it, so one Enter moves
+# exactly one Phase.
+present_phase() {
+    PRESENT_SKIP=0
+    present_has_keyboard || return 0
+    while read -r -t 0.01 _; do :; done
+}
+
+present_has_keyboard() { [[ -z "$PRESENT_PAUSE" && -t 0 ]]; }
+
+# Wait $1 seconds, or less if Enter comes.
+present_sleep() {
+    ((PRESENT_SKIP)) && return 0
+    if ! present_has_keyboard; then
+        sleep "$1"
+        return 0
+    fi
+    read -r -t "$1" _ && PRESENT_SKIP=1
+    return 0
+}
+
 present_wait() {
+    ((PRESENT_SKIP)) && return 0
     if [[ -n "$PRESENT_PAUSE" ]]; then
         echo "    ... $PRESENT_PAUSE s"
         sleep "$PRESENT_PAUSE"
@@ -512,49 +539,55 @@ present() {
     local pid
     rm -f "$RUN/scores.json"     # the score table starts empty
     present_header "Phase 0  평소: rproxy, Phone 없음"
+    present_phase
     act_start 1 dry hold
     scene_set P0
     present_bystander
     present_wait
 
     present_header "Phase 1  unbounded: $(mix_total) Phones, $PHONE_RATE_1/s"
+    present_phase
     scene_set P1
     touch "$RUN/go"
     pid="$(pid_read rproxy)"
     for _ in $(seq $((PRESENT_DEATH_WAIT * 10))); do
-        pid_is_alive "$pid" || break
-        sleep 0.1
+        pid_is_alive "$pid" && ((!PRESENT_SKIP)) || break
+        present_sleep 0.1
     done
     sleep 0.5    # let the runner record the exit
     present_bystander
     present_wait
 
     present_header "Phase 2-A  memory-cap: $RELAY_MEMORY MiB of replies"
+    present_phase
     act_start 2 dry
     scene_set 2A
-    sleep "$PRESENT_2A_BYSTANDER"
+    present_sleep "$PRESENT_2A_BYSTANDER"
     present_bystander
     present_wait
 
     # 2-B: the bystander waits in the conn-cap queue. It runs in the
     # background, and the dashboard counts its wait.
     present_header "Phase 2-B  conn-cap: $RELAY_CONNS slots, a queue of $RELAY_QUEUE s"
+    present_phase
     act_start 3 dry
     scene_set 2B
-    sleep "$PRESENT_2B_BYSTANDER"
+    present_sleep "$PRESENT_2B_BYSTANDER"
     BYSTANDER_WAIT="$RELAY_QUEUE" present_bystander &
     present_wait
 
     present_header "Phase 3  backpressure: $((RELAY_BUFFER / 1024)) KiB for each connection"
+    present_phase
     act_start 4 dry
     scene_set P3
-    sleep "$PRESENT_ACT4_WAIT"
+    present_sleep "$PRESENT_ACT4_WAIT"
     present_bystander
     present_wait
 
     # Phase 4: the same load on a pool Origin. Phase 3 can end early: the
     # comparison needs only its threads, not its last Phone.
     present_header "Phase 4  pool: $POOL_WORKERS Workers, the same load"
+    present_phase
     act_start 5 dry
     scene_set P4
     present_wait
